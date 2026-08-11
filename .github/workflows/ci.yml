@@ -9,9 +9,14 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A hung integration test (server.test.js spawns real child processes)
+    # once ran to GitHub's default 6-hour job timeout undetected. This caps
+    # the blast radius; --test-timeout in package.json bounds individual
+    # tests so a hang fails fast instead of reaching this ceiling at all.
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm

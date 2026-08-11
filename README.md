@@ -4,7 +4,7 @@ The Express/Node backend for **Arbiter**, a pay-per-question
 human-intelligence oracle settled on Stellar/Soroban. Terminates the HTTP
 402 payment flow, dispatches questions to workers over SSE, reconciles
 answers, and settles on-chain against
-[arbiter-contract](https://github.com/rudeus112266/arbiter-contract). It's
+[arbiter-contract](https://github.com/Arbiter-xyz/arbiter-contract). It's
 the sole holder of the platform's admin key — the only component allowed
 to call `resolve()`/`refund()`.
 

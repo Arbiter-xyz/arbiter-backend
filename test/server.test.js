@@ -18,6 +18,14 @@ function startServer(extraEnv) {
 
   const ready = new Promise((resolve, reject) => {
     let buf = '';
+    // Kill the child right here on any failure path — don't rely solely on
+    // the describe block's `after()` hook, which never runs if `before()`
+    // rejects before it gets that far, leaking a live child process that
+    // keeps `node --test` from ever exiting.
+    const fail = (err) => {
+      child.kill();
+      reject(err);
+    };
     const onData = (chunk) => {
       buf += chunk.toString();
       if (buf.includes('listening on')) {
@@ -26,8 +34,8 @@ function startServer(extraEnv) {
       }
     };
     child.stdout.on('data', onData);
-    child.on('exit', (code) => reject(new Error(`server exited early with code ${code}`)));
-    setTimeout(() => reject(new Error('server did not start in time')), 10_000);
+    child.on('exit', (code) => fail(new Error(`server exited early with code ${code}`)));
+    setTimeout(() => fail(new Error('server did not start in time')), 10_000);
   });
 
   return { child, port, ready };
