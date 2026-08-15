@@ -289,6 +289,46 @@ describe('worker session auth over real HTTP — the /app/answer impersonation f
     assert.equal(res.status, 409); // reaches real logic, not blocked by auth
   });
 
+  test('POST /oracle with a payerAddress but no token is rejected with 401 before touching the chain (fused metered path)', async () => {
+    const payer = Keypair.random();
+    const res = await fetch(`${base}/oracle`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: 'test', payerAddress: payer.publicKey() }),
+    });
+    assert.equal(res.status, 401);
+  });
+
+  test('POST /oracle rejects a session token for a DIFFERENT address than the claimed payerAddress', async () => {
+    const victim = Keypair.random();
+    const attacker = Keypair.random();
+    // getSession() calls the /workers/... session endpoints, but the
+    // underlying token is address-generic (see server.js's comment on the
+    // fused /oracle handler) — reusing it here doubles as proof that a
+    // worker-issued session and a payer-issued one are interchangeable.
+    const attackerSession = await getSession(attacker);
+
+    const res = await fetch(`${base}/oracle`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        question: 'test',
+        payerAddress: victim.publicKey(),
+        token: attackerSession.token,
+      }),
+    });
+    assert.equal(res.status, 401);
+  });
+
+  test('POST /oracle with NO payerAddress still falls through to the classic 402 challenge flow, unaffected by the fused metered path', async () => {
+    const res = await fetch(`${base}/oracle`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: 'test' }),
+    });
+    assert.equal(res.status, 402);
+  });
+
   test('GET /app/events also enforces session auth for address-format worker ids', async () => {
     const worker = Keypair.random();
     const res = await fetch(`${base}/app/events?worker=${worker.publicKey()}`);

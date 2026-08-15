@@ -103,6 +103,60 @@ async function reconcileWithClaude(question, submissions) {
   return { consensus, confidence, matchingWorkerIds, method: 'claude' };
 }
 
+const REPORT_DRAFT_TOOL = {
+  name: 'report_draft',
+  description: 'Report a direct draft answer to a question, with a self-assessed confidence.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      answer: { type: 'string', description: 'The best direct answer to the question.' },
+      confidence: {
+        type: 'number',
+        minimum: 0,
+        maximum: 1,
+        description: 'Self-assessed confidence 0-1 that this answer is correct.',
+      },
+    },
+    required: ['answer', 'confidence'],
+  },
+};
+
+/**
+ * The `instant` tier's entire fulfillment path — no worker submissions
+ * exist to reconcile, this generates the answer directly. Deliberately a
+ * separate function from reconcile()/reconcileWithClaude() rather than
+ * calling reconcile() with zero submissions: that path already means
+ * "nobody answered, refund," which is exactly the wrong behavior here.
+ * Never throws; oracle.js's instant-tier branch treats a null return the
+ * same as any other unable-to-answer case (refund, fail closed).
+ */
+export async function draftAnswer(question, questionId) {
+  const client = getClient();
+  if (!client) {
+    logger.warn({ questionId }, 'instant tier requested but ANTHROPIC_API_KEY not configured');
+    return null;
+  }
+
+  try {
+    const message = await client.messages.create({
+      model: config.anthropicModel,
+      max_tokens: 512,
+      tool_choice: { type: 'tool', name: 'report_draft' },
+      tools: [REPORT_DRAFT_TOOL],
+      messages: [{ role: 'user', content: `Question: "${question}"\n\nGive your best direct answer.` }],
+    });
+
+    const toolUse = message.content.find((b) => b.type === 'tool_use' && b.name === 'report_draft');
+    if (!toolUse) return null;
+
+    const { answer, confidence } = toolUse.input;
+    return { consensus: answer, confidence, matchingWorkerIds: [], method: 'llm-draft' };
+  } catch (err) {
+    logger.error({ err, questionId }, 'instant-tier draft answer failed');
+    return null;
+  }
+}
+
 /**
  * reconcile() never throws and never hangs indefinitely on an external API
  * outage — any Claude error falls back to a deterministic vote so the

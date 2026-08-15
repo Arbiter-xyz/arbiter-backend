@@ -6,6 +6,20 @@
  * whatever answered in time.
  */
 export const PRICING_TIERS = Object.freeze({
+  // No human quorum at all — an immediate LLM-generated draft, settled the
+  // moment it comes back. Cheaper and near-instant on purpose: it's a
+  // different product promise ("a fast draft") than every other tier
+  // ("a staked human quorum verified it"), not a discount on the same one.
+  // quorumSize 0 / timeoutMs 0 are sentinels oracle.js checks for to skip
+  // dispatch entirely, not real dispatch parameters.
+  instant: Object.freeze({
+    key: 'instant',
+    label: 'Instant — LLM draft, no human quorum (see standard/express/priority for a staked guarantee)',
+    priceStroops: 500_000n,
+    quorumSize: 0,
+    timeoutMs: 0,
+    instant: true,
+  }),
   standard: Object.freeze({
     key: 'standard',
     label: 'Standard',
@@ -22,10 +36,15 @@ export const PRICING_TIERS = Object.freeze({
   }),
   priority: Object.freeze({
     key: 'priority',
-    label: 'Priority — larger quorum, higher confidence',
+    label: 'Priority — larger quorum, routed to the leaderboard first',
     priceStroops: 6_000_000n,
     quorumSize: 5,
     timeoutMs: 30_000,
+    // Ties this tier to the public leaderboard (see leaderboard.js) instead
+    // of "higher confidence" being just a bigger-quorum claim — Priority
+    // actually means "this went to established, track-recorded verifiers
+    // first." See dispatch.js's selectTargets for the fail-open behavior.
+    preferEstablished: true,
   }),
 });
 

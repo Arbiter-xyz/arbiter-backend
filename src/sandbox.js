@@ -1,6 +1,6 @@
 import { createJob, updateJob } from './jobs.js';
 import { resolveTier } from './pricing.js';
-import { exactMatchVote } from './reconcile.js';
+import { exactMatchVote, draftAnswer } from './reconcile.js';
 import { config } from './config.js';
 import { jobLogger } from './logger.js';
 
@@ -15,14 +15,23 @@ import { jobLogger } from './logger.js';
  * HTTP call, so someone can decide whether to trust the real thing before
  * they've spent any setup effort at all.
  *
- * Deliberately never touches stellarClient.js/Claude:
- *  - No chain calls, so it works even with no deployed contract configured
- *    (true in this dev environment) and never costs the platform a network fee.
- *  - No Claude calls, so it's free, fast, and fully deterministic — every
- *    outcome path is driven by exactMatchVote(), the same grouping logic
- *    production reconciliation falls back to, just never escalated to an
- *    LLM here. That keeps sandbox mode from being a free way to spend the
- *    platform's Anthropic budget.
+ * Never touches stellarClient.js — no chain calls, so it works even with no
+ * deployed contract configured and never costs the platform a network fee.
+ *
+ * Claude is used for a real one-shot draft answer on the default 'resolved'
+ * path — same call as the Instant tier's draftAnswer() — but ONLY when
+ * ANTHROPIC_API_KEY is configured; without one, or on any Claude failure,
+ * this falls back to the original fully-deterministic canned response
+ * (exactMatchVote() over synthetic submissions). A canned response you
+ * clearly built against beats a real answer that's flaky under load — this
+ * is a strict upgrade when a key exists, never a new failure mode when it
+ * doesn't. The explicit 'disagreement'/'no-answers' simulate modes always
+ * stay canned regardless of key presence: those exist to deterministically
+ * exercise specific edge-case response shapes on demand, not to get "a real
+ * answer." Cost exposure from a free, unauthenticated endpoint calling a
+ * paid API is bounded by the existing per-IP sandbox rate limit
+ * (SANDBOX_RATE_LIMIT_MAX), same protection every other rate-limited route
+ * here already relies on.
  * Every response is unambiguously tagged `sandbox: true` and fake tx
  * hashes are prefixed "SANDBOX-" so nothing here can be mistaken for a
  * real settlement.
@@ -116,6 +125,33 @@ async function runSandboxFulfillment(questionId, questionText, mode) {
   // progression (exercising real integration code paths), never so long
   // that trying the product feels slow.
   await sleep(350);
+
+  if (mode === 'resolved' && config.anthropicApiKey) {
+    const draft = await draftAnswer(questionText, questionId);
+    if (draft) {
+      // Honest about what actually produced this answer — no fake
+      // "3 workers agreed" shape when it was really one Claude call.
+      // totalAnswers: 0 / matchingWorkers: [] matches how oracle.js's real
+      // Instant tier reports the same llm-draft method for the same reason.
+      await updateJob(questionId, { status: 'reconciling', totalAnswers: 0 });
+      await sleep(350);
+      await updateJob(questionId, {
+        status: 'settled',
+        outcome: 'resolved',
+        answer: draft.consensus,
+        confidence: draft.confidence,
+        reconciliationMethod: draft.method,
+        totalAnswers: 0,
+        matchingWorkers: [],
+        payoutTx: fakeTxHash('payout'),
+        payoutModel: 'sandbox — no real funds moved',
+      });
+      return;
+    }
+    // draftAnswer() returned null (no key after all, or Claude errored) —
+    // fall through to the deterministic canned path below rather than
+    // surfacing a broken demo.
+  }
 
   const submissions = cannedSubmissions(questionText, mode);
   await updateJob(questionId, { status: 'reconciling', totalAnswers: submissions.length });

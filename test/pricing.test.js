@@ -34,3 +34,11 @@ test('an unknown tier key falls back to the standard tier rather than throwing',
   const priced = priceForTier('not-a-real-tier', 100);
   assert.equal(priced.key, 'standard');
 });
+
+test('the instant tier has no human quorum to surge-price against, so it always prices at its flat base rate', () => {
+  const tier = PRICING_TIERS.instant;
+  assert.equal(tier.quorumSize, 0);
+  assert.equal(surgeMultiplier(tier, 0), 1);
+  assert.equal(surgeMultiplier(tier, 1000), 1);
+  assert.equal(priceForTier('instant', 0).priceStroops, PRICING_TIERS.instant.priceStroops);
+});

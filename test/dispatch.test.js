@@ -91,6 +91,52 @@ test('category routing fails open to everyone online when no one matches and no 
   }
 });
 
+test('preferEstablished routes only to established workers when enough of them are online', async () => {
+  const established = fakeRes();
+  const fresh = fakeRes();
+  registerWorker('worker-established-a', established, []);
+  registerWorker('worker-fresh-a', fresh, []);
+  for (let i = 0; i < 5; i += 1) await recordOutcome('worker-established-a', true);
+  assert.equal(await isEstablishedWorker('worker-established-a'), true);
+  assert.equal(await isEstablishedWorker('worker-fresh-a'), false);
+
+  try {
+    await broadcast('q-300', 'Priority-tier question', {
+      quorumSize: 1,
+      expiresInMs: 1000,
+      preferEstablished: true,
+    });
+    assert.equal(established.events.length, 1, 'the established worker is routed to');
+    assert.equal(fresh.events.length, 0, 'the fresh worker is excluded while enough established workers exist');
+  } finally {
+    unregisterWorker('worker-established-a');
+    unregisterWorker('worker-fresh-a');
+  }
+});
+
+test('preferEstablished fails open to everyone once too few established workers are online for the quorum', async () => {
+  const established = fakeRes();
+  const fresh = fakeRes();
+  registerWorker('worker-established-b', established, []);
+  registerWorker('worker-fresh-b', fresh, []);
+  for (let i = 0; i < 5; i += 1) await recordOutcome('worker-established-b', true);
+
+  try {
+    // quorumSize 2 but only 1 established worker online — a starved quorum
+    // is worse than including a fresh worker, so this must fail open.
+    await broadcast('q-301', 'Priority-tier question, thin established supply', {
+      quorumSize: 2,
+      expiresInMs: 1000,
+      preferEstablished: true,
+    });
+    assert.equal(established.events.length, 1);
+    assert.equal(fresh.events.length, 1, 'falls open to the fresh worker rather than starving the quorum');
+  } finally {
+    unregisterWorker('worker-established-b');
+    unregisterWorker('worker-fresh-b');
+  }
+});
+
 test('a worker with a poor track record is excluded from routing once eligible peers exist', async () => {
   const good = fakeRes();
   const bad = fakeRes();

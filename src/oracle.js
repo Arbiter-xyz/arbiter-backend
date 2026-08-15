@@ -1,7 +1,7 @@
 import { nextQuestionId, stashQuestion, getStashedQuestion, dropStashedQuestion } from './pendingQuestions.js';
 import { createJob, updateJob, getJob, claimJob } from './jobs.js';
 import { dispatchAndCollect, recordOutcome, getSmoothedOnlineWorkerCount } from './dispatch.js';
-import { reconcile } from './reconcile.js';
+import { reconcile, draftAnswer } from './reconcile.js';
 import { resolveQuestion, refundQuestion, getQuestionOnChain } from './stellarClient.js';
 import { resolveTier, listTiersForClient, stroopsToUsdc, priceForTier } from './pricing.js';
 import { incrementStat } from './stats.js';
@@ -154,12 +154,17 @@ export async function getJobStatus(questionId) {
 }
 
 async function fulfillOracleCall(questionId, pending, tier) {
+  if (tier.instant) {
+    return fulfillInstant(questionId, pending);
+  }
+
   let submissions = [];
   try {
     submissions = await dispatchAndCollect(questionId, pending.question, {
       quorumSize: tier.quorumSize,
       timeoutMs: tier.timeoutMs,
       category: pending.category,
+      preferEstablished: tier.preferEstablished,
     });
   } catch (err) {
     // dispatchAndCollect is designed to never reject, but guard anyway — an
@@ -180,6 +185,72 @@ async function fulfillOracleCall(questionId, pending, tier) {
     await settleResolved(questionId, submissions, result);
   } else {
     await settleRefunded(questionId, submissions, result);
+  }
+}
+
+/**
+ * The `instant` tier's fulfillment: no human dispatch, no quorum wait —
+ * generate a draft answer directly and settle immediately. There is no
+ * human worker to pay here, so on success the platform address itself is
+ * passed as resolve()'s sole "winner": it's the party that actually
+ * provided the value (the LLM call), and the contract has no notion of who
+ * a worker "is" beyond an address that gets credited — see charge()'s and
+ * resolve()'s doc comments. Failure (no API key, Claude error) fails
+ * closed exactly like the human path: refund, never charge for nothing.
+ */
+async function fulfillInstant(questionId, pending) {
+  await updateJob(questionId, { status: 'reconciling', totalAnswers: 0 });
+
+  const result = await draftAnswer(pending.question, questionId);
+
+  if (result && result.consensus) {
+    await settleInstantResolved(questionId, result);
+  } else {
+    await settleRefunded(questionId, [], {
+      consensus: null,
+      confidence: 0,
+      matchingWorkerIds: [],
+      method: 'llm-draft-unavailable',
+      reason: 'instant tier could not produce a draft answer (LLM unavailable or errored)',
+    });
+  }
+}
+
+async function settleInstantResolved(questionId, result) {
+  try {
+    const { hash } = await resolveQuestion(questionId, [config.platformAddress], []);
+    await dropStashedQuestion(questionId);
+    await incrementStat('resolved');
+    await updateJob(questionId, {
+      status: 'settled',
+      outcome: 'resolved',
+      answer: result.consensus,
+      confidence: result.confidence,
+      reconciliationMethod: result.method,
+      totalAnswers: 0,
+      matchingWorkers: [],
+      slashedWorkers: [],
+      payoutTx: hash,
+      payoutModel: 'instant tier — no human worker involved, settled directly to the platform',
+    });
+  } catch (err) {
+    const onChainNow = await getQuestionOnChain(questionId).catch(() => null);
+    if (onChainNow && onChainNow.status === 'refunded') {
+      jobLogger(questionId).warn('instant tier lost the settlement race to a third-party refund_timeout()');
+      await incrementStat('refunded');
+      await updateJob(questionId, {
+        status: 'settled',
+        outcome: 'lost_race_to_timeout_refund',
+        reason: "a third party force-refunded via refund_timeout() before this backend's resolve() landed",
+        confidence: result.confidence,
+        reconciliationMethod: result.method,
+        totalAnswers: 0,
+      });
+      return;
+    }
+
+    jobLogger(questionId).error({ err }, 'instant tier resolve() failed, falling back to refund');
+    await settleRefunded(questionId, [], { ...result, reason: `on-chain resolve failed: ${err.message}` });
   }
 }
 

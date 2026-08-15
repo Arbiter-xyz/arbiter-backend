@@ -58,6 +58,22 @@ test('simulate=no-answers settles as refunded with the no-answers reason', async
   assert.match(job.reason, /no workers answered/);
 });
 
+test('with no ANTHROPIC_API_KEY configured (this test environment), the resolved path stays fully canned/deterministic', async () => {
+  // Real success-path coverage (a configured key producing a genuine
+  // draftAnswer()) needs live credentials this suite intentionally doesn't
+  // have — see reconcile.test.js's draftAnswer test for the same
+  // no-key-configured boundary. What's testable and matters here: sandbox
+  // mode must never regress to something broken or non-deterministic just
+  // because draftAnswer() was wired in as an optional upgrade path.
+  const jobId = 'sandbox-no-key-fallback-1';
+  await startSandboxFulfillment(jobId, 'No API key in this test env', {});
+  const job = await waitForSettled(jobId);
+
+  assert.equal(job.outcome, 'resolved');
+  assert.equal(job.reconciliationMethod, 'exact-match-fastpath');
+  assert.equal(job.matchingWorkers.length, 3, 'still the canned 3-worker shape, not the llm-draft shape');
+});
+
 test('an unrecognized simulate value falls back to the default resolved path rather than erroring', async () => {
   const jobId = 'sandbox-bogus-mode-1';
   await startSandboxFulfillment(jobId, 'Test question', { simulate: 'not-a-real-mode' });

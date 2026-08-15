@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { reconcile } from '../src/reconcile.js';
+import { reconcile, draftAnswer } from '../src/reconcile.js';
 
 function established(workerId, answer) {
   return { workerId, answer, established: true };
@@ -63,4 +63,12 @@ test('genuine disagreement without an API key falls back to a deterministic plur
   assert.equal(result.consensus, 'Rust');
   assert.ok(Math.abs(result.confidence - 2 / 3) < 1e-9);
   assert.deepEqual(result.matchingWorkerIds.sort(), ['w1', 'w2']);
+});
+
+test('draftAnswer never throws without an API key, and returns null so the instant tier fails closed (refund)', async () => {
+  // No ANTHROPIC_API_KEY configured in this test environment, same as the
+  // reconcile() fallback tests above — the instant tier has no human
+  // quorum behind it, so a null draft must mean "refund", not "crash".
+  const result = await draftAnswer('What year did Stellar launch?', 'test-question-id');
+  assert.equal(result, null);
 });

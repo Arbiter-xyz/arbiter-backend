@@ -12,6 +12,15 @@ const workers = new Map(); // workerId -> { res, categories: Set<string>, connec
 const collectors = new Map(); // questionId -> { submissions: Map<workerId, answer>, quorumSize, finished, finish }
 
 const REPUTATION_PREFIX = 'rep:';
+// A single durable list of every workerId that has ever had an outcome
+// recorded — reputation itself is keyed per-worker (rep:{workerId}), which
+// is fine for a single lookup but can't be enumerated. This index is what
+// makes a public leaderboard possible without scanning the whole store.
+// Bounded and de-duplicated the same way payerIndex.js bounds its per-payer
+// list, for the same reason: durable, unbounded growth is the failure mode
+// to avoid, not a real capacity concern at this scale.
+const WORKER_INDEX_KEY = 'known-worker-ids';
+const MAX_TRACKED_WORKERS = 5_000;
 
 export function onlineWorkerCount() {
   return workers.size;
@@ -52,9 +61,21 @@ export async function getReputation(workerId) {
 export async function recordOutcome(workerId, matched) {
   const key = REPUTATION_PREFIX + workerId;
   const rec = (await store.get(key)) || { matched: 0, total: 0 };
+  const isNew = rec.total === 0;
   rec.total += 1;
   if (matched) rec.matched += 1;
   await store.set(key, rec); // no TTL — reputation is durable
+
+  if (isNew) {
+    const known = (await store.get(WORKER_INDEX_KEY)) || [];
+    if (!known.includes(workerId)) {
+      await store.set(WORKER_INDEX_KEY, [workerId, ...known].slice(0, MAX_TRACKED_WORKERS));
+    }
+  }
+}
+
+export async function getKnownWorkerIds() {
+  return (await store.get(WORKER_INDEX_KEY)) || [];
 }
 
 async function isEligible(workerId) {
@@ -81,7 +102,16 @@ function writeSse(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-async function selectTargets(category) {
+/**
+ * `preferEstablished` is what ties the pricing tiers to the public
+ * leaderboard (see leaderboard.js) instead of leaving them as parallel,
+ * unrelated features — the Priority tier's whole premise is "route to the
+ * verifiers with a real track record first," so it should actually mean
+ * that, not just "a bigger quorum." Still fails open: never lets the
+ * established-only pool drop below quorumSize's worth of recipients, since
+ * a starved quorum is a worse outcome than one with a fresh worker in it.
+ */
+async function selectTargets(category, { preferEstablished = false, quorumSize = 0 } = {}) {
   let targets = [...workers.entries()];
 
   if (category) {
@@ -100,12 +130,19 @@ async function selectTargets(category) {
   }
   // Reputation gating must never be able to zero out the recipient list —
   // routing quality is a soft preference, payment settlement is not.
-  return eligible.length > 0 ? eligible : targets;
+  const pool = eligible.length > 0 ? eligible : targets;
+  if (!preferEstablished) return pool;
+
+  const established = [];
+  for (const entry of pool) {
+    if (await isEstablishedWorker(entry[0])) established.push(entry);
+  }
+  return established.length >= quorumSize ? established : pool;
 }
 
-export async function broadcast(questionId, questionText, { category, quorumSize, expiresInMs } = {}) {
+export async function broadcast(questionId, questionText, { category, quorumSize, expiresInMs, preferEstablished } = {}) {
   const payload = { questionId: questionId.toString(), question: questionText, quorumSize, expiresInMs };
-  const targets = await selectTargets(category);
+  const targets = await selectTargets(category, { preferEstablished, quorumSize });
   for (const [, w] of targets) writeSse(w.res, 'question', payload);
 
   // Supplement SSE with push notifications for workers who are eligible
@@ -170,7 +207,7 @@ export function getSmoothedOnlineWorkerCount() {
  * isEstablishedWorker) so reconcile.js can decide whether a unanimous
  * result is trustworthy enough to fast-path.
  */
-export function dispatchAndCollect(questionId, questionText, { quorumSize, timeoutMs, category } = {}) {
+export function dispatchAndCollect(questionId, questionText, { quorumSize, timeoutMs, category, preferEstablished } = {}) {
   const qid = questionId.toString();
   return new Promise((resolvePromise) => {
     const state = { submissions: new Map(), quorumSize, finished: false };
@@ -190,7 +227,7 @@ export function dispatchAndCollect(questionId, questionText, { quorumSize, timeo
     }
     state.finish = finish;
 
-    broadcast(questionId, questionText, { category, quorumSize, expiresInMs: timeoutMs }).catch((err) => {
+    broadcast(questionId, questionText, { category, quorumSize, expiresInMs: timeoutMs, preferEstablished }).catch((err) => {
       jobLogger(questionId).error({ err }, 'broadcast failed');
     });
   });

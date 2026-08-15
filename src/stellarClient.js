@@ -21,6 +21,10 @@ export function u64Arg(value) {
   return nativeToScVal(BigInt(value), { type: 'u64' });
 }
 
+export function i128Arg(value) {
+  return nativeToScVal(BigInt(value), { type: 'i128' });
+}
+
 export function addressArg(address) {
   return new Address(address).toScVal();
 }
@@ -92,6 +96,15 @@ export async function refundQuestion(questionId) {
   return invokeAsAdmin('refund', [u64Arg(questionId)]);
 }
 
+/** Draws down a payer's prepaid on-chain balance and opens `questionId`,
+ * with no signature from the payer on this specific call — see charge() in
+ * the contract. Throws (via invokeAsAdmin's retry) if the balance can't
+ * cover `amountStroops`; callers must not treat that as safe to retry blind,
+ * since retrying an insufficient charge just fails the same way again. */
+export async function chargeBalance(payerAddress, questionId, amountStroops) {
+  return invokeAsAdmin('charge', [addressArg(payerAddress), u64Arg(questionId), i128Arg(amountStroops)]);
+}
+
 export function decodeStatus(raw) {
   // A data-less Rust enum variant (Status::Pending etc.) decodes via
   // scValToNative as a single-element ARRAY, e.g. ['Pending'] — confirmed
@@ -159,4 +172,9 @@ export async function getOwedOnChain(workerAddress) {
 export async function getStakeOnChain(workerAddress) {
   const stake = await simulateReadOnly('get_stake', [addressArg(workerAddress)]);
   return BigInt(stake ?? 0);
+}
+
+export async function getBalanceOnChain(payerAddress) {
+  const balance = await simulateReadOnly('get_balance', [addressArg(payerAddress)]);
+  return BigInt(balance ?? 0);
 }

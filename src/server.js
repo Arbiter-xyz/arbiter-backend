@@ -26,6 +26,8 @@ import {
 } from './sponsor.js';
 import { getStashedQuestion, nextQuestionId } from './pendingQuestions.js';
 import { getOwedOnChain, getStakeOnChain } from './stellarClient.js';
+import { askMetered, getMeteredBalance, depositInstructions } from './metered.js';
+import { getLeaderboard } from './leaderboard.js';
 import { stroopsToUsdc } from './pricing.js';
 import { checkRateLimit } from './rateLimit.js';
 import { issueSandboxChallenge, startSandboxFulfillment } from './sandbox.js';
@@ -70,6 +72,22 @@ app.get('/health', (req, res) => {
 // Platform-wide, real-settlement-only counters — safe to surface publicly
 // (e.g. a landing page trust strip) since sandbox traffic never counts
 // toward these (see stats.js).
+// Public, no auth, no wallet — worker reputation as a portable asset rather
+// than a number this backend keeps behind a login. Match ratio is this
+// backend's own record (stated plainly, not independently verifiable);
+// stake is read live from the contract, so at least that part of every row
+// is checkable by anyone without trusting this API at all.
+app.get('/leaderboard', async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+    const leaderboard = await getLeaderboard(limit);
+    res.json({ leaderboard });
+  } catch (err) {
+    req.log.error({ err }, 'failed to build leaderboard');
+    res.status(500).json({ error: 'failed to build leaderboard' });
+  }
+});
+
 app.get('/stats', async (req, res) => {
   const stats = await getStats();
   res.json({ onlineWorkers: onlineWorkerCount(), ...stats });
@@ -105,12 +123,52 @@ app.post('/oracle/sandbox', rateLimited('sandbox', byIp), async (req, res) => {
   }
 });
 
+/**
+ * ONE endpoint, two payment methods chosen transparently by what the
+ * caller sends — not two parallel APIs to learn. Include `payerAddress` +
+ * `token` (from POST /payers/:address/session) and a sufficient prepaid
+ * balance, and this settles immediately with no 402 round trip and no
+ * per-question signature at all. Send nothing extra, and it's the classic
+ * flow: 402 with payment instructions, then retry with X-Payment-Tx after
+ * a real submit(). Metered billing was originally a separate
+ * /oracle/metered route; fusing it into /oracle itself is the point —
+ * "how you pay" shouldn't be a different URL than "what you're asking."
+ */
 app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
   const questionId = req.header('X-Question-Id');
   const paymentTx = req.header('X-Payment-Tx');
+  const { question, tier, category, payerAddress, token } = req.body || {};
+
+  if (payerAddress) {
+    if (!question || typeof question !== 'string') {
+      return res.status(400).json({ error: 'body.question (string) is required' });
+    }
+    if (question.length > config.maxQuestionLength) {
+      return res.status(400).json({ error: `body.question must be at most ${config.maxQuestionLength} characters` });
+    }
+    if (verifySessionToken(token) !== payerAddress) {
+      return res.status(401).json({ error: 'a valid session token for this address is required — see POST /payers/:address/session' });
+    }
+    try {
+      const result = await askMetered(payerAddress, question, tier, category);
+      return res.status(202).json({ ...result, statusUrl: `/oracle/${result.jobId}` });
+    } catch (err) {
+      // #13 is ContractError::InsufficientBalance — see contracts/oracle-escrow/src/lib.rs.
+      // Simulation failures surface the raw Soroban error string, not a typed
+      // exception, so this is the same string-matching pattern stellarClient.js
+      // already uses for QuestionNotFound.
+      if (/Error\(Contract, #13\)/.test(err.message || '')) {
+        return res.status(402).json({
+          error: 'insufficient prepaid balance',
+          ...depositInstructions(payerAddress),
+        });
+      }
+      req.log.error({ err, payerAddress }, 'metered charge failed');
+      return res.status(500).json({ error: 'failed to process metered request' });
+    }
+  }
 
   if (!questionId || !paymentTx) {
-    const { question, tier, category } = req.body || {};
     if (!question || typeof question !== 'string') {
       return res.status(400).json({ error: 'body.question (string) is required' });
     }
@@ -144,6 +202,43 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
   } catch (err) {
     req.log.error({ err, questionId }, 'failed to process payment/fulfillment');
     return res.status(500).json({ error: 'failed to process payment' });
+  }
+});
+
+// ---------------------------------------------------------------------
+// Payer identity for metered billing (POST /oracle above) — deposit()
+// once on-chain (a real payer signature, made out of band), then ask any
+// number of questions with no further signing. Reuses workerAuth.js's
+// challenge/response session mechanism to prove control of the payer
+// address; the token itself doesn't distinguish "worker" from "payer"
+// (both just prove control of a Stellar address), only the route naming
+// does.
+// ---------------------------------------------------------------------
+
+app.post('/payers/:address/session/challenge', rateLimited('push', byIp), async (req, res) => {
+  try {
+    const xdr = await buildChallengeXdr(req.params.address);
+    res.json({ xdr });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/payers/:address/session', rateLimited('push', byIp), async (req, res) => {
+  const { signedXdr } = req.body || {};
+  if (!signedXdr) return res.status(400).json({ error: 'signedXdr is required' });
+  const session = await verifyChallengeAndIssueSession(req.params.address, signedXdr);
+  if (!session) return res.status(401).json({ error: 'challenge verification failed — signature did not match, or the challenge expired' });
+  res.json(session);
+});
+
+app.get('/payers/:address/balance', async (req, res) => {
+  try {
+    const balance = await getMeteredBalance(req.params.address);
+    res.json({ ...balance, ...depositInstructions(req.params.address) });
+  } catch (err) {
+    req.log.error({ err }, 'failed to read prepaid balance');
+    res.status(500).json({ error: 'failed to read prepaid balance' });
   }
 });
 
