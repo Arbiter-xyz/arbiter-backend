@@ -85,7 +85,11 @@ export function listTiersForClient() {
  * result at quote time, since supply can change before payment lands.
  */
 const COMFORTABLE_SUPPLY_MULTIPLE = 3;
-const MAX_SURGE_MULTIPLIER = 2;
+// Exported so callers that must reserve funds *before* the live price is
+// known (billing.js's fiat-credit reservation, made ahead of askMetered()
+// computing the real surge-adjusted price) can compute a safe ceiling —
+// see reserveCredit()'s doc comment in billing.js.
+export const MAX_SURGE_MULTIPLIER = 2;
 const MIN_SURGE_MULTIPLIER = 1;
 
 export function surgeMultiplier(tier, onlineWorkers) {

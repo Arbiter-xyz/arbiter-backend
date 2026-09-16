@@ -2,7 +2,8 @@ import { store } from './store.js';
 import { config } from './config.js';
 import { checkRateLimit } from './rateLimit.js';
 import { getPushEligibleWorkerIds, notifyWorker } from './push.js';
-import { jobLogger } from './logger.js';
+import { getStakeOnChain, touchWorker } from './stellarClient.js';
+import { jobLogger, logger } from './logger.js';
 
 // Live worker registry — inherently process-local because it holds open SSE
 // response objects (see the multi-instance caveat in store.js).
@@ -78,10 +79,32 @@ export async function getKnownWorkerIds() {
   return (await store.get(WORKER_INDEX_KEY)) || [];
 }
 
+// Periodically-refreshed cache of established workers' on-chain stake — see
+// setCachedStake() below. Same "sample on an interval, tolerate staleness"
+// trade-off already made for worker supply (see supplySamplerHandle).
+// WORKER_MIN_STAKE_STROOPS defaults to 0, which disables this check
+// entirely (today's behavior) — it's an opt-in, not a silent policy change.
+const stakeCache = new Map(); // workerId -> stroops (bigint)
+
+/** Pure decision logic, factored out so it's directly testable with any
+ * threshold — config is frozen at load time (Object.freeze), so a test in
+ * this same process can't exercise a non-default minStakeStroops by
+ * mutating config. Mirrors computeSmoothedCount's reason for existing as
+ * its own pure function below. Fails open (true) when minStakeStroops is
+ * 0/disabled, or when there's no cached stake yet — routing quality is a
+ * soft preference, payment settlement is not, same principle
+ * selectTargets() already documents for reputation gating. */
+export function stakeGateAllows(cachedStake, minStakeStroops) {
+  if (minStakeStroops <= 0n) return true;
+  if (cachedStake === undefined) return true;
+  return cachedStake >= minStakeStroops;
+}
+
 async function isEligible(workerId) {
   const rep = await getReputation(workerId);
   if (rep.total < config.worker.minAnswersBeforeReputationGate) return true;
-  return rep.matched / rep.total >= config.worker.minMatchRatio;
+  if (rep.matched / rep.total < config.worker.minMatchRatio) return false;
+  return stakeGateAllows(stakeCache.get(workerId), config.worker.minStakeStroops);
 }
 
 /**
@@ -186,6 +209,71 @@ const supplySamplerHandle = setInterval(() => {
   if (supplySamples.length > SUPPLY_WINDOW_SAMPLES) supplySamples.shift();
 }, SUPPLY_SAMPLE_INTERVAL_MS);
 supplySamplerHandle.unref?.();
+
+const STAKE_SAMPLE_INTERVAL_MS = 30_000;
+
+/** Refreshes stakeCache for every currently-online established worker, and
+ * drops cache entries for anyone no longer online (bounded growth). Skips
+ * entirely when the feature is disabled (minStakeStroops <= 0) so a default
+ * deployment never pays for RPC calls it doesn't need. A failed lookup for
+ * one worker just leaves their previous cached value in place — isEligible
+ * fails open on a genuinely missing entry, never on a stale-but-present one. */
+async function refreshStakeCache() {
+  if (config.worker.minStakeStroops <= 0n) return;
+
+  const onlineIds = new Set(workers.keys());
+  for (const cachedId of stakeCache.keys()) {
+    if (!onlineIds.has(cachedId)) stakeCache.delete(cachedId);
+  }
+
+  await Promise.all(
+    [...onlineIds].map(async (workerId) => {
+      const rep = await getReputation(workerId);
+      if (rep.total < config.worker.minAnswersBeforeReputationGate) return;
+      try {
+        stakeCache.set(workerId, await getStakeOnChain(workerId));
+      } catch {
+        // leave whatever was cached before, if anything.
+      }
+    }),
+  );
+}
+
+const stakeSamplerHandle = setInterval(() => {
+  refreshStakeCache().catch(() => {});
+}, STAKE_SAMPLE_INTERVAL_MS);
+stakeSamplerHandle.unref?.();
+
+// Storage TTL only extends on a write that touches an entry (see
+// touch()/credit_owed()/stake() in lib.rs) — a worker who earns once and
+// never comes back to stake or withdraw again would otherwise have their
+// Owed/Stake entries silently archive off-chain storage. Sweeping once a
+// day is enormously conservative against the ~5.8-day (100_000-ledger)
+// renewal threshold the contract itself uses, while still keeping the
+// platform's per-touch() network fee bill low. Skipped entirely when no
+// admin key is configured (e.g. most test/dev runs) — same "don't pay for
+// what isn't wired up" principle as refreshStakeCache's early return.
+const TTL_SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+async function sweepWorkerTtls() {
+  if (!config.platformSecret) return;
+
+  const knownIds = await getKnownWorkerIds();
+  await Promise.all(
+    knownIds.map(async (workerId) => {
+      try {
+        await touchWorker(workerId);
+      } catch (err) {
+        logger.warn({ err, workerId }, 'touch() TTL sweep failed for worker');
+      }
+    }),
+  );
+}
+
+const ttlSweepHandle = setInterval(() => {
+  sweepWorkerTtls().catch(() => {});
+}, TTL_SWEEP_INTERVAL_MS);
+ttlSweepHandle.unref?.();
 
 /** Pure averaging math, factored out so it's testable without waiting on
  * real timers. Falls back to the live count when no samples exist yet

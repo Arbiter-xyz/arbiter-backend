@@ -178,3 +178,13 @@ export async function getBalanceOnChain(payerAddress) {
   const balance = await simulateReadOnly('get_balance', [addressArg(payerAddress)]);
   return BigInt(balance ?? 0);
 }
+
+/** Refreshes storage TTL on a worker's Owed/Stake entries via the
+ * contract's permissionless touch() — no worker signature involved, so
+ * this can run on the platform's own admin key exactly like resolve()
+ * does. See touch()'s doc comment in lib.rs for why a periodic sweep needs
+ * to exist at all (a worker who earns once and never returns has no other
+ * way to keep their balance from archiving off-chain storage). */
+export async function touchWorker(workerAddress) {
+  return invokeAsAdmin('touch', [addressArg(workerAddress)]);
+}

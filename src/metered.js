@@ -42,13 +42,14 @@ export async function askMetered(payerAddress, questionText, tierKey, category) 
   await stashQuestion(questionId, pending);
 
   const tier = { ...priced };
-  const { jobId } = await startFulfillment(questionId, pending, tier);
+  const { jobId } = await startFulfillment(questionId, pending, tier, payerAddress);
 
   return {
     jobId,
     questionId,
     tier: priced.key,
     amount: stroopsToUsdc(priced.priceStroops),
+    amountStroops: priced.priceStroops.toString(),
     tiers: listTiersForClient(),
   };
 }

@@ -23,14 +23,21 @@ import {
   feeBumpSubmitPayment,
   feeBumpStake,
   feeBumpWithdraw,
+  feeBumpWithdrawTo,
 } from './sponsor.js';
 import { getStashedQuestion, nextQuestionId } from './pendingQuestions.js';
 import { getOwedOnChain, getStakeOnChain } from './stellarClient.js';
 import { askMetered, getMeteredBalance, depositInstructions } from './metered.js';
 import { getLeaderboard } from './leaderboard.js';
-import { stroopsToUsdc } from './pricing.js';
+import { stroopsToUsdc, resolveTier, MAX_SURGE_MULTIPLIER } from './pricing.js';
 import { checkRateLimit } from './rateLimit.js';
 import { issueSandboxChallenge, startSandboxFulfillment } from './sandbox.js';
+import { requireAdmin } from './adminAuth.js';
+import { listTransactions, listWorkers, listPayers, getTreasury, getFeeRevenue, listAnchorPayouts, listAnchorKyc } from './admin.js';
+import { getAnchorConfig, isAnchorConfigured } from './anchorClient.js';
+import { recordAnchorTransaction, recordAnchorKyc } from './anchorRecords.js';
+import { resolveApiKey } from './apiKeyAuth.js';
+import { isBillingConfigured, createCheckoutSession, handleStripeWebhook, getCreditBalanceStroops, reserveCredit, settleReservation } from './billing.js';
 import { logger, httpLogger } from './logger.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -48,6 +55,23 @@ app.use(httpLogger);
 // flooding possible in the first place, so this is paired with the rate
 // limiting below, not a substitute for it.
 app.use(cors(config.allowedOrigins.includes('*') ? { origin: '*' } : { origin: config.allowedOrigins }));
+
+// Stripe webhook signature verification needs the RAW request body, and
+// Express only hands raw bytes to whichever parser claims a request first
+// — so this route (and only this one) must be registered with its own
+// express.raw() BEFORE the global express.json() below, or the body would
+// already be parsed/mangled by the time constructEvent() sees it.
+app.post('/billing/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!isBillingConfigured()) return res.status(503).json({ error: 'billing not configured' });
+  try {
+    await handleStripeWebhook(req.body, req.get('stripe-signature'));
+    res.json({ received: true });
+  } catch (err) {
+    req.log.warn({ err }, 'stripe webhook signature verification failed');
+    res.status(400).json({ error: 'invalid webhook signature' });
+  }
+});
+
 app.use(express.json());
 
 /** Every /sponsor/* call spends a real network fee on the platform's behalf,
@@ -139,6 +163,48 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
   const paymentTx = req.header('X-Payment-Tx');
   const { question, tier, category, payerAddress, token } = req.body || {};
 
+  // Third payment method: an `Authorization: Bearer ak_live_...` API key
+  // (see apiKeyAuth.js/billing.js) — the wallet-free onramp. Checked first
+  // since it needs neither payerAddress nor a session token; everything
+  // downstream (dispatch, reconcile, settle) is the identical pipeline,
+  // funded from the platform's own pooled balance instead of the caller's.
+  const apiKeyAccountId = await resolveApiKey(req);
+  if (apiKeyAccountId) {
+    if (!question || typeof question !== 'string') {
+      return res.status(400).json({ error: 'body.question (string) is required' });
+    }
+    if (question.length > config.maxQuestionLength) {
+      return res.status(400).json({ error: `body.question must be at most ${config.maxQuestionLength} characters` });
+    }
+
+    // Reserve the worst-case (surge-capped) price up front — askMetered()
+    // only reveals the real, possibly-lower price it actually charged
+    // after the on-chain charge has already happened, so the reservation
+    // has to cover the ceiling, not the (not-yet-known) actual. See
+    // reserveCredit()'s doc comment in billing.js.
+    const resolvedTier = resolveTier(tier);
+    const maxStroops = Number(resolvedTier.priceStroops * BigInt(MAX_SURGE_MULTIPLIER));
+    const reserved = await reserveCredit(apiKeyAccountId, maxStroops);
+    if (!reserved) {
+      return res.status(402).json({ error: 'insufficient credit balance — top up via POST /billing/checkout' });
+    }
+
+    try {
+      const result = await askMetered(config.billing.fiatPoolAddress, question, tier, category);
+      await settleReservation(apiKeyAccountId, maxStroops, Number(result.amountStroops));
+      return res.status(202).json({ ...result, statusUrl: `/oracle/${result.jobId}` });
+    } catch (err) {
+      // Refund the reservation in full — this failure is the platform's
+      // pooled float running low, never the customer's fault, so it should
+      // never cost them credit. Never surfaced to the customer as "the
+      // platform is low on funds" — that's an operator concern (see the
+      // Treasury admin view), not something to leak externally.
+      await settleReservation(apiKeyAccountId, maxStroops, 0);
+      req.log.error({ err, apiKeyAccountId }, 'fiat-pool charge failed — platform pooled balance may be low');
+      return res.status(503).json({ error: 'temporarily unable to process — try again shortly' });
+    }
+  }
+
   if (payerAddress) {
     if (!question || typeof question !== 'string') {
       return res.status(400).json({ error: 'body.question (string) is required' });
@@ -190,7 +256,7 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
       return res.status(verdict.status).json({ questionId, reason: verdict.reason });
     }
 
-    const { jobId } = await startFulfillment(questionId, verdict.pending, verdict.tier);
+    const { jobId } = await startFulfillment(questionId, verdict.pending, verdict.tier, verdict.payerAddress);
     return res.status(202).json({
       jobId,
       questionId,
@@ -270,6 +336,35 @@ app.get('/payers/:address/questions', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
+// Billing — the non-crypto onramp. /billing/webhook is registered above,
+// before express.json(), since it needs the raw request body. Everything
+// here is a no-op 503 when billing isn't configured (see
+// isBillingConfigured in billing.js) rather than a crash, same
+// fail-closed-if-unconfigured posture as /admin/* and /anchor/*.
+// ---------------------------------------------------------------------
+
+app.post('/billing/checkout', rateLimited('billing', byIp), async (req, res) => {
+  if (!isBillingConfigured()) return res.status(503).json({ error: 'billing not configured' });
+  const { amountUsd, successUrl, cancelUrl } = req.body || {};
+  if (!successUrl || !cancelUrl) {
+    return res.status(400).json({ error: 'successUrl and cancelUrl are required' });
+  }
+  try {
+    const result = await createCheckoutSession(Number(amountUsd), successUrl, cancelUrl);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message || 'failed to create checkout session' });
+  }
+});
+
+app.get('/billing/account', async (req, res) => {
+  const accountId = await resolveApiKey(req);
+  if (!accountId) return res.status(401).json({ error: 'a valid API key is required' });
+  const creditBalanceStroops = await getCreditBalanceStroops(accountId);
+  res.json({ accountId, creditBalanceStroops: String(creditBalanceStroops), creditBalance: stroopsToUsdc(creditBalanceStroops) });
+});
+
+// ---------------------------------------------------------------------
 // Gas sponsorship — payers and workers never need to hold XLM. Every route
 // here costs the platform a real fee-bump, so all are rate-limited.
 // ---------------------------------------------------------------------
@@ -333,12 +428,17 @@ app.post('/sponsor/stake', rateLimited('sponsor', byIp), async (req, res) => {
 });
 
 app.post('/sponsor/withdraw', rateLimited('sponsor', byIp), async (req, res) => {
-  const { xdr, workerAddress } = req.body || {};
-  if (!xdr || !workerAddress) {
-    return res.status(400).json({ error: 'xdr and workerAddress are required' });
+  const { xdr, workerAddress, amountStroops, beneficiaryAddress } = req.body || {};
+  if (!xdr || !workerAddress || !amountStroops) {
+    return res.status(400).json({ error: 'xdr, workerAddress, and amountStroops are required' });
   }
   try {
-    const result = await feeBumpWithdraw(xdr, workerAddress);
+    // beneficiaryAddress is opt-in: present -> the worker signed a
+    // withdraw_to() call routing the payout elsewhere; absent -> the
+    // ordinary withdraw() call paying the worker's own address.
+    const result = beneficiaryAddress
+      ? await feeBumpWithdrawTo(xdr, workerAddress, beneficiaryAddress, amountStroops)
+      : await feeBumpWithdraw(xdr, workerAddress, amountStroops);
     res.json(result);
   } catch (err) {
     req.log.error({ err }, 'sponsor withdraw failed');
@@ -490,6 +590,86 @@ app.post('/app/answer', rateLimited('answer', byIp), (req, res) => {
     return res.status(409).json({ ok: false, error: 'question is closed, expired, or already answered by this worker' });
   }
   res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------
+// Admin/ops console — everything here is read-only and gated by
+// requireAdmin (see adminAuth.js). No rate limit: these calls don't spend
+// a network fee or write state the way /sponsor/* and /oracle do, and the
+// bearer-token gate is the actual access control.
+// ---------------------------------------------------------------------
+
+app.get('/admin/transactions', requireAdmin, async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 50, 200);
+  const offset = Number(req.query.offset) || 0;
+  res.json(await listTransactions({ limit, offset }));
+});
+
+app.get('/admin/workers', requireAdmin, async (req, res) => {
+  res.json({ workers: await listWorkers() });
+});
+
+app.get('/admin/payers', requireAdmin, async (req, res) => {
+  res.json({ payers: await listPayers() });
+});
+
+app.get('/admin/treasury', requireAdmin, async (req, res) => {
+  res.json(await getTreasury());
+});
+
+app.get('/admin/fees', requireAdmin, async (req, res) => {
+  res.json(await getFeeRevenue());
+});
+
+app.get('/admin/payouts', requireAdmin, async (req, res) => {
+  res.json({ payouts: await listAnchorPayouts() });
+});
+
+app.get('/admin/kyc', requireAdmin, async (req, res) => {
+  res.json({ customers: await listAnchorKyc() });
+});
+
+// ---------------------------------------------------------------------
+// Fiat rails — Arbiter is a CLIENT of one configured SEP-24/SEP-12 anchor
+// (see anchorClient.js), never a money transmitter itself. The frontend
+// drives SEP-10 auth and the SEP-24 interactive deposit/withdraw flow
+// directly against the anchor using the config below (that's the only way
+// it can work: the anchor's JWT is gated by the account holder's own
+// signature, which this backend never has). /anchor/report is this
+// backend's only write path — a self-authenticated user telling us what
+// their own browser observed, purely so the admin console has something
+// to show (see admin.js's listAnchorPayouts/listAnchorKyc for that caveat).
+// ---------------------------------------------------------------------
+
+app.get('/anchor/config', async (req, res) => {
+  if (!isAnchorConfigured()) {
+    return res.status(503).json({ error: 'no fiat anchor is configured on this server (ANCHOR_HOME_DOMAIN unset)' });
+  }
+  try {
+    res.json(await getAnchorConfig());
+  } catch (err) {
+    req.log.error({ err }, 'failed to resolve anchor stellar.toml');
+    res.status(502).json({ error: 'failed to resolve the configured anchor\'s stellar.toml' });
+  }
+});
+
+app.post('/anchor/report', rateLimited('push', byIp), async (req, res) => {
+  const { address, token, kind, status, amount, assetCode, anchorTransactionId, tier } = req.body || {};
+  if (verifySessionToken(token) !== address) {
+    return res.status(401).json({ error: 'a valid session token for this address is required — see POST /payers/:address/session or /workers/:address/session' });
+  }
+
+  try {
+    if (kind === 'kyc') {
+      await recordAnchorKyc(address, { status, tier });
+    } else {
+      if (!anchorTransactionId) return res.status(400).json({ error: 'anchorTransactionId is required for deposit/withdrawal reports' });
+      await recordAnchorTransaction(address, { kind, status, amount, assetCode, anchorTransactionId });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 // Serve the built worker UI from the same Express app.

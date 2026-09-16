@@ -11,6 +11,7 @@ import {
   onlineWorkerCount,
   computeSmoothedCount,
   isEstablishedWorker,
+  stakeGateAllows,
 } from '../src/dispatch.js';
 
 function fakeRes() {
@@ -211,6 +212,30 @@ test('computeSmoothedCount is not moved by a single-instant dip the way the raw 
   const samples = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 0];
   const smoothed = computeSmoothedCount(samples, 0);
   assert.ok(smoothed >= 9, `expected the single dip to barely move the average, got ${smoothed}`);
+});
+
+// --- stakeGateAllows: closes the "unstake to zero, then misbehave for
+// free" gap found pressure-testing the netting engine. Owed earnings are
+// never touched by this — it only gates future dispatch eligibility. ---
+
+test('stakeGateAllows always allows when the feature is disabled (minStakeStroops <= 0)', () => {
+  assert.equal(stakeGateAllows(0n, 0n), true);
+  assert.equal(stakeGateAllows(undefined, 0n), true);
+});
+
+test('stakeGateAllows fails open when there is no cached stake yet', () => {
+  // Just-connected worker, or an RPC hiccup skipped a sample — routing
+  // quality is a soft preference, payment settlement is not.
+  assert.equal(stakeGateAllows(undefined, 1_000_000n), true);
+});
+
+test('stakeGateAllows denies a cached stake below the configured minimum', () => {
+  assert.equal(stakeGateAllows(500_000n, 1_000_000n), false);
+});
+
+test('stakeGateAllows allows a cached stake at or above the configured minimum', () => {
+  assert.equal(stakeGateAllows(1_000_000n, 1_000_000n), true);
+  assert.equal(stakeGateAllows(2_000_000n, 1_000_000n), true);
 });
 
 // --- established-worker check, used to gate reconcile.js's fast path ---

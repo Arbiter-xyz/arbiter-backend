@@ -59,13 +59,13 @@ test('a transaction with more than one operation is rejected regardless of conte
   const account = new Account(kp.publicKey(), '1');
   const contract = new Contract(config.contractId);
   const tx = new TransactionBuilder(account, { fee: '100', networkPassphrase: Networks.TESTNET })
-    .addOperation(contract.call('withdraw', addressArg(worker)))
-    .addOperation(contract.call('withdraw', addressArg(worker)))
+    .addOperation(contract.call('withdraw', addressArg(worker), nativeToScVal(500_000n, { type: 'i128' })))
+    .addOperation(contract.call('withdraw', addressArg(worker), nativeToScVal(500_000n, { type: 'i128' })))
     .setTimeout(30)
     .build();
   tx.sign(kp);
 
-  await assert.rejects(() => feeBumpWithdraw(tx.toXDR(), worker), (err) => {
+  await assert.rejects(() => feeBumpWithdraw(tx.toXDR(), worker, 500_000n), (err) => {
     assert.match(err.message, /expected exactly one operation/);
     return true;
   });
@@ -74,9 +74,19 @@ test('a transaction with more than one operation is rejected regardless of conte
 test('withdraw() for a DIFFERENT worker than claimed is rejected (prevents spoofing whose payout is fee-bumped)', async () => {
   const actualWorker = Keypair.random().publicKey();
   const claimedWorker = Keypair.random().publicKey();
-  const xdr = buildSignedTx('withdraw', [addressArg(actualWorker)]);
+  const xdr = buildSignedTx('withdraw', [addressArg(actualWorker), nativeToScVal(500_000n, { type: 'i128' })]);
 
-  await assert.rejects(() => feeBumpWithdraw(xdr, claimedWorker), (err) => {
+  await assert.rejects(() => feeBumpWithdraw(xdr, claimedWorker, 500_000n), (err) => {
+    assert.match(err.message, /does not match the expected withdraw\(\) call/);
+    return true;
+  });
+});
+
+test('withdraw() with a mismatched amount is rejected', async () => {
+  const worker = Keypair.random().publicKey();
+  const xdr = buildSignedTx('withdraw', [addressArg(worker), nativeToScVal(1n, { type: 'i128' })]);
+
+  await assert.rejects(() => feeBumpWithdraw(xdr, worker, 999_999n), (err) => {
     assert.match(err.message, /does not match the expected withdraw\(\) call/);
     return true;
   });

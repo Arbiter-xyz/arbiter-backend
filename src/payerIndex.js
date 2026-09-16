@@ -12,11 +12,29 @@ import { store } from './store.js';
 const PREFIX = 'payer-questions:';
 const MAX_TRACKED_PER_PAYER = 200; // bound growth; keep the most recent
 
+// Mirrors dispatch.js's WORKER_INDEX_KEY / jobs.js's JOB_INDEX_KEY: a
+// durable, bounded list of every payer address ever seen, so an admin
+// "Payers" list can be enumerated without a store-wide scan.
+const PAYER_INDEX_KEY = 'known-payer-addresses';
+const MAX_TRACKED_PAYERS = 5_000;
+
+export async function getKnownPayerAddresses() {
+  return (await store.get(PAYER_INDEX_KEY)) || [];
+}
+
 export async function recordPayerQuestion(payerAddress, questionId) {
   const key = PREFIX + payerAddress;
   const existing = (await store.get(key)) || [];
+  const isNew = existing.length === 0;
   const next = [questionId, ...existing.filter((id) => id !== questionId)].slice(0, MAX_TRACKED_PER_PAYER);
   await store.set(key, next); // no TTL — durable, same choice as reputation
+
+  if (isNew) {
+    const known = await getKnownPayerAddresses();
+    if (!known.includes(payerAddress)) {
+      await store.set(PAYER_INDEX_KEY, [payerAddress, ...known].slice(0, MAX_TRACKED_PAYERS));
+    }
+  }
 }
 
 export async function getPayerQuestionIds(payerAddress) {

@@ -6,6 +6,7 @@ import { resolveQuestion, refundQuestion, getQuestionOnChain } from './stellarCl
 import { resolveTier, listTiersForClient, stroopsToUsdc, priceForTier } from './pricing.js';
 import { incrementStat } from './stats.js';
 import { recordPayerQuestion } from './payerIndex.js';
+import { notifyWorker } from './push.js';
 import { jobLogger } from './logger.js';
 import { store } from './store.js';
 import { config } from './config.js';
@@ -99,8 +100,7 @@ export async function verifyPayment(questionId) {
   }
 
   const tier = { ...resolveTier(pending.tierKey), priceStroops: quotedPriceStroops };
-  await recordPayerQuestion(onChain.payer, questionId);
-  return { ok: true, pending, tier };
+  return { ok: true, pending, tier, payerAddress: onChain.payer };
 }
 
 /**
@@ -119,8 +119,15 @@ export async function verifyPayment(questionId) {
  * atomic claim (see jobs.js::claimJob) rather than a plain existence check,
  * since two truly concurrent retries could otherwise both observe "no job
  * yet" and both proceed.
+ *
+ * `payerAddress` is optional (the sandbox path has no real payer) and, when
+ * present, is both stored on the job record (so the admin console's
+ * Transactions view can show who asked) and indexed via
+ * recordPayerQuestion — centralized here, the one place both the classic
+ * submit()-based flow (verifyPayment) and the prepaid-balance flow
+ * (askMetered) converge, instead of duplicated in each caller.
  */
-export async function startFulfillment(questionId, pending, tier) {
+export async function startFulfillment(questionId, pending, tier, payerAddress) {
   const claimed = await claimJob(questionId);
   if (!claimed) return { jobId: questionId };
 
@@ -131,7 +138,10 @@ export async function startFulfillment(questionId, pending, tier) {
     timeoutMs: tier.timeoutMs,
     amountStroops: tier.priceStroops.toString(),
     amount: stroopsToUsdc(tier.priceStroops),
+    payer: payerAddress || null,
   });
+
+  if (payerAddress) await recordPayerQuestion(payerAddress, questionId);
 
   fulfillOracleCall(questionId, pending, tier).catch((err) => {
     // fulfillOracleCall is written to always settle the escrow before
@@ -263,6 +273,19 @@ async function settleResolved(questionId, submissions, result) {
     await recordReputationOutcomes(submissions, result.matchingWorkerIds);
     await dropStashedQuestion(questionId);
     await incrementStat('resolved');
+
+    // Proactive "you got paid" push — a worker who answers once and closes
+    // the tab has no other way to learn they were credited (the console
+    // only shows it on the next visit/poll). notifyWorker() never throws,
+    // so a failed notification can never put settlement itself at risk.
+    for (const workerId of result.matchingWorkerIds) {
+      notifyWorker(workerId, {
+        title: 'You got paid on Arbiter',
+        body: 'Your answer matched consensus — the payout is credited and ready to withdraw.',
+        questionId: questionId.toString(),
+        type: 'credited',
+      }).catch(() => {});
+    }
     await updateJob(questionId, {
       status: 'settled',
       outcome: 'resolved',

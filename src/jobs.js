@@ -3,6 +3,26 @@ import { config } from './config.js';
 
 const PREFIX = 'job:';
 
+// A single durable list of every jobId ever created, in most-recent-first
+// order — jobs themselves are keyed by jobId (job:{id}), fine for a single
+// lookup but not enumerable on their own. Same index pattern as dispatch.js's
+// WORKER_INDEX_KEY / payerIndex.js's payer index: bounded and durable, since
+// unbounded growth (not capacity) is the real failure mode at this scale.
+// This is what makes an admin "Transactions" list possible without a Redis
+// KEYS/SCAN (unsafe in production, and unsupported by the in-memory store).
+const JOB_INDEX_KEY = 'known-job-ids';
+const MAX_TRACKED_JOBS = 5_000;
+
+async function indexJob(jobId) {
+  const known = (await store.get(JOB_INDEX_KEY)) || [];
+  if (known.includes(jobId)) return;
+  await store.set(JOB_INDEX_KEY, [jobId, ...known].slice(0, MAX_TRACKED_JOBS));
+}
+
+export async function getKnownJobIds() {
+  return (await store.get(JOB_INDEX_KEY)) || [];
+}
+
 /**
  * Async job record for a paid question. Replaces v1's design of holding the
  * client's HTTP request open for up to QUORUM_TIMEOUT_MS while workers
@@ -38,6 +58,7 @@ export async function createJob(jobId, initial) {
     ...initial,
   };
   await store.set(PREFIX + jobId, record, config.jobResultTtlMs);
+  await indexJob(jobId);
   return record;
 }
 

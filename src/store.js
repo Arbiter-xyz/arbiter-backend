@@ -13,10 +13,9 @@ import { logger } from './logger.js';
  * NOT covered by this abstraction: the live worker SSE registry and the
  * per-question quorum collector in dispatch.js. Those hold open socket
  * objects and in-process timers, which are inherently tied to whichever
- * process accepted the connection. Running more than one backend instance
- * behind a load balancer would need a pub/sub fan-out (e.g. Redis pub/sub)
- * so a question dispatched on instance A reaches a worker connected to
- * instance B — that's a real follow-up, not implemented here.
+ * process accepted the connection. See pubsub.js for how dispatch.js fans
+ * those out across instances using getClient()/setNX()/hsetnx()/hgetall()
+ * below as the coordination primitives.
  */
 
 class MemoryStore {
@@ -60,6 +59,74 @@ class MemoryStore {
     this.map.set(key, { value: next, expiresAt: ttlMs ? now + ttlMs : null });
     return next;
   }
+
+  // No Redis client to duplicate a pub/sub connection from — see pubsub.js's
+  // createPubSub(), which falls back to an in-process broker when this
+  // returns null, same "no Redis, no distributed anything" trade-off as
+  // every other feature in this file.
+  getClient() {
+    return null;
+  }
+
+  /** Same run-to-completion-safe check-then-set discipline as incr() above:
+   * no `await` between the read and the write, so two concurrent callers
+   * for the same key can't both observe "not set yet." */
+  async setNX(key, value, ttlMs) {
+    const entry = this.map.get(key);
+    const now = Date.now();
+    if (entry && (!entry.expiresAt || entry.expiresAt >= now)) return false;
+    this.map.set(key, { value, expiresAt: ttlMs ? now + ttlMs : null });
+    return true;
+  }
+
+  /** A hash living under one KV key, dedup'd per field — the answer-
+   * collection primitive: many workers (fields) racing to write into one
+   * question's (key's) hash, each exactly once. TTL is set only on the
+   * hash's first-ever field, mirroring incr()'s TTL-on-first-write; later
+   * fields extend the same entry without resetting its expiry. */
+  async hsetnx(key, field, value, ttlMs) {
+    const now = Date.now();
+    const entry = this.map.get(key);
+    const alive = entry && (!entry.expiresAt || entry.expiresAt >= now);
+    const hash = alive ? entry.value : {};
+    if (Object.prototype.hasOwnProperty.call(hash, field)) return false;
+    hash[field] = value;
+    this.map.set(key, { value: hash, expiresAt: alive ? entry.expiresAt : ttlMs ? now + ttlMs : null });
+    return true;
+  }
+
+  async hgetall(key) {
+    const entry = this.map.get(key);
+    if (!entry) return {};
+    if (entry.expiresAt && entry.expiresAt < Date.now()) {
+      this.map.delete(key);
+      return {};
+    }
+    return { ...entry.value };
+  }
+
+  /** Durable accumulator — no TTL, matching every other money-like balance
+   * in this codebase (Owed, reputation, payer records): a credit balance
+   * must never silently expire. Same run-to-completion-safe check-then-
+   * write discipline as incr(). */
+  async incrBy(key, delta) {
+    const entry = this.map.get(key);
+    const next = (entry ? entry.value : 0) + delta;
+    this.map.set(key, { value: next, expiresAt: null });
+    return next;
+  }
+
+  /** Atomic conditional decrement — the credit-reservation primitive: only
+   * succeeds if the balance can afford `amount`, so two concurrent
+   * reservations against the same account can never both succeed against
+   * funds that only cover one of them. */
+  async decrIfAtLeast(key, amount) {
+    const entry = this.map.get(key);
+    const current = entry ? entry.value : 0;
+    if (current < amount) return false;
+    this.map.set(key, { value: current - amount, expiresAt: null });
+    return true;
+  }
 }
 
 class RedisStore {
@@ -86,6 +153,33 @@ class RedisStore {
     const next = await this.client.incr(key);
     if (next === 1 && ttlMs) await this.client.pexpire(key, ttlMs);
     return next;
+  }
+
+  getClient() {
+    return this.client;
+  }
+
+  async setNX(key, value, ttlMs) {
+    const raw = JSON.stringify(value);
+    const result = ttlMs
+      ? await this.client.set(key, raw, 'PX', ttlMs, 'NX')
+      : await this.client.set(key, raw, 'NX');
+    return result === 'OK';
+  }
+
+  async hsetnx(key, field, value, ttlMs) {
+    const wasSet = await this.client.hsetnx(key, field, JSON.stringify(value));
+    if (wasSet === 1 && ttlMs) await this.client.pexpire(key, ttlMs);
+    return wasSet === 1;
+  }
+
+  async hgetall(key) {
+    const raw = await this.client.hgetall(key);
+    const result = {};
+    for (const [field, value] of Object.entries(raw)) {
+      result[field] = JSON.parse(value);
+    }
+    return result;
   }
 }
 

@@ -11,7 +11,7 @@ import { withRetry } from './retry.js';
 const HORIZON_RETRY_OPTS = { attempts: 2, timeoutMs: 10_000, baseDelayMs: 300 };
 
 let horizonServer = null;
-function getHorizon() {
+export function getHorizon() {
   if (!horizonServer) {
     horizonServer = new Horizon.Server(config.horizonUrl, { allowHttp: config.horizonUrl.startsWith('http://') });
   }
@@ -137,10 +137,21 @@ export async function feeBumpStake(signedInnerXdr, workerAddress, amountStroops)
   ]);
 }
 
-/** Relays a worker's own withdraw(worker) call. Funds always land on the
- * address embedded in the call itself, which the contract's require_auth
- * already ties to the caller's own signature — there is no separate
- * "expected amount" to check here, unlike submit()/stake(). */
-export async function feeBumpWithdraw(signedInnerXdr, workerAddress) {
-  return relayFeeBump(signedInnerXdr, 'sponsor/withdraw', 'withdraw', [addressArg(workerAddress)]);
+/** Relays a worker's own withdraw(worker, amountStroops) call. */
+export async function feeBumpWithdraw(signedInnerXdr, workerAddress, amountStroops) {
+  return relayFeeBump(signedInnerXdr, 'sponsor/withdraw', 'withdraw', [
+    addressArg(workerAddress),
+    nativeToScVal(BigInt(amountStroops), { type: 'i128' }),
+  ]);
+}
+
+/** Relays a worker's own withdraw_to(worker, beneficiary, amountStroops)
+ * call — same balance draw-down and same require_auth as withdraw(), just
+ * routing the payout to a different address than the signing key. */
+export async function feeBumpWithdrawTo(signedInnerXdr, workerAddress, beneficiaryAddress, amountStroops) {
+  return relayFeeBump(signedInnerXdr, 'sponsor/withdraw', 'withdraw_to', [
+    addressArg(workerAddress),
+    addressArg(beneficiaryAddress),
+    nativeToScVal(BigInt(amountStroops), { type: 'i128' }),
+  ]);
 }
