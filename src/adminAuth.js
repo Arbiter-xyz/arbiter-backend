@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto';
 import { config } from './config.js';
 
 /**
@@ -14,9 +15,16 @@ export function requireAdmin(req, res, next) {
 
   const header = req.get('authorization') || '';
   const [scheme, token] = header.split(' ');
-  if (scheme !== 'Bearer' || token !== config.admin.token) {
+  if (scheme !== 'Bearer' || !token) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const tokenBuf = Buffer.from(token);
+  const expectedBuf = Buffer.from(config.admin.token);
+  if (tokenBuf.length !== expectedBuf.length || !timingSafeEqual(tokenBuf, expectedBuf)) {
     return res.status(401).json({ error: 'unauthorized' });
   }
 
   next();
 }
+

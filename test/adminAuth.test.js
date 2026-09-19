@@ -37,9 +37,31 @@ test('rejects a wrong bearer token', () => {
   assert.equal(state.nextCalled, false);
 });
 
+test('rejects a same-length-but-wrong bearer token', () => {
+  const { req, res, next, state } = mockReqRes('Bearer test-admin-tokex');
+  requireAdmin(req, res, next);
+  assert.equal(state.statusCode, 401);
+  assert.equal(state.nextCalled, false);
+});
+
+test('rejects an empty bearer token', () => {
+  const { req, res, next, state } = mockReqRes('Bearer ');
+  requireAdmin(req, res, next);
+  assert.equal(state.statusCode, 401);
+  assert.equal(state.nextCalled, false);
+});
+
+test('rejects a non-Bearer authorization scheme', () => {
+  const { req, res, next, state } = mockReqRes('Basic dGVzdC1hZG1pbi10b2tlbg==');
+  requireAdmin(req, res, next);
+  assert.equal(state.statusCode, 401);
+  assert.equal(state.nextCalled, false);
+});
+
 test('calls next() for the correct bearer token', () => {
   const { req, res, next, state } = mockReqRes('Bearer test-admin-token');
   requireAdmin(req, res, next);
   assert.equal(state.nextCalled, true);
   assert.equal(state.statusCode, null);
 });
+
