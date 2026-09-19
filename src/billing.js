@@ -74,10 +74,30 @@ export async function settleReservation(accountId, reservedStroops, actualStroop
  * Session to fund it. The raw key is embedded in success_url and shown
  * exactly once on redirect — the same one-time-reveal pattern Stripe
  * itself uses for webhook signing secrets. Losing it means starting over;
- * key recovery/rotation is a deliberate v1 gap, not an oversight. */
+ * key recovery/rotation is a deliberate v1 gap, not an oversight.
+ *
+ * successUrl/cancelUrl are caller-supplied, and the raw key is appended
+ * directly to successUrl's query string — without validating the origin,
+ * any caller could point successUrl at a domain they control and have
+ * Stripe hand a freshly-minted API key straight to them once a real payer
+ * completes checkout. Restricted to the same allowlist CORS already
+ * enforces (config.allowedOrigins) — a redirect target has to be
+ * somewhere this backend already trusts to run frontend code at all. */
+export function isAllowedRedirectUrl(url) {
+  if (config.allowedOrigins.includes('*')) return true; // wide-open dev mode, same default as CORS
+  try {
+    return config.allowedOrigins.includes(new URL(url).origin);
+  } catch {
+    return false;
+  }
+}
+
 export async function createCheckoutSession(amountUsd, successUrl, cancelUrl) {
   if (!Number.isFinite(amountUsd) || amountUsd < config.billing.minTopupUsd) {
     throw new Error(`amountUsd must be a number >= ${config.billing.minTopupUsd}`);
+  }
+  if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
+    throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
   }
 
   const { accountId, rawKey } = await createAccount();

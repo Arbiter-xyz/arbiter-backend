@@ -3,8 +3,31 @@ import './helpers/billing-test-env.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import Stripe from 'stripe';
-import { reserveCredit, settleReservation, getCreditBalanceStroops, handleStripeWebhook } from '../src/billing.js';
+import {
+  reserveCredit,
+  settleReservation,
+  getCreditBalanceStroops,
+  handleStripeWebhook,
+  isAllowedRedirectUrl,
+  createCheckoutSession,
+} from '../src/billing.js';
 import { config } from '../src/config.js';
+
+/** config.allowedOrigins is an array nested inside a frozen config object
+ * — Object.freeze is shallow, so the array's own contents are still
+ * mutable, which is how these tests exercise both the wide-open default
+ * and a restricted allowlist without needing a second process/env. */
+function withAllowedOrigins(origins, fn) {
+  const original = [...config.allowedOrigins];
+  config.allowedOrigins.length = 0;
+  config.allowedOrigins.push(...origins);
+  return Promise.resolve()
+    .then(fn)
+    .finally(() => {
+      config.allowedOrigins.length = 0;
+      config.allowedOrigins.push(...original);
+    });
+}
 
 function uniqueId(prefix) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -96,3 +119,37 @@ test('handleStripeWebhook ignores event types other than checkout.session.comple
 
   assert.equal(await getCreditBalanceStroops(accountId), 0);
 });
+
+// Regression coverage: successUrl/cancelUrl used to be passed straight
+// through to Stripe with the freshly-minted API key appended to
+// successUrl's query string, with no origin check at all — any caller
+// could point successUrl at a domain they control and have Stripe hand
+// the key straight to them once a real payer completed checkout.
+
+test('isAllowedRedirectUrl allows any origin when ALLOWED_ORIGINS is wide open (the default)', () =>
+  withAllowedOrigins(['*'], () => {
+    assert.equal(isAllowedRedirectUrl('https://anything.example.com/success'), true);
+  }));
+
+test('isAllowedRedirectUrl restricts to the configured allowlist once one is set', () =>
+  withAllowedOrigins(['https://app.arbiter.example'], () => {
+    assert.equal(isAllowedRedirectUrl('https://app.arbiter.example/billing/success'), true);
+    assert.equal(isAllowedRedirectUrl('https://attacker.example.com/steal'), false);
+    assert.equal(isAllowedRedirectUrl('not-a-url'), false);
+  }));
+
+test('createCheckoutSession rejects a successUrl on a disallowed origin before any Stripe call', () =>
+  withAllowedOrigins(['https://app.arbiter.example'], async () => {
+    await assert.rejects(
+      () => createCheckoutSession(20, 'https://attacker.example.com/steal?next=', 'https://app.arbiter.example/cancel'),
+      /allowed origin/,
+    );
+  }));
+
+test('createCheckoutSession rejects a disallowed cancelUrl too, not just successUrl', () =>
+  withAllowedOrigins(['https://app.arbiter.example'], async () => {
+    await assert.rejects(
+      () => createCheckoutSession(20, 'https://app.arbiter.example/success', 'https://attacker.example.com/cancel'),
+      /allowed origin/,
+    );
+  }));

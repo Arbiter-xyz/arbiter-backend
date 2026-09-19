@@ -16,8 +16,18 @@ import { config } from './config.js';
  * LOG_FORMAT=json for real deployments where something else (Datadog,
  * CloudWatch, etc.) parses the JSON lines directly.
  */
+// pino-http's default req serializer includes the full request headers
+// object — without this, every admin bearer token, ak_live_ API key, and
+// worker/payer session token sent via `Authorization` lands verbatim in
+// every request log line, worse in LOG_FORMAT=json production mode
+// feeding an external aggregator most operators can't fully lock down.
+// Exported standalone so the redaction behavior is directly testable
+// against a real pino instance without needing the app's own transport.
+export const REDACT_CONFIG = { paths: ['req.headers.authorization', 'req.headers.cookie'], censor: '[redacted]' };
+
 export const logger = pino({
   level: config.logLevel,
+  redact: REDACT_CONFIG,
   transport:
     config.logFormat === 'json'
       ? undefined
