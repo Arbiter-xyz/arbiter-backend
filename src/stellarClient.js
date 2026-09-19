@@ -53,7 +53,7 @@ export function vecOfAddresses(addresses) {
  * question, so it must fail fast enough to still hit the fail-closed
  * refund fallback promptly, not retry indefinitely.
  */
-async function invokeAsAdmin(method, scValArgs) {
+async function runInvokeAsAdmin(method, scValArgs) {
   return withRetry(
     async () => {
       const srv = getServer();
@@ -82,6 +82,53 @@ async function invokeAsAdmin(method, scValArgs) {
     },
     { attempts: 2, timeoutMs: 10_000, baseDelayMs: 300, label: `invokeAsAdmin(${method})` },
   );
+}
+
+/** There is exactly one Stellar account signing every admin call (the
+ * platform key), and Stellar requires a strictly increasing, gap-free
+ * sequence number per submitted transaction from that account. Two
+ * invokeAsAdmin() calls that overlap in time would otherwise both fetch
+ * the *same* current sequence and both build a transaction for
+ * `sequence + 1` — only one can land, and the other fails outright rather
+ * than retrying into success, since a fresh getAccount() read moments
+ * later would just collide with a THIRD concurrent caller instead. This
+ * is ordinary production traffic, not a rare edge case: two questions
+ * settling around the same moment, or sweepWorkerTtls()'s daily
+ * Promise.all() fan-out across every known worker, all sign from this
+ * same key at once.
+ *
+ * Queuing every call onto one chain — waiting for the previous call's
+ * entire build/sign/submit/poll cycle to finish before the next one even
+ * reads a sequence number — is what actually fixes it: by the time a
+ * queued call's runInvokeAsAdmin() does its own getAccount() read, the
+ * previous call's sequence bump has already landed on a closed ledger
+ * (pollTransaction waits for that), so there is never a stale snapshot
+ * for two calls to race over. The queue variable itself always resolves,
+ * regardless of whether the call it's tracking succeeded or failed — only
+ * `result` (returned to the real caller) carries the real outcome — so
+ * one failed admin call can never wedge every later one behind a
+ * permanently-rejected link.
+ *
+ * The queueing itself is Stellar-agnostic, so it's factored out as its own
+ * function and exported — directly testable without mocking the RPC layer
+ * at all, the same reason computeSmoothedCount/stakeGateAllows/
+ * surgeMultiplier exist as pure functions elsewhere in this codebase. */
+export function createSerialQueue() {
+  let tail = Promise.resolve();
+  return function serialize(fn) {
+    const result = tail.then(fn, fn);
+    tail = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  };
+}
+
+const serializeAdminCall = createSerialQueue();
+
+function invokeAsAdmin(method, scValArgs) {
+  return serializeAdminCall(() => runInvokeAsAdmin(method, scValArgs));
 }
 
 export async function resolveQuestion(questionId, matchingWorkerAddresses, losingWorkerAddresses = []) {
