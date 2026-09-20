@@ -50,8 +50,14 @@ export const PRICING_TIERS = Object.freeze({
 
 export const DEFAULT_TIER_KEY = 'standard';
 
+// hasOwnProperty guard, not a plain bracket lookup: a plain
+// PRICING_TIERS[tierKey] on a caller-supplied string resolves inherited
+// Object.prototype members too — tierKey: "__proto__" returns
+// Object.prototype itself (truthy, so the `||` default never kicks in),
+// and priceForTier() then crashes trying to BigInt() a NaN instead of
+// cleanly falling back to the standard tier.
 export function resolveTier(tierKey) {
-  return PRICING_TIERS[tierKey] || PRICING_TIERS[DEFAULT_TIER_KEY];
+  return Object.prototype.hasOwnProperty.call(PRICING_TIERS, tierKey) ? PRICING_TIERS[tierKey] : PRICING_TIERS[DEFAULT_TIER_KEY];
 }
 
 export function stroopsToUsdc(stroops) {

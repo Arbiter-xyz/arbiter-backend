@@ -1,6 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PRICING_TIERS, surgeMultiplier, priceForTier } from '../src/pricing.js';
+import { PRICING_TIERS, surgeMultiplier, priceForTier, resolveTier, DEFAULT_TIER_KEY } from '../src/pricing.js';
+
+// Regression coverage: resolveTier used a plain bracket lookup, so a
+// caller-supplied tierKey of "__proto__" resolved Object.prototype itself
+// (truthy — the `||` default never triggered) instead of falling back to
+// the default tier, and priceForTier() then crashed trying to BigInt() a
+// NaN rather than cleanly quoting the standard price.
+test('resolveTier falls back to the default tier for a prototype-pollution-style key, not Object.prototype', () => {
+  const tier = resolveTier('__proto__');
+  assert.equal(tier, PRICING_TIERS[DEFAULT_TIER_KEY]);
+  assert.doesNotThrow(() => priceForTier('__proto__', 5));
+});
+
+test('resolveTier falls back to the default tier for any other unknown key too', () => {
+  assert.equal(resolveTier('not-a-real-tier'), PRICING_TIERS[DEFAULT_TIER_KEY]);
+  assert.equal(resolveTier(undefined), PRICING_TIERS[DEFAULT_TIER_KEY]);
+});
 
 test('comfortable supply (>= 3x quorum size online) charges exactly the base price', () => {
   const tier = PRICING_TIERS.standard; // quorumSize 3 -> comfortable at 9 online
