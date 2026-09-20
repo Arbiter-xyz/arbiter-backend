@@ -218,7 +218,11 @@ describe('worker session auth over real HTTP — the /app/answer impersonation f
   let base;
 
   before(async () => {
-    server = startServer({ NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015' });
+    // This block's tests share the 'push' rate-limit bucket across many
+    // session-challenge calls (worker AND payer routes both use it) — bumped
+    // well above the default so the growing test count here doesn't start
+    // tripping 429s and masquerading as a broken auth check.
+    server = startServer({ NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015', PUSH_RATE_LIMIT_MAX: '100' });
     await server.ready;
     base = `http://localhost:${server.port}`;
   });
@@ -332,6 +336,73 @@ describe('worker session auth over real HTTP — the /app/answer impersonation f
   test('GET /app/events also enforces session auth for address-format worker ids', async () => {
     const worker = Keypair.random();
     const res = await fetch(`${base}/app/events?worker=${worker.publicKey()}`);
+    assert.equal(res.status, 401);
+  });
+
+  // Regression coverage: push-subscribe/unsubscribe used to have NO
+  // identity check at all for a real worker address — anyone who knew a
+  // worker's public address (visible on-chain from their own past
+  // resolve()/withdraw() transactions) could silently redirect that
+  // worker's notifications, or kill a competitor's, with zero proof of
+  // control. Same auth gate as /app/answer now applies.
+  test('POST /workers/:address/push-subscribe with an address-format id and NO token is rejected with 401', async () => {
+    const worker = Keypair.random();
+    const res = await fetch(`${base}/workers/${worker.publicKey()}/push-subscribe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subscription: { endpoint: 'https://push.example.com/fake', keys: { p256dh: 'x', auth: 'y' } } }),
+    });
+    assert.equal(res.status, 401);
+  });
+
+  test('POST /workers/:address/push-unsubscribe with an address-format id and NO token is rejected with 401', async () => {
+    const worker = Keypair.random();
+    const res = await fetch(`${base}/workers/${worker.publicKey()}/push-unsubscribe`, { method: 'POST' });
+    assert.equal(res.status, 401);
+  });
+
+  test('push-subscribe with a valid session for the address passes auth (reaches 200, not 401)', async () => {
+    const worker = Keypair.random();
+    const session = await getSession(worker);
+    const res = await fetch(`${base}/workers/${worker.publicKey()}/push-subscribe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        subscription: { endpoint: 'https://push.example.com/fake', keys: { p256dh: 'x', auth: 'y' } },
+        token: session.token,
+      }),
+    });
+    assert.equal(res.status, 200);
+  });
+
+  // Regression coverage: /payers/:address/questions and /balance used to
+  // return a payer's full question/answer text and prepaid balance to
+  // anyone who knew their address, no auth at all. Now gated the same way
+  // as every other per-address route.
+  test('GET /payers/:address/questions with an address-format id and NO token is rejected with 401', async () => {
+    const payer = Keypair.random();
+    const res = await fetch(`${base}/payers/${payer.publicKey()}/questions`);
+    assert.equal(res.status, 401);
+  });
+
+  test('GET /payers/:address/balance with an address-format id and NO token is rejected with 401', async () => {
+    const payer = Keypair.random();
+    const res = await fetch(`${base}/payers/${payer.publicKey()}/balance`);
+    assert.equal(res.status, 401);
+  });
+
+  test('GET /payers/:address/questions with a valid session for the address passes auth (reaches 200, not 401)', async () => {
+    const payer = Keypair.random();
+    const session = await getSession(payer);
+    const res = await fetch(`${base}/payers/${payer.publicKey()}/questions?token=${encodeURIComponent(session.token)}`);
+    assert.equal(res.status, 200);
+  });
+
+  test('GET /payers/:address/questions rejects a session token for a DIFFERENT address', async () => {
+    const victim = Keypair.random();
+    const attacker = Keypair.random();
+    const attackerSession = await getSession(attacker);
+    const res = await fetch(`${base}/payers/${victim.publicKey()}/questions?token=${encodeURIComponent(attackerSession.token)}`);
     assert.equal(res.status, 401);
   });
 });

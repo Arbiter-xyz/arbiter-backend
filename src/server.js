@@ -184,7 +184,16 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
     // reserveCredit()'s doc comment in billing.js.
     const resolvedTier = resolveTier(tier);
     const maxStroops = Number(resolvedTier.priceStroops * BigInt(MAX_SURGE_MULTIPLIER));
-    const reserved = await reserveCredit(apiKeyAccountId, maxStroops);
+    let reserved;
+    try {
+      reserved = await reserveCredit(apiKeyAccountId, maxStroops);
+    } catch (err) {
+      // An Express 4 async handler doesn't catch a throw on its own — left
+      // unguarded, this would be an unhandled rejection that crashes the
+      // whole process, not just fail this one request.
+      req.log.error({ err, apiKeyAccountId }, 'credit reservation failed unexpectedly');
+      return res.status(500).json({ error: 'failed to process request' });
+    }
     if (!reserved) {
       return res.status(402).json({ error: 'insufficient credit balance — top up via POST /billing/checkout' });
     }
@@ -299,6 +308,9 @@ app.post('/payers/:address/session', rateLimited('push', byIp), async (req, res)
 });
 
 app.get('/payers/:address/balance', async (req, res) => {
+  if (requiresAuth(req.params.address) && verifySessionToken(req.query.token) !== req.params.address) {
+    return res.status(401).json({ error: 'a valid session token for this address is required — see POST /payers/:address/session' });
+  }
   try {
     const balance = await getMeteredBalance(req.params.address);
     res.json({ ...balance, ...depositInstructions(req.params.address) });
@@ -322,6 +334,9 @@ app.get('/oracle/:jobId', async (req, res) => {
 // entries in the index may resolve to nothing — filtered out below rather
 // than surfaced as broken rows.
 app.get('/payers/:address/questions', async (req, res) => {
+  if (requiresAuth(req.params.address) && verifySessionToken(req.query.token) !== req.params.address) {
+    return res.status(401).json({ error: 'a valid session token for this address is required — see POST /payers/:address/session' });
+  }
   const ids = await getPayerQuestionIds(req.params.address);
   const jobs = await Promise.all(ids.map((id) => getJobStatus(id)));
   const summary = summarizePayerQuestions(ids, jobs);
@@ -494,7 +509,10 @@ app.get('/push/vapid-public-key', (req, res) => {
 });
 
 app.post('/workers/:address/push-subscribe', rateLimited('push', byIp), async (req, res) => {
-  const { subscription, categories } = req.body || {};
+  const { subscription, categories, token } = req.body || {};
+  if (requiresAuth(req.params.address) && verifySessionToken(token) !== req.params.address) {
+    return res.status(401).json({ error: 'a valid session token for this address is required — see POST /workers/:address/session' });
+  }
   if (!subscription || typeof subscription !== 'object' || !subscription.endpoint) {
     return res.status(400).json({ error: 'a valid PushSubscription object is required' });
   }
@@ -503,6 +521,10 @@ app.post('/workers/:address/push-subscribe', rateLimited('push', byIp), async (r
 });
 
 app.post('/workers/:address/push-unsubscribe', rateLimited('push', byIp), async (req, res) => {
+  const { token } = req.body || {};
+  if (requiresAuth(req.params.address) && verifySessionToken(token) !== req.params.address) {
+    return res.status(401).json({ error: 'a valid session token for this address is required — see POST /workers/:address/session' });
+  }
   await removeSubscription(req.params.address);
   res.json({ ok: true });
 });

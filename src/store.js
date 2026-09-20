@@ -129,7 +129,12 @@ class MemoryStore {
   }
 }
 
-class RedisStore {
+// Exported (unlike MemoryStore) so its methods are directly unit-testable
+// against a lightweight fake ioredis client — this codebase has no real
+// Redis in CI, so this is the only way RedisStore's own logic (the Lua
+// script in particular) ever actually runs under test, rather than just
+// being trusted to be correct by inspection.
+export class RedisStore {
   constructor(client) {
     this.client = client;
   }
@@ -180,6 +185,31 @@ class RedisStore {
       result[field] = JSON.parse(value);
     }
     return result;
+  }
+
+  // Durable — no TTL, matching MemoryStore's incrBy (money-like balances
+  // must never expire).
+  async incrBy(key, delta) {
+    return this.client.incrby(key, delta);
+  }
+
+  // Redis has no single-command "decrement only if the result would stay
+  // >= 0" — INCRBY/DECRBY are unconditional, so getting this right without
+  // a race between two concurrent reservations against the same account
+  // needs a server-side script: Redis evaluates a Lua script atomically
+  // (no other command runs while it's mid-flight), which is what makes
+  // "check then act" safe as one indivisible step here.
+  async decrIfAtLeast(key, amount) {
+    const result = await this.client.eval(
+      `local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+       if current < tonumber(ARGV[1]) then return 0 end
+       redis.call('DECRBY', KEYS[1], ARGV[1])
+       return 1`,
+      1,
+      key,
+      amount,
+    );
+    return result === 1;
   }
 }
 
