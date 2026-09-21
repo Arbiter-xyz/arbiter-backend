@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { isAnchorConfigured } from '../src/anchorClient.js';
 import { recordAnchorTransaction, getAnchorTransactions, recordAnchorKyc, getAnchorKyc } from '../src/anchorRecords.js';
 import { listAnchorPayouts, listAnchorKyc } from '../src/admin.js';
+import { withTimeout } from '../src/retry.js';
 
 function uniqueAddress(prefix) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -75,4 +76,13 @@ test('listAnchorKyc surfaces the latest reported status per address', async () =
   const row = customers.find((c) => c.address === address);
   assert.ok(row, 'the KYC report should appear in listAnchorKyc');
   assert.equal(row.status, 'ACCEPTED');
+});
+
+test('withTimeout rejects a never-settling fn within the bound (stellar.toml pattern)', async () => {
+  const start = Date.now();
+  await assert.rejects(
+    () => withTimeout(() => new Promise(() => {}), 50, 'stellar.toml resolve'),
+    /stellar\.toml resolve timed out after 50ms/,
+  );
+  assert.ok(Date.now() - start < 500, 'should not hang');
 });

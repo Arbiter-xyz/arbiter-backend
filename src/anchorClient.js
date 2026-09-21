@@ -1,5 +1,6 @@
 import { StellarToml } from '@stellar/stellar-sdk';
 import { config } from './config.js';
+import { withTimeout } from './retry.js';
 
 /**
  * Arbiter is a CLIENT of the configured anchor's stellar.toml — never a
@@ -29,7 +30,13 @@ export async function getAnchorConfig() {
   if (!isAnchorConfigured()) return null;
   if (cached && cached.expiresAt > Date.now()) return cached.config;
 
-  const toml = await StellarToml.Resolver.resolve(config.anchor.homeDomain);
+  // Bound the SDK's otherwise-unbounded stellar.toml fetch (Config timeout
+  // defaults to 0). A few seconds is plenty for .well-known/stellar.toml.
+  const toml = await withTimeout(
+    () => StellarToml.Resolver.resolve(config.anchor.homeDomain),
+    5_000,
+    'stellar.toml resolve',
+  );
   const resolved = {
     homeDomain: config.anchor.homeDomain,
     signingKey: toml.SIGNING_KEY || null,
