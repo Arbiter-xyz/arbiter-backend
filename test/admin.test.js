@@ -86,3 +86,19 @@ test('getFeeRevenue sums the platform\'s 20% cut only over settled+resolved jobs
   assert.ok(resolvedCount >= 1);
   assert.ok(Number(totalFeeRevenue) >= 0.2 - 1e-6, `expected at least ~0.2 USDC of fee revenue, got ${totalFeeRevenue}`);
 });
+
+// 56-char G-prefixed string that fails Ed25519 checksum validation.
+const INVALID_CHECKSUM_G_ADDRESS = 'G' + 'A'.repeat(55);
+
+test('listWorkers treats a checksum-invalid G-address as a non-address (stake/owed stay 0)', async () => {
+  const { StrKey } = await import('@stellar/stellar-sdk');
+  assert.equal(StrKey.isValidEd25519PublicKey(INVALID_CHECKSUM_G_ADDRESS), false);
+  assert.equal(INVALID_CHECKSUM_G_ADDRESS.startsWith('G') && INVALID_CHECKSUM_G_ADDRESS.length === 56, true);
+
+  await recordOutcome(INVALID_CHECKSUM_G_ADDRESS, true);
+  const workers = await listWorkers();
+  const row = workers.find((w) => w.workerId === INVALID_CHECKSUM_G_ADDRESS);
+  assert.ok(row, 'worker with a recorded outcome should appear in listWorkers');
+  assert.equal(row.stake, '0.0000000');
+  assert.equal(row.owed, '0.0000000');
+});
