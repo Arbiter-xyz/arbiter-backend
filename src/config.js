@@ -2,7 +2,12 @@ import 'dotenv/config';
 import { randomBytes } from 'node:crypto';
 
 function num(v, d) {
-  return v === undefined || v === '' ? d : Number(v);
+  if (v === undefined || v === '') return d;
+  const n = Number(v);
+  if (Number.isNaN(n)) {
+    throw new Error(`Invalid numeric config value: ${JSON.stringify(v)}`);
+  }
+  return n;
 }
 
 // Falls back to a random per-process secret if unset — sessions won't
