@@ -6,6 +6,7 @@ import { getStakeOnChain, getOwedOnChain } from './stellarClient.js';
 import { getHorizon } from './sponsor.js';
 import { config } from './config.js';
 import { stroopsToUsdc } from './pricing.js';
+import { StrKey } from '@stellar/stellar-sdk';
 
 const PLATFORM_FEE_BPS = 2000n; // mirrors contracts/oracle-escrow/src/lib.rs's PLATFORM_FEE_BPS
 const BPS_DENOM = 10_000n;
@@ -33,7 +34,7 @@ export async function listWorkers() {
   return Promise.all(
     ids.map(async (workerId) => {
       const rep = await getReputation(workerId);
-      const isAddress = workerId.startsWith('G') && workerId.length === 56;
+      const isAddress = StrKey.isValidEd25519PublicKey(workerId);
       const [stakeStroops, owedStroops] = isAddress
         ? await Promise.all([getStakeOnChain(workerId).catch(() => 0n), getOwedOnChain(workerId).catch(() => 0n)])
         : [0n, 0n];
