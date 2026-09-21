@@ -2,6 +2,7 @@ import { getKnownWorkerIds, getReputation } from './dispatch.js';
 import { getStakeOnChain } from './stellarClient.js';
 import { config } from './config.js';
 import { stroopsToUsdc } from './pricing.js';
+import { StrKey } from '@stellar/stellar-sdk';
 
 /**
  * Worker reputation is already used internally to gate routing (see
@@ -43,7 +44,7 @@ export async function getLeaderboard(limit = 50) {
   const rows = await Promise.all(
     ids.map(async (workerId) => {
       const rep = await getReputation(workerId);
-      const isAddress = workerId.startsWith('G') && workerId.length === 56;
+      const isAddress = StrKey.isValidEd25519PublicKey(workerId);
       const stakeStroops = isAddress ? await getStakeOnChain(workerId).catch(() => 0n) : 0n;
       return {
         workerId,
