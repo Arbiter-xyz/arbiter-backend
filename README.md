@@ -9,11 +9,12 @@ the sole holder of the platform's admin key — the only component allowed
 to call `resolve()`/`refund()`/`touch()` — and, separately, the pooled
 fiat-onramp float key (kept deliberately distinct; see "Billing" below).
 
-Split out of the original `arbiter` monorepo and kept in sync with it as
-development continues — full history and the round-by-round build
-narrative live in the original
-[`arbiter`](https://github.com/rudeus112266/arbiter) repo; this repo tracks
-its `backend/` subtree.
+Originally split out of a monorepo; that monorepo is now retired — this
+repo is the sole source of truth for the backend's code going forward,
+version-pinned against `arbiter-contract`'s releases rather than kept in
+lockstep by hand (see #163). Pre-split history and the round-by-round
+build narrative live in the archived
+[`arbiter`](https://github.com/rudeus112266/arbiter) repo.
 
 ## What it does
 
@@ -59,6 +60,8 @@ npm start
 
 Verified live against a real deployed contract on Stellar testnet — a full
 paid question (payment → dispatch → reconcile → `resolve()`) and a real
-sponsored `withdraw()` landing real USDC in a zero-XLM wallet. See the
-original monorepo's README, "Round 6," for the full writeup including two
-real bugs that live infrastructure surfaced and mocked tests never could.
+sponsored `withdraw()` landing real USDC in a zero-XLM wallet. (That run
+predates this repo's split; see "Round 6" in the archived
+[`arbiter`](https://github.com/rudeus112266/arbiter) monorepo README for
+the full write-up, including two real bugs that live infrastructure
+surfaced and mocked tests never could.)
