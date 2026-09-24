@@ -10,8 +10,14 @@ import { notifyWorker } from './push.js';
 import { jobLogger } from './logger.js';
 import { store } from './store.js';
 import { config } from './config.js';
+import { undoWindowFor, holdThenDispatch, cancelHeld } from './undoWindow.js';
+import { verifySessionToken } from './workerAuth.js';
+import { restoreCredit } from './billing.js';
 
 const IDEMPOTENCY_PREFIX = 'idempotency:';
+// Who may cancel an API-key-funded job. Kept out of the job record itself,
+// which GET /oracle/:jobId returns verbatim to anyone holding the jobId.
+const JOB_OWNER_PREFIX = 'job-owner:';
 
 export async function issueChallenge(questionText, tierKey, category) {
   const questionId = (await nextQuestionId()).toString();
@@ -126,12 +132,22 @@ export async function verifyPayment(questionId) {
  * recordPayerQuestion — centralized here, the one place both the classic
  * submit()-based flow (verifyPayment) and the prepaid-balance flow
  * (askMetered) converge, instead of duplicated in each caller.
+ *
+ * Non-instant tiers are first held for the undo window (see undoWindow.js)
+ * in status 'holding'; dispatch only starts once the hold elapses without
+ * a cancelJob() claiming the job first. `apiKeyAccountId` marks a job
+ * funded through the API-key path, whose `payerAddress` is the platform's
+ * pooled fiat address — it's what cancelJob() authenticates against there.
  */
-export async function startFulfillment(questionId, pending, tier, payerAddress) {
+export async function startFulfillment(questionId, pending, tier, payerAddress, { apiKeyAccountId } = {}) {
   const claimed = await claimJob(questionId);
   if (!claimed) return { jobId: questionId };
 
+  const holdMs = undoWindowFor(tier);
+  const cancellableUntil = holdMs > 0 ? Date.now() + holdMs : null;
+
   await createJob(questionId, {
+    ...(cancellableUntil ? { status: 'holding', cancellableUntil } : {}),
     question: pending.question,
     tier: tier.key,
     quorumSize: tier.quorumSize,
@@ -141,8 +157,30 @@ export async function startFulfillment(questionId, pending, tier, payerAddress) 
     payer: payerAddress || null,
   });
 
+  if (apiKeyAccountId) {
+    await store.set(JOB_OWNER_PREFIX + questionId, { apiKeyAccountId }, config.jobResultTtlMs);
+  }
   if (payerAddress) await recordPayerQuestion(payerAddress, questionId);
 
+  if (!cancellableUntil) {
+    runFulfillment(questionId, pending, tier);
+    return { jobId: questionId };
+  }
+
+  holdThenDispatch(
+    questionId,
+    holdMs,
+    async () => {
+      await updateJob(questionId, { status: 'awaiting_workers', cancellableUntil: null, dispatchedAt: Date.now() });
+      runFulfillment(questionId, pending, tier);
+    },
+    (err) => jobLogger(questionId).error({ err }, 'failed to start dispatch after the undo window'),
+  );
+
+  return { jobId: questionId, cancellableUntil };
+}
+
+function runFulfillment(questionId, pending, tier) {
   fulfillOracleCall(questionId, pending, tier).catch((err) => {
     // fulfillOracleCall is written to always settle the escrow before
     // returning; this catch is a last-resort net so a bug there can't leave
@@ -155,8 +193,83 @@ export async function startFulfillment(questionId, pending, tier, payerAddress) 
       autoRefundAfterLedgers: config.timeoutLedgers,
     }).catch(() => {});
   });
+}
 
-  return { jobId: questionId };
+/**
+ * Cancels a paid question inside its undo window and refunds it through
+ * settleRefunded() — the exact refund()/refund_pending_timeout path every
+ * other refund takes, not a parallel one.
+ *
+ * Who may cancel: whoever paid, proven the same way every other
+ * payer-scoped route proves it.
+ *  - Classic submit() flow and the prepaid/metered flow: a session token
+ *    for the job's `payer` address (POST /payers/:address/session). For the
+ *    classic flow the payer is only known once verifyPayment() reads it off
+ *    the on-chain Question, so this is the one proof that works for both —
+ *    the canceller signs the same throwaway challenge workerAuth.js uses.
+ *  - API-key flow: the same API key that asked. Its on-chain payer is the
+ *    platform's pooled fiat address, so a session token can't identify the
+ *    customer there; the refund returns to the pool and the customer's
+ *    credit is restored here. That credit is restored even if refund()
+ *    itself fails, because a cancelled job is never dispatched and so can
+ *    never be resolve()d — its escrow can only ever go back to the pool,
+ *    via refund() now or refund_timeout() later.
+ *
+ * Returns `{ ok: true, job }` or `{ ok: false, status, error }`. Never
+ * races dispatch: undoWindow.js's atomic decision claim guarantees exactly
+ * one of "cancel" or "dispatch" wins, so a cancel that loses gets a 409
+ * instead of refunding a question workers are already answering.
+ */
+export async function cancelJob(jobId, { sessionToken, apiKeyAccountId } = {}) {
+  const job = await getJob(jobId);
+  if (!job || job.sandbox) return { ok: false, status: 404, error: 'unknown or expired jobId' };
+
+  const owner = await store.get(JOB_OWNER_PREFIX + jobId);
+  const authorized = owner?.apiKeyAccountId
+    ? Boolean(apiKeyAccountId) && apiKeyAccountId === owner.apiKeyAccountId
+    : Boolean(job.payer) && verifySessionToken(sessionToken) === job.payer;
+  if (!authorized) {
+    return {
+      ok: false,
+      status: 401,
+      error: owner?.apiKeyAccountId
+        ? 'the API key that asked this question is required to cancel it'
+        : "a valid session token for this job's payer is required — see POST /payers/:address/session",
+    };
+  }
+
+  if (job.tier === 'instant') {
+    return { ok: false, status: 409, error: 'instant-tier questions have no undo window' };
+  }
+  if (job.status !== 'holding') {
+    return { ok: false, status: 409, error: notCancellableReason(job.status) };
+  }
+
+  const { cancelled } = await cancelHeld(jobId, async () => {
+    await updateJob(jobId, { status: 'cancelling', cancellableUntil: null, cancelledAt: Date.now() });
+    await settleRefunded(
+      jobId,
+      [],
+      {
+        consensus: null,
+        confidence: 0,
+        matchingWorkerIds: [],
+        method: 'cancelled-by-payer',
+        reason: 'cancelled by the payer during the undo window',
+      },
+      { cancelledByPayer: true },
+    );
+    if (owner?.apiKeyAccountId) await restoreCredit(owner.apiKeyAccountId, Number(job.amountStroops));
+  });
+
+  if (!cancelled) return { ok: false, status: 409, error: notCancellableReason('awaiting_workers') };
+  return { ok: true, job: await getJob(jobId) };
+}
+
+function notCancellableReason(status) {
+  if (status === 'settled') return 'this question has already settled';
+  if (status === 'cancelling') return 'this question is already being cancelled';
+  return 'already dispatched to workers — the undo window has closed';
 }
 
 export async function getJobStatus(questionId) {
@@ -354,7 +467,7 @@ async function settleResolved(questionId, submissions, result) {
   }
 }
 
-async function settleRefunded(questionId, submissions, result) {
+async function settleRefunded(questionId, submissions, result, extraJobFields = {}) {
   const hash = await refundQuestion(questionId)
     .then((r) => r.hash)
     .catch((err) => {
@@ -384,6 +497,7 @@ async function settleRefunded(questionId, submissions, result) {
     totalAnswers: submissions.length,
     refundTx: hash,
     ...(hash ? {} : { autoRefundAfterLedgers: config.timeoutLedgers }),
+    ...extraJobFields,
   });
 }
 

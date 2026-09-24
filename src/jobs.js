@@ -31,7 +31,10 @@ export async function getKnownJobIds() {
  * returns 202 immediately once payment is confirmed, and the caller polls
  * GET /oracle/:jobId (or listens on its SSE stream) for the result.
  *
- * States: awaiting_workers -> reconciling -> settled
+ * States: [holding ->] awaiting_workers -> reconciling -> settled
+ * `holding` is the undo window (see undoWindow.js) — paid, not yet
+ * dispatched, cancellable until `cancellableUntil`; a cancelled job goes
+ * holding -> cancelling -> settled instead.
  * `settled` always carries an `outcome` of 'resolved' or 'refunded' — same
  * fail-closed guarantee as before, just observed asynchronously.
  */

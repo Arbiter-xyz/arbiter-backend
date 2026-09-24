@@ -44,6 +44,11 @@ export const config = Object.freeze({
 
   minConfidence: num(process.env.MIN_CONFIDENCE, 0.6),
 
+  // Undo window (see undoWindow.js): how long a paid, non-instant question
+  // is held after payment before it's dispatched to workers, during which
+  // the payer can POST /oracle/:jobId/cancel for a refund. 0 disables it.
+  undoWindowMs: num(process.env.UNDO_WINDOW_MS, 8_000),
+
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
   anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-sonnet-5',
 
