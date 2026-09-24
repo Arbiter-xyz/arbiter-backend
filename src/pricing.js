@@ -115,3 +115,68 @@ export function priceForTier(tierKey, onlineWorkers) {
   const priceStroops = BigInt(Math.round(Number(tier.priceStroops) * multiplier));
   return { ...tier, priceStroops, surgeMultiplier: multiplier };
 }
+
+/**
+ * Shadow-mode AI baseline (issue #13). The `instant` tier already produces an
+ * LLM draft with no human quorum; for questions dispatched on a real quorum
+ * tier (standard/express/priority) we additionally generate that same instant
+ * draft *in shadow* — off the settlement path — and later compare it against
+ * the human-reconciled consensus. This turns "we think the LLM draft is
+ * usually right" into a published, verifiable agreement rate, and is the
+ * measurement prerequisite for any future AI-assisted routing.
+ *
+ * This is purely observability: it must never affect settlement, timing, or
+ * cost of the real dispatch. The helpers below are deliberately pure and
+ * side-effect-free so callers can run them alongside the existing quorum
+ * without touching the dispatch path.
+ */
+
+// Tiers that carry a real human quorum and therefore qualify for a shadow
+// draft. `instant` is excluded — it *is* the draft, not a shadow of one.
+export function shouldShadowDraft(tierKey) {
+  const tier = resolveTier(tierKey);
+  return !tier.instant && tier.quorumSize > 0;
+}
+
+// Normalizes an answer for comparison so trivial formatting differences
+// (case, surrounding whitespace, collapsed internal whitespace) don't count
+// as disagreement. Kept intentionally conservative — anything beyond this
+// would be guessing at semantic equivalence, which is out of scope here.
+export function normalizeDraftAnswer(answer) {
+  if (answer === null || answer === undefined) return '';
+  return String(answer).trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+/**
+ * Compares a shadow instant-tier draft against the human-reconciled consensus
+ * outcome for the same question. Returns a record keyed the same way stats.js
+ * tracks its `resolved`/`refunded` counters, so the shadow counters can be
+ * aggregated with the same machinery. `matched` is only meaningful when the
+ * question actually settled to a consensus answer; a refunded/no-consensus
+ * question is recorded as `refunded` and excluded from the agreement rate.
+ */
+export function recordShadowAgreement({ draftAnswer, consensusAnswer, outcome }) {
+  if (outcome !== 'resolved') {
+    return { outcome: 'refunded', matched: false, counted: false };
+  }
+  const matched = normalizeDraftAnswer(draftAnswer) === normalizeDraftAnswer(consensusAnswer);
+  return { outcome: 'resolved', matched, counted: true };
+}
+
+/**
+ * Aggregates shadow-agreement counters into the published rate. Mirrors the
+ * shape stats.js exposes for resolved/refunded so it can be surfaced the same
+ * way (e.g. via /stats or an admin endpoint). `agreementRate` is null until
+ * there's at least one counted (resolved) comparison, so callers don't publish
+ * a misleading 0% before any data exists.
+ */
+export function shadowAgreementRate({ matched = 0, mismatched = 0, refunded = 0 } = {}) {
+  const counted = matched + mismatched;
+  return {
+    matched,
+    mismatched,
+    refunded,
+    counted,
+    agreementRate: counted > 0 ? matched / counted : null,
+  };
+}
