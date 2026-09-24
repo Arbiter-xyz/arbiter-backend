@@ -1,19 +1,38 @@
 import { nextQuestionId, stashQuestion, getStashedQuestion, dropStashedQuestion } from './pendingQuestions.js';
 import { createJob, updateJob, getJob, claimJob } from './jobs.js';
-import { dispatchAndCollect, recordOutcome, getSmoothedOnlineWorkerCount } from './dispatch.js';
+import { dispatchAndCollect, recordOutcome, getSmoothedOnlineWorkerCount, hasOnlineWhitelistedWorker } from './dispatch.js';
 import { reconcile, draftAnswer } from './reconcile.js';
 import { resolveQuestion, refundQuestion, getQuestionOnChain } from './stellarClient.js';
 import { resolveTier, listTiersForClient, stroopsToUsdc, priceForTier } from './pricing.js';
 import { incrementStat } from './stats.js';
 import { recordPayerQuestion } from './payerIndex.js';
+import { getPrivatePool } from './privatePools.js';
 import { notifyWorker } from './push.js';
 import { jobLogger } from './logger.js';
 import { store } from './store.js';
 import { config } from './config.js';
+import { DEFAULT_CONSENSUS_MODE } from './consensus.js';
 
 const IDEMPOTENCY_PREFIX = 'idempotency:';
 
-export async function issueChallenge(questionText, tierKey, category) {
+/**
+ * `consensusRule` is a validated rule from consensus.js's
+ * parseConsensusRule(), or null for the default exact-match mode. Only a
+ * non-default rule adds fields to the stash and the response, so the
+ * default path's records are unchanged.
+ */
+export function consensusStashFields(consensusRule) {
+  if (!consensusRule) return {};
+  return { consensusMode: consensusRule.mode, consensusTolerance: consensusRule.tolerance };
+}
+
+/** Rebuilds the rule reconcile() takes from a stashed pending question. */
+export function consensusRuleFromPending(pending) {
+  if (!pending?.consensusMode || pending.consensusMode === DEFAULT_CONSENSUS_MODE) return null;
+  return { mode: pending.consensusMode, tolerance: pending.consensusTolerance };
+}
+
+export async function issueChallenge(questionText, tierKey, category, consensusRule = null) {
   const questionId = (await nextQuestionId()).toString();
   // Price is snapshotted NOW, at quote time, from a SMOOTHED (trailing-
   // average) worker-supply signal rather than the instantaneous online
@@ -34,6 +53,7 @@ export async function issueChallenge(questionText, tierKey, category) {
     timeoutMs: priced.timeoutMs,
     category: category || null,
     createdAt: Date.now(),
+    ...consensusStashFields(consensusRule),
   });
 
   return {
@@ -48,6 +68,7 @@ export async function issueChallenge(questionText, tierKey, category) {
     tiers: listTiersForClient(),
     quorumSize: priced.quorumSize,
     timeoutMs: priced.timeoutMs,
+    ...consensusStashFields(consensusRule),
     autoRefundAfterLedgers: config.timeoutLedgers,
     instructions:
       `Call submit(payer, ${questionId}, ${priced.priceStroops.toString()}) on contract ${config.contractId}, ` +
@@ -69,14 +90,14 @@ export async function issueChallenge(questionText, tierKey, category) {
  * questionId itself is already a natural idempotency key there (see
  * startFulfillment's claimJob() usage).
  */
-export async function issueChallengeIdempotent(questionText, tierKey, category, idempotencyKey) {
-  if (!idempotencyKey) return issueChallenge(questionText, tierKey, category);
+export async function issueChallengeIdempotent(questionText, tierKey, category, idempotencyKey, consensusRule = null) {
+  if (!idempotencyKey) return issueChallenge(questionText, tierKey, category, consensusRule);
 
   const cacheKey = IDEMPOTENCY_PREFIX + idempotencyKey;
   const cached = await store.get(cacheKey);
   if (cached) return cached;
 
-  const challenge = await issueChallenge(questionText, tierKey, category);
+  const challenge = await issueChallenge(questionText, tierKey, category, consensusRule);
   await store.set(cacheKey, challenge, config.pendingQuestionTtlMs);
   return challenge;
 }
@@ -139,11 +160,14 @@ export async function startFulfillment(questionId, pending, tier, payerAddress) 
     amountStroops: tier.priceStroops.toString(),
     amount: stroopsToUsdc(tier.priceStroops),
     payer: payerAddress || null,
+    // What rule reconcile() will apply, visible on GET /oracle/:jobId.
+    consensusMode: pending.consensusMode || DEFAULT_CONSENSUS_MODE,
+    ...(pending.consensusTolerance ? { consensusTolerance: pending.consensusTolerance } : {}),
   });
 
   if (payerAddress) await recordPayerQuestion(payerAddress, questionId);
 
-  fulfillOracleCall(questionId, pending, tier).catch((err) => {
+  fulfillOracleCall(questionId, pending, tier, payerAddress).catch((err) => {
     // fulfillOracleCall is written to always settle the escrow before
     // returning; this catch is a last-resort net so a bug there can't leave
     // the job record stuck in 'awaiting_workers' forever.
@@ -163,9 +187,46 @@ export async function getJobStatus(questionId) {
   return getJob(questionId);
 }
 
-async function fulfillOracleCall(questionId, pending, tier) {
+/**
+ * Private pools (see privatePools.js): when the payer has registered one,
+ * dispatch is restricted to those workers, and this FAILS CLOSED: if none
+ * of them is online, the question is refunded without being broadcast at
+ * all, rather than falling back to the open pool the payer opted out of.
+ * The same goes for a failed pool lookup, since we can't tell whether the
+ * payer has a restriction. A payer with no pool gets whitelist = null,
+ * which is exactly today's open-pool dispatch.
+ */
+async function fulfillOracleCall(questionId, pending, tier, payerAddress) {
   if (tier.instant) {
     return fulfillInstant(questionId, pending);
+  }
+
+  let whitelist = null;
+  try {
+    const pool = await getPrivatePool(payerAddress);
+    if (pool.length > 0) whitelist = pool;
+  } catch (err) {
+    jobLogger(questionId).error({ err }, 'private pool lookup failed, refunding rather than risk the open pool');
+    return settleRefunded(questionId, [], {
+      consensus: null,
+      confidence: 0,
+      matchingWorkerIds: [],
+      method: 'private-pool-unavailable',
+      reason: "could not load the payer's private worker pool",
+    });
+  }
+
+  if (whitelist) {
+    await updateJob(questionId, { privatePool: true, privatePoolSize: whitelist.length });
+    if (!hasOnlineWhitelistedWorker(whitelist)) {
+      return settleRefunded(questionId, [], {
+        consensus: null,
+        confidence: 0,
+        matchingWorkerIds: [],
+        method: 'no-private-pool-workers',
+        reason: "none of the workers in the payer's private pool were online",
+      });
+    }
   }
 
   let submissions = [];
@@ -175,6 +236,7 @@ async function fulfillOracleCall(questionId, pending, tier) {
       timeoutMs: tier.timeoutMs,
       category: pending.category,
       preferEstablished: tier.preferEstablished,
+      whitelist,
     });
   } catch (err) {
     // dispatchAndCollect is designed to never reject, but guard anyway — an
@@ -186,7 +248,7 @@ async function fulfillOracleCall(questionId, pending, tier) {
 
   await updateJob(questionId, { status: 'reconciling', totalAnswers: submissions.length });
 
-  const result = await reconcile(pending.question, submissions, questionId);
+  const result = await reconcile(pending.question, submissions, questionId, consensusRuleFromPending(pending));
 
   const shouldResolve =
     submissions.length > 0 && result.matchingWorkerIds.length > 0 && result.confidence >= config.minConfidence;

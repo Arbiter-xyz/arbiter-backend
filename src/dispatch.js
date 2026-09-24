@@ -133,9 +133,25 @@ function writeSse(res, event, data) {
  * that, not just "a bigger quorum." Still fails open: never lets the
  * established-only pool drop below quorumSize's worth of recipients, since
  * a starved quorum is a worse outcome than one with a fresh worker in it.
+ *
+ * `whitelist` (a payer's private pool — see privatePools.js) is the one
+ * filter here that deliberately FAILS CLOSED. Every other filter is a soft
+ * routing preference, so falling back to a wider pool beats stranding the
+ * question. A private pool is a hard requirement the payer explicitly asked
+ * for; falling back to the open pool would quietly defeat the feature and
+ * send their question to exactly the workers they excluded. So it runs
+ * first, and when no whitelisted worker is online this returns [] (the
+ * caller refunds rather than broadcasting). The soft filters below still
+ * fail open, but only as far as the whitelisted set, never past it.
  */
-async function selectTargets(category, { preferEstablished = false, quorumSize = 0 } = {}) {
+async function selectTargets(category, { preferEstablished = false, quorumSize = 0, whitelist = null } = {}) {
   let targets = [...workers.entries()];
+
+  if (whitelist) {
+    const allowed = new Set(whitelist);
+    targets = targets.filter(([id]) => allowed.has(id));
+    if (targets.length === 0) return [];
+  }
 
   if (category) {
     const norm = normalizeCategory(category);
@@ -163,9 +179,18 @@ async function selectTargets(category, { preferEstablished = false, quorumSize =
   return established.length >= quorumSize ? established : pool;
 }
 
-export async function broadcast(questionId, questionText, { category, quorumSize, expiresInMs, preferEstablished } = {}) {
+/** Whether any worker in `whitelist` is connected right now — i.e. whether
+ * selectTargets() would find anyone to send a private-pool question to. */
+export function hasOnlineWhitelistedWorker(whitelist) {
+  return whitelist.some((id) => workers.has(id));
+}
+
+export async function broadcast(questionId, questionText, { category, quorumSize, expiresInMs, preferEstablished, whitelist = null } = {}) {
   const payload = { questionId: questionId.toString(), question: questionText, quorumSize, expiresInMs };
-  const targets = await selectTargets(category, { preferEstablished, quorumSize });
+  const targets = await selectTargets(category, { preferEstablished, quorumSize, whitelist });
+  // Private pool with nobody online: fail closed. No SSE broadcast and no
+  // push either, so the caller can refund right away (see selectTargets).
+  if (whitelist && targets.length === 0) return [];
   for (const [, w] of targets) writeSse(w.res, 'question', payload);
 
   // Supplement SSE with push notifications for workers who are eligible
@@ -174,7 +199,12 @@ export async function broadcast(questionId, questionText, { category, quorumSize
   // push.js for the honest tradeoff; short-timeout tiers skip this).
   if (expiresInMs >= config.push.minTimeoutForPushMs) {
     const onlineIds = new Set(targets.map(([id]) => id));
-    const offlineEligible = getPushEligibleWorkerIds(category).filter((id) => !onlineIds.has(id));
+    // The push body carries the question text, so a private pool restricts
+    // push recipients as well as SSE recipients.
+    const allowed = whitelist ? new Set(whitelist) : null;
+    const offlineEligible = getPushEligibleWorkerIds(category).filter(
+      (id) => !onlineIds.has(id) && (!allowed || allowed.has(id)),
+    );
     for (const workerId of offlineEligible) {
       notifyWorker(workerId, {
         title: 'New question on Arbiter',
@@ -294,11 +324,20 @@ export function getSmoothedOnlineWorkerCount() {
  * had a bad day. Each submission is annotated with `established` (see
  * isEstablishedWorker) so reconcile.js can decide whether a unanimous
  * result is trustworthy enough to fast-path.
+ *
+ * With a `whitelist` (private pool), only whitelisted workers' answers are
+ * accepted, and if the broadcast reaches nobody the collector closes at
+ * once with no submissions instead of waiting out the timeout.
  */
-export function dispatchAndCollect(questionId, questionText, { quorumSize, timeoutMs, category, preferEstablished } = {}) {
+export function dispatchAndCollect(questionId, questionText, { quorumSize, timeoutMs, category, preferEstablished, whitelist = null } = {}) {
   const qid = questionId.toString();
   return new Promise((resolvePromise) => {
-    const state = { submissions: new Map(), quorumSize, finished: false };
+    const state = {
+      submissions: new Map(),
+      quorumSize,
+      finished: false,
+      allowedWorkers: whitelist ? new Set(whitelist) : null,
+    };
     collectors.set(qid, state);
 
     const timer = setTimeout(finish, timeoutMs);
@@ -315,9 +354,13 @@ export function dispatchAndCollect(questionId, questionText, { quorumSize, timeo
     }
     state.finish = finish;
 
-    broadcast(questionId, questionText, { category, quorumSize, expiresInMs: timeoutMs, preferEstablished }).catch((err) => {
-      jobLogger(questionId).error({ err }, 'broadcast failed');
-    });
+    broadcast(questionId, questionText, { category, quorumSize, expiresInMs: timeoutMs, preferEstablished, whitelist })
+      .then((targetIds) => {
+        if (whitelist && targetIds.length === 0) finish();
+      })
+      .catch((err) => {
+        jobLogger(questionId).error({ err }, 'broadcast failed');
+      });
   });
 }
 
@@ -325,10 +368,14 @@ async function annotateEstablished(submissions) {
   return Promise.all(submissions.map(async (s) => ({ ...s, established: await isEstablishedWorker(s.workerId) })));
 }
 
-/** Returns false (never throws) if the question is closed/expired or this worker already answered it. */
+/** Returns false (never throws) if the question is closed/expired, this
+ * worker already answered it, or the question is restricted to a private
+ * pool this worker isn't in. Question ids aren't secret, so without that
+ * last check anyone could answer a private question they were never sent. */
 export function submitAnswer(questionId, workerId, answer) {
   const state = collectors.get(questionId.toString());
   if (!state || state.finished) return false;
+  if (state.allowedWorkers && !state.allowedWorkers.has(workerId)) return false;
   if (state.submissions.has(workerId)) return false;
   state.submissions.set(workerId, answer);
   if (state.submissions.size >= state.quorumSize) state.finish();

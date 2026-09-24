@@ -33,6 +33,18 @@ build narrative live in the archived
   logging with request/job correlation, idempotent job creation, and
   bounded retry/timeout on every external call (Claude, Soroban RPC,
   Horizon).
+- **Private worker pools** (`privatePools.js`) — a payer can whitelist
+  worker addresses (`GET`/`POST /payers/:address/pool`,
+  `DELETE /payers/:address/pool/:worker`, session-token gated). Their
+  questions then go only to, and only take answers from, those workers.
+  This **fails closed**: if no whitelisted worker is online, the question
+  is refunded rather than sent to the open pool. Payers without a pool
+  are unaffected.
+- **Configurable consensus rules** (`consensus.js`) — `consensusMode:
+  'numeric-tolerance'` with `tolerance: { percent }` or `{ absolute }` on
+  `POST /oracle` makes numeric answers ("42", "$42.00", "about 42") within
+  tolerance count as agreeing, without a Claude call. The default `'exact'`
+  mode is unchanged. The rule used is shown on `GET /oracle/:jobId`.
 - Cryptographic worker session auth (`workerAuth.js`) — an address-format
   `workerId` must prove control of that key before submitting an answer.
 - A read-only admin/ops console (`/admin/*`, bearer-token gated) —
@@ -53,7 +65,7 @@ build narrative live in the archived
 
 ```sh
 npm install
-npm test              # 166 tests, no chain needed
+npm test              # 241 tests, no chain needed
 cp .env.example .env  # fill in ORACLE_CONTRACT_ID / PLATFORM_SECRET for real use
 npm start
 ```

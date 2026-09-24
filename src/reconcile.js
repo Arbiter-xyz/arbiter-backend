@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { config } from './config.js';
 import { logger } from './logger.js';
+import { numericToleranceVote, describeTolerance } from './consensus.js';
 
 function normalize(text) {
   return text
@@ -11,16 +12,20 @@ function normalize(text) {
     .trim();
 }
 
-export function exactMatchVote(submissions) {
+/** Groups submissions by normalized answer text, in first-seen order. */
+export function groupByNormalizedAnswer(submissions) {
   const groups = new Map(); // normalized -> { representative, workerIds }
   for (const { workerId, answer } of submissions) {
     const norm = normalize(answer);
     if (!groups.has(norm)) groups.set(norm, { representative: answer, workerIds: [] });
     groups.get(norm).workerIds.push(workerId);
   }
+  return [...groups.values()];
+}
 
+export function exactMatchVote(submissions) {
   let winner = null;
-  for (const group of groups.values()) {
+  for (const group of groupByNormalizedAnswer(submissions)) {
     if (!winner || group.workerIds.length > winner.workerIds.length) winner = group;
   }
 
@@ -72,11 +77,17 @@ function getClient() {
   return anthropicClient;
 }
 
-async function reconcileWithClaude(question, submissions) {
+async function reconcileWithClaude(question, submissions, rule) {
   const client = getClient();
   if (!client) throw new Error('ANTHROPIC_API_KEY not configured');
 
   const submissionsText = submissions.map((s) => `Worker ${s.workerId}: "${s.answer}"`).join('\n');
+  // Only non-default rules add anything to the prompt, so the default
+  // mode's Claude call is unchanged.
+  const ruleText =
+    rule?.mode === 'numeric-tolerance'
+      ? ` The asker requested numeric matching: treat numeric answers ${describeTolerance(rule.tolerance)} as matches.`
+      : '';
 
   const message = await client.messages.create({
     model: config.anthropicModel,
@@ -91,7 +102,8 @@ async function reconcileWithClaude(question, submissions) {
           'Reconcile these into a single consensus answer. Treat paraphrases, case ' +
           'differences, and whitespace differences as matches. If the workers genuinely ' +
           "disagree, pick the winning plurality, lower the confidence accordingly, and only " +
-          "list the winning plurality's worker ids in matching_worker_ids.",
+          "list the winning plurality's worker ids in matching_worker_ids." +
+          ruleText,
       },
     ],
   });
@@ -175,13 +187,23 @@ export async function draftAnswer(question, questionId) {
  * patient attacker, but it's no longer free. Any quorum containing a fresh
  * identity still gets Claude's (weak, non-guaranteed, but nonzero)
  * plausibility read, same as a genuine disagreement would.
+ *
+ * `rule` is the question's consensus rule (see consensus.js); null/omitted
+ * means the default exact-match mode. 'numeric-tolerance' swaps
+ * exactMatchVote() for numericToleranceVote(), and everything else is the
+ * same: the established-worker fast path when everyone is within
+ * tolerance, and Claude (then the vote) for genuine disagreement.
  */
-export async function reconcile(question, submissions, questionId) {
+export async function reconcile(question, submissions, questionId, rule = null) {
   if (submissions.length === 0) {
     return { consensus: null, confidence: 0, matchingWorkerIds: [], method: 'no-answers' };
   }
 
-  const vote = exactMatchVote(submissions);
+  const numeric = rule?.mode === 'numeric-tolerance';
+  const vote = numeric
+    ? numericToleranceVote(submissions, rule.tolerance, groupByNormalizedAnswer)
+    : exactMatchVote(submissions);
+  const methodPrefix = numeric ? 'numeric-tolerance' : 'exact-match';
   const allEstablished = submissions.every((s) => s.established);
 
   if (vote.allAgree && allEstablished) {
@@ -189,19 +211,19 @@ export async function reconcile(question, submissions, questionId) {
       consensus: vote.consensus,
       confidence: 1,
       matchingWorkerIds: vote.matchingWorkerIds,
-      method: 'exact-match-fastpath',
+      method: `${methodPrefix}-fastpath`,
     };
   }
 
   try {
-    return await reconcileWithClaude(question, submissions);
+    return await reconcileWithClaude(question, submissions, rule);
   } catch (err) {
-    logger.error({ err, questionId }, 'Claude reconciliation failed, falling back to exact-match vote');
+    logger.error({ err, questionId }, `Claude reconciliation failed, falling back to ${methodPrefix} vote`);
     return {
       consensus: vote.consensus,
       confidence: vote.confidence,
       matchingWorkerIds: vote.matchingWorkerIds,
-      method: 'exact-match-fallback',
+      method: `${methodPrefix}-fallback`,
     };
   }
 }

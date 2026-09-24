@@ -2,7 +2,7 @@ import { nextQuestionId, stashQuestion } from './pendingQuestions.js';
 import { priceForTier, listTiersForClient, stroopsToUsdc } from './pricing.js';
 import { getSmoothedOnlineWorkerCount } from './dispatch.js';
 import { chargeBalance, getBalanceOnChain } from './stellarClient.js';
-import { startFulfillment } from './oracle.js';
+import { startFulfillment, consensusStashFields } from './oracle.js';
 import { config } from './config.js';
 
 /**
@@ -21,7 +21,7 @@ import { config } from './config.js';
  * route wiring) — without that, anyone could charge against a balance they
  * don't own just by naming someone else's address.
  */
-export async function askMetered(payerAddress, questionText, tierKey, category) {
+export async function askMetered(payerAddress, questionText, tierKey, category, consensusRule = null) {
   const questionId = (await nextQuestionId()).toString();
   const priced = priceForTier(tierKey, getSmoothedOnlineWorkerCount());
 
@@ -38,6 +38,7 @@ export async function askMetered(payerAddress, questionText, tierKey, category) 
     timeoutMs: priced.timeoutMs,
     category: category || null,
     createdAt: Date.now(),
+    ...consensusStashFields(consensusRule),
   };
   await stashQuestion(questionId, pending);
 
