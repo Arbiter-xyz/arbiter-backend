@@ -49,11 +49,22 @@ build narrative live in the archived
   Credit reservations are atomic and webhook delivery is idempotent per
   Stripe event id.
 
+## Client SDKs
+
+First-party clients for the agent-facing API (ask → pay → poll, payer
+session auth, the undo window, and the public reads), each with its own
+README, tests, and changelog:
+
+- **TypeScript / JavaScript**: [`sdk/typescript`](sdk/typescript) (`@arbiter-xyz/sdk`), for Node 18+ and browsers
+- **Python**: [`sdk/python`](sdk/python) (`arbiter-sdk`), for Python 3.9+
+
+Both can be tried against `POST /oracle/sandbox` with no wallet at all.
+
 ## Running it
 
 ```sh
 npm install
-npm test              # 166 tests, no chain needed
+npm test              # no chain needed
 cp .env.example .env  # fill in ORACLE_CONTRACT_ID / PLATFORM_SECRET for real use
 npm start
 ```
