@@ -48,12 +48,22 @@ build narrative live in the archived
   same `chargeBalance()` path the wallet-based prepaid flow already uses.
   Credit reservations are atomic and webhook delivery is idempotent per
   Stripe event id.
+- **Answer provenance ([docs/provenance.md](docs/provenance.md))**: every
+  settled question commits (sha256 over canonical JSON) to its raw worker
+  submissions and any LLM prompt/response before `resolve()`/`refund()`
+  is sent. The record is public at `GET /oracle/:jobId/provenance`, and
+  `scripts/verify-provenance.js` lets anyone re-derive the consensus and
+  check it against the on-chain payout.
+- **Startup security-posture check (`securityPosture.js`)**: a deployment
+  that looks like production refuses to start without `SESSION_SECRET`,
+  and logs a loud error for wide-open `ALLOWED_ORIGINS` or a non-TLS
+  `REDIS_URL`. Local dev with every default left alone stays silent.
 
 ## Running it
 
 ```sh
 npm install
-npm test              # 166 tests, no chain needed
+npm test              # no chain needed
 cp .env.example .env  # fill in ORACLE_CONTRACT_ID / PLATFORM_SECRET for real use
 npm start
 ```
@@ -65,3 +75,18 @@ predates this repo's split; see "Round 6" in the archived
 [`arbiter`](https://github.com/rudeus112266/arbiter) monorepo README for
 the full write-up, including two real bugs that live infrastructure
 surfaced and mocked tests never could.)
+
+### Running the full stack locally
+
+To run the contract, this backend, and the app together (deploy the
+contract to testnet, point this backend at it, point the app at this
+backend, then run a real paid question end to end), see
+**[docs/local-full-stack.md](docs/local-full-stack.md)**. It's the single
+cross-repo guide, and it pins contract/app versions known to work with this
+backend.
+
+### Capacity
+
+Load-test tooling (`scripts/loadtest.js`), measured limits, and the current
+bottleneck (serialized on-chain settlement) are in
+[docs/capacity/README.md](docs/capacity/README.md).
