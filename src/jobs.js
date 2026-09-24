@@ -44,6 +44,14 @@ export async function getKnownJobIds() {
  * store.incr() is the same atomic primitive the rate limiter relies on
  * (see store.js's MemoryStore.incr for why it has to be atomic), reused
  * here instead of inventing a second locking mechanism.
+ *
+ * This is the single gate that must hold under true network-level duplicate
+ * delivery: a proxy or client retry can send the exact same request twice,
+ * truly simultaneously, over separate connections. Because store.incr() is
+ * atomic, exactly one of those callers observes claimCount === 1 and wins;
+ * every other caller (however many, however simultaneous) observes > 1 and
+ * is rejected. The claim key is written with the same TTL as the job record
+ * so a claim can never outlive the job it guards.
  */
 export async function claimJob(jobId) {
   const claimCount = await store.incr(`${PREFIX}claim:${jobId}`, config.jobResultTtlMs);
