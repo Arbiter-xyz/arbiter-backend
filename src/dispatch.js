@@ -163,6 +163,37 @@ async function selectTargets(category, { preferEstablished = false, quorumSize =
   return established.length >= quorumSize ? established : pool;
 }
 
+/**
+ * Shape of the follow-up SSE `suggestion` event (see dispatchAndCollect's
+ * `suggestion` option). Labelled as loudly as the payload allows: it's one
+ * unverified LLM guess, never a consensus answer, and reconcile.js never
+ * sees it — only real worker submissions count toward settlement.
+ */
+export function buildSuggestionPayload(questionId, draft) {
+  return {
+    questionId: questionId.toString(),
+    suggestedAnswer: draft.consensus,
+    suggestedConfidence: draft.confidence,
+    suggestionSource: draft.method || 'llm-draft',
+    unverified: true,
+    note: 'Unverified AI draft, not a consensus answer — check it and answer independently.',
+  };
+}
+
+/** Sends a draft suggestion to the workers a question was broadcast to, if
+ * they're still connected. Returns the ids it was actually written to. */
+export function sendSuggestion(questionId, workerIds, draft) {
+  const payload = buildSuggestionPayload(questionId, draft);
+  const delivered = [];
+  for (const workerId of workerIds) {
+    const w = workers.get(workerId);
+    if (!w) continue;
+    writeSse(w.res, 'suggestion', payload);
+    delivered.push(workerId);
+  }
+  return delivered;
+}
+
 export async function broadcast(questionId, questionText, { category, quorumSize, expiresInMs, preferEstablished } = {}) {
   const payload = { questionId: questionId.toString(), question: questionText, quorumSize, expiresInMs };
   const targets = await selectTargets(category, { preferEstablished, quorumSize });
@@ -294,8 +325,18 @@ export function getSmoothedOnlineWorkerCount() {
  * had a bad day. Each submission is annotated with `established` (see
  * isEstablishedWorker) so reconcile.js can decide whether a unanimous
  * result is trustworthy enough to fast-path.
+ *
+ * `suggestion` is an optional promise for an LLM draft answer (see
+ * oracle.js's fulfillOracleCall). It is deliberately NON-blocking: the
+ * question is broadcast immediately, exactly as without it, and the draft
+ * follows as a separate `suggestion` SSE event to the same recipients once
+ * it resolves — a Claude round-trip is seconds, and making every worker
+ * wait on it would cost more answering time than the prefill saves on the
+ * shorter tiers (express's whole window is 12s). A draft that resolves to
+ * null, rejects, or arrives after the question has closed is simply
+ * dropped; it can never delay or fail the broadcast itself.
  */
-export function dispatchAndCollect(questionId, questionText, { quorumSize, timeoutMs, category, preferEstablished } = {}) {
+export function dispatchAndCollect(questionId, questionText, { quorumSize, timeoutMs, category, preferEstablished, suggestion } = {}) {
   const qid = questionId.toString();
   return new Promise((resolvePromise) => {
     const state = { submissions: new Map(), quorumSize, finished: false };
@@ -315,9 +356,21 @@ export function dispatchAndCollect(questionId, questionText, { quorumSize, timeo
     }
     state.finish = finish;
 
-    broadcast(questionId, questionText, { category, quorumSize, expiresInMs: timeoutMs, preferEstablished }).catch((err) => {
+    const broadcasted = broadcast(questionId, questionText, { category, quorumSize, expiresInMs: timeoutMs, preferEstablished });
+    broadcasted.catch((err) => {
       jobLogger(questionId).error({ err }, 'broadcast failed');
     });
+
+    if (suggestion) {
+      Promise.all([broadcasted, suggestion])
+        .then(([targetIds, draft]) => {
+          if (!draft || !draft.consensus || state.finished) return;
+          sendSuggestion(qid, targetIds, draft);
+        })
+        .catch((err) => {
+          jobLogger(questionId).warn({ err }, 'draft suggestion could not be delivered');
+        });
+    }
   });
 }
 

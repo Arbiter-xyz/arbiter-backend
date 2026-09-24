@@ -47,6 +47,22 @@ export const config = Object.freeze({
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
   anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-sonnet-5',
 
+  // Draft-answer suggestions for human-quorum tiers (see oracle.js's
+  // shouldDraftSuggestion): one extra Claude call per dispatched question,
+  // delivered to workers as an unverified prefill. Opt-in, off by default:
+  // it adds real per-question Claude spend, and a visible draft can anchor
+  // workers toward the LLM's answer instead of their own independent one —
+  // a trade-off an operator should choose deliberately, not inherit.
+  draftSuggestions: Object.freeze({
+    enabled: process.env.DRAFT_SUGGESTIONS_ENABLED === 'true',
+    tiers: Object.freeze(
+      (process.env.DRAFT_SUGGESTION_TIERS || 'standard,express,priority')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
+  }),
+
   pendingQuestionTtlMs: num(process.env.PENDING_QUESTION_TTL_MS, 600_000),
   jobResultTtlMs: num(process.env.JOB_RESULT_TTL_MS, 3_600_000),
 

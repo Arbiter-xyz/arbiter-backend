@@ -163,10 +163,31 @@ export async function getJobStatus(questionId) {
   return getJob(questionId);
 }
 
+/**
+ * Whether a human-quorum question should get an LLM draft sent to workers
+ * as a prefill suggestion. Pure (settings are a parameter, defaulting to
+ * config) so every combination is testable despite config being frozen at
+ * load — same reason stakeGateAllows() exists as its own function. Never
+ * for `instant`, which already drafts and settles on its own.
+ */
+export function shouldDraftSuggestion(tier, settings = { ...config.draftSuggestions, apiKey: config.anthropicApiKey }) {
+  if (!tier || tier.instant) return false;
+  if (!settings.enabled || !settings.apiKey) return false;
+  return settings.tiers.includes(tier.key);
+}
+
 async function fulfillOracleCall(questionId, pending, tier) {
   if (tier.instant) {
     return fulfillInstant(questionId, pending);
   }
+
+  // Started concurrently with dispatch, never awaited here — the suggestion
+  // is additive, so it can't be allowed to delay or fail the broadcast (see
+  // dispatchAndCollect's `suggestion` option for the delivery side).
+  // draftAnswer() never throws and resolves null on any failure.
+  const suggestion = shouldDraftSuggestion(tier)
+    ? draftAnswer(pending.question, questionId, { purpose: 'worker-suggestion' })
+    : undefined;
 
   let submissions = [];
   try {
@@ -175,6 +196,7 @@ async function fulfillOracleCall(questionId, pending, tier) {
       timeoutMs: tier.timeoutMs,
       category: pending.category,
       preferEstablished: tier.preferEstablished,
+      suggestion,
     });
   } catch (err) {
     // dispatchAndCollect is designed to never reject, but guard anyway — an
