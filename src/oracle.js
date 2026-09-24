@@ -9,6 +9,7 @@ import { recordPayerQuestion } from './payerIndex.js';
 import { notifyWorker } from './push.js';
 import { jobLogger } from './logger.js';
 import { store } from './store.js';
+import { buildProvenanceRecord, saveProvenance, attachSettlement } from './provenance.js';
 import { config } from './config.js';
 
 const IDEMPOTENCY_PREFIX = 'idempotency:';
@@ -165,7 +166,7 @@ export async function getJobStatus(questionId) {
 
 async function fulfillOracleCall(questionId, pending, tier) {
   if (tier.instant) {
-    return fulfillInstant(questionId, pending);
+    return fulfillInstant(questionId, pending, tier);
   }
 
   let submissions = [];
@@ -191,10 +192,53 @@ async function fulfillOracleCall(questionId, pending, tier) {
   const shouldResolve =
     submissions.length > 0 && result.matchingWorkerIds.length > 0 && result.confidence >= config.minConfidence;
 
+  await commitProvenance(questionId, pending, tier, submissions, result, shouldResolve ? 'resolve' : 'refund');
+
   if (shouldResolve) {
     await settleResolved(questionId, submissions, result);
   } else {
     await settleRefunded(questionId, submissions, result);
+  }
+  await recordSettlementProvenance(questionId);
+}
+
+/**
+ * Commits to every raw reconciliation input (see provenance.js) BEFORE
+ * resolve()/refund() is sent, and publishes the hash on the job record.
+ * Never throws: provenance is an audit trail, so a failure to write it must
+ * never be the reason a payer's escrow goes unsettled.
+ */
+async function commitProvenance(questionId, pending, tier, submissions, result, action) {
+  try {
+    const record = buildProvenanceRecord({
+      questionId,
+      question: pending.question,
+      tier: tier.key,
+      submissions,
+      result,
+      minConfidence: config.minConfidence,
+      action,
+    });
+    const provenanceHash = await saveProvenance(questionId, record);
+    await updateJob(questionId, { provenanceHash });
+  } catch (err) {
+    jobLogger(questionId).error({ err }, 'failed to commit reconciliation provenance');
+  }
+}
+
+/** Copies the settlement outcome and tx hashes (known only after settling)
+ * next to the committed record, outside the hash. Never throws. */
+async function recordSettlementProvenance(questionId) {
+  try {
+    const job = await getJob(questionId);
+    if (!job) return;
+    await attachSettlement(questionId, {
+      outcome: job.outcome || null,
+      payoutTx: job.payoutTx || null,
+      refundTx: job.refundTx || null,
+    });
+  } catch (err) {
+    jobLogger(questionId).error({ err }, 'failed to record settlement provenance');
   }
 }
 
@@ -208,22 +252,29 @@ async function fulfillOracleCall(questionId, pending, tier) {
  * resolve()'s doc comments. Failure (no API key, Claude error) fails
  * closed exactly like the human path: refund, never charge for nothing.
  */
-async function fulfillInstant(questionId, pending) {
+async function fulfillInstant(questionId, pending, tier) {
   await updateJob(questionId, { status: 'reconciling', totalAnswers: 0 });
 
-  const result = await draftAnswer(pending.question, questionId);
+  const draft = await draftAnswer(pending.question, questionId);
+  const resolved = Boolean(draft && draft.consensus);
+  const result = resolved
+    ? draft
+    : {
+        consensus: null,
+        confidence: 0,
+        matchingWorkerIds: [],
+        method: 'llm-draft-unavailable',
+        reason: 'instant tier could not produce a draft answer (LLM unavailable or errored)',
+      };
 
-  if (result && result.consensus) {
+  await commitProvenance(questionId, pending, tier, [], result, resolved ? 'resolve' : 'refund');
+
+  if (resolved) {
     await settleInstantResolved(questionId, result);
   } else {
-    await settleRefunded(questionId, [], {
-      consensus: null,
-      confidence: 0,
-      matchingWorkerIds: [],
-      method: 'llm-draft-unavailable',
-      reason: 'instant tier could not produce a draft answer (LLM unavailable or errored)',
-    });
+    await settleRefunded(questionId, [], result);
   }
+  await recordSettlementProvenance(questionId);
 }
 
 async function settleInstantResolved(questionId, result) {

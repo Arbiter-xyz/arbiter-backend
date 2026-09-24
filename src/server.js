@@ -39,6 +39,7 @@ import { recordAnchorTransaction, recordAnchorKyc } from './anchorRecords.js';
 import { resolveApiKey } from './apiKeyAuth.js';
 import { isBillingConfigured, createCheckoutSession, handleStripeWebhook, getCreditBalanceStroops, reserveCredit, settleReservation } from './billing.js';
 import { logger, httpLogger } from './logger.js';
+import { getProvenance } from './provenance.js';
 import { enforceSecurityPosture } from './securityPosture.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -335,6 +336,24 @@ app.get('/oracle/:jobId', async (req, res) => {
   if (!job) return res.status(404).json({ error: 'unknown or expired jobId' });
   const httpStatus = job.status === 'settled' ? 200 : 202;
   return res.status(httpStatus).json({ jobId: req.params.jobId, ...job });
+});
+
+// Public, unauthenticated, same as GET /oracle/:jobId: the full committed
+// reconciliation inputs for a settled question (raw worker submissions, the
+// exact LLM request/response when one was used), the sha256 commitment, and
+// the settlement tx hashes. See provenance.js for the format, and
+// scripts/verify-provenance.js to re-derive the consensus independently.
+app.get('/oracle/:jobId/provenance', async (req, res) => {
+  const entry = await getProvenance(req.params.jobId);
+  if (!entry) return res.status(404).json({ error: 'no provenance recorded for this jobId (not settled yet, or settled before provenance existed)' });
+  return res.json({
+    jobId: req.params.jobId,
+    algorithm: 'sha256',
+    canonicalization: 'RFC 8785 (JCS)',
+    hash: entry.hash,
+    record: entry.record,
+    settlement: entry.settlement,
+  });
 });
 
 // A payer's own question history — there's no account system, so this is
