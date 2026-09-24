@@ -11,6 +11,52 @@ function normalize(text) {
     .trim();
 }
 
+// Common filler words that carry no answer content. Stripped before
+// similarity comparison so "the answer is 42" and "42" cluster together.
+const STOPWORDS = new Set([
+  'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+  'it', 'its', 'this', 'that', 'these', 'those', 'of', 'to', 'in', 'on',
+  'at', 'by', 'for', 'with', 'and', 'or', 'as', 'so', 'answer', 'answers',
+  'result', 'results', 'i', 'we', 'you', 'they', 'he', 'she', 'my', 'our',
+  'your', 'their', 'think', 'believe', 'say', 'said', 'says', 'would', 'will',
+]);
+
+function tokenize(text) {
+  return normalize(text)
+    .split(' ')
+    .filter((t) => t.length > 0 && !STOPWORDS.has(t));
+}
+
+/**
+ * Cheap string-similarity heuristic used to cluster near-duplicate answers
+ * before voting. We deliberately avoid an embedding call here: reconcile()
+ * sits in the critical path of settling escrow with a fail-closed fallback
+ * behind it, and a synchronous, dependency-free heuristic keeps that path
+ * fast and deterministic. Token-set Jaccard similarity over content words
+ * (stopwords stripped) captures the common paraphrase cases — "42" vs
+ * "the answer is 42", casing/whitespace/punctuation differences — while
+ * still separating genuinely different answers.
+ */
+function similarity(a, b) {
+  const ta = tokenize(a);
+  const tb = tokenize(b);
+  if (ta.length === 0 && tb.length === 0) return 1;
+  if (ta.length === 0 || tb.length === 0) return 0;
+
+  const setA = new Set(ta);
+  const setB = new Set(tb);
+  let intersection = 0;
+  for (const t of setA) if (setB.has(t)) intersection += 1;
+  const union = setA.size + setB.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+// Above this Jaccard threshold two answers are treated as the same cluster.
+// Tuned conservatively: too low merges genuinely different answers (a
+// correctness risk), too high fails to merge obvious paraphrases (the
+// quality problem this issue targets).
+const CLUSTER_THRESHOLD = 0.6;
+
 export function exactMatchVote(submissions) {
   const groups = new Map(); // normalized -> { representative, workerIds }
   for (const { workerId, answer } of submissions) {
@@ -29,6 +75,47 @@ export function exactMatchVote(submissions) {
     confidence: winner.workerIds.length / submissions.length,
     matchingWorkerIds: winner.workerIds,
     allAgree: winner.workerIds.length === submissions.length,
+  };
+}
+
+/**
+ * Cluster raw submissions by semantic similarity, then vote on clusters
+ * rather than raw strings. A cluster's size (not any single string's exact
+ * match count) is what counts toward quorum agreement, so "42" and "the
+ * answer is 42" reinforce the same quorum instead of fracturing it.
+ *
+ * Clustering is greedy and order-dependent: each submission joins the
+ * first existing cluster whose representative it is similar enough to,
+ * otherwise it seeds a new cluster. The representative is the first
+ * submission seen for that cluster. This is deterministic for a given
+ * submission order and cheap (O(n^2) similarity checks over a small n).
+ */
+export function clusterVote(submissions) {
+  const clusters = []; // { representative, workerIds }
+
+  for (const { workerId, answer } of submissions) {
+    let joined = false;
+    for (const cluster of clusters) {
+      if (similarity(answer, cluster.representative) >= CLUSTER_THRESHOLD) {
+        cluster.workerIds.push(workerId);
+        joined = true;
+        break;
+      }
+    }
+    if (!joined) clusters.push({ representative: answer, workerIds: [workerId] });
+  }
+
+  let winner = null;
+  for (const cluster of clusters) {
+    if (!winner || cluster.workerIds.length > winner.workerIds.length) winner = cluster;
+  }
+
+  return {
+    consensus: winner.representative,
+    confidence: winner.workerIds.length / submissions.length,
+    matchingWorkerIds: winner.workerIds,
+    allAgree: winner.workerIds.length === submissions.length,
+    clusterCount: clusters.length,
   };
 }
 
@@ -162,26 +249,33 @@ export async function draftAnswer(question, questionId) {
  * outage — any Claude error falls back to a deterministic vote so the
  * caller can always settle the escrow one way or the other.
  *
- * Fast path: if every worker's answer normalizes identically AND every one
- * of those workers is reputation-established (see dispatch.js's
- * isEstablishedWorker), there is nothing for an LLM to adjudicate — skip
- * Claude and save the latency/cost. The established-only restriction
- * matters: unanimous agreement only proves consensus, never correctness, so
- * a quorum stuffed with fresh (possibly sybil) identities racing to submit
- * the same wrong answer would otherwise sail through with zero scrutiny.
- * Requiring history from every matching worker forces that attack to first
- * spend many honest-looking questions building up reputation before it can
- * ever hit the frictionless path — it doesn't eliminate a sufficiently
- * patient attacker, but it's no longer free. Any quorum containing a fresh
+ * Fast path: if every worker's answer clusters together (near-duplicate
+ * phrasing counts as agreement) AND every one of those workers is
+ * reputation-established (see dispatch.js's isEstablishedWorker), there is
+ * nothing for an LLM to adjudicate — skip Claude and save the
+ * latency/cost. The established-only restriction matters: unanimous
+ * agreement only proves consensus, never correctness, so a quorum stuffed
+ * with fresh (possibly sybil) identities racing to submit the same wrong
+ * answer would otherwise sail through with zero scrutiny. Requiring
+ * history from every matching worker forces that attack to first spend
+ * many honest-looking questions building up reputation before it can ever
+ * hit the frictionless path — it doesn't eliminate a sufficiently patient
+ * attacker, but it's no longer free. Any quorum containing a fresh
  * identity still gets Claude's (weak, non-guaranteed, but nonzero)
  * plausibility read, same as a genuine disagreement would.
+ *
+ * Fail-closed guarantee: clustering is a heuristic, so it is only trusted
+ * for the frictionless fast path when it is unambiguous (every submission
+ * lands in a single cluster). Any split clustering — including one caused
+ * by a borderline similarity score — falls through to the Claude-assisted
+ * review path rather than silently resolving on a fuzzy match.
  */
 export async function reconcile(question, submissions, questionId) {
   if (submissions.length === 0) {
     return { consensus: null, confidence: 0, matchingWorkerIds: [], method: 'no-answers' };
   }
 
-  const vote = exactMatchVote(submissions);
+  const vote = clusterVote(submissions);
   const allEstablished = submissions.every((s) => s.established);
 
   if (vote.allAgree && allEstablished) {
@@ -189,19 +283,19 @@ export async function reconcile(question, submissions, questionId) {
       consensus: vote.consensus,
       confidence: 1,
       matchingWorkerIds: vote.matchingWorkerIds,
-      method: 'exact-match-fastpath',
+      method: 'cluster-fastpath',
     };
   }
 
   try {
     return await reconcileWithClaude(question, submissions);
   } catch (err) {
-    logger.error({ err, questionId }, 'Claude reconciliation failed, falling back to exact-match vote');
+    logger.error({ err, questionId }, 'Claude reconciliation failed, falling back to cluster vote');
     return {
       consensus: vote.consensus,
       confidence: vote.confidence,
       matchingWorkerIds: vote.matchingWorkerIds,
-      method: 'exact-match-fallback',
+      method: 'cluster-fallback',
     };
   }
 }
