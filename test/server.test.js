@@ -396,6 +396,10 @@ describe('worker session auth over real HTTP — the /app/answer impersonation f
     const session = await getSession(payer);
     const res = await fetch(`${base}/payers/${payer.publicKey()}/questions?token=${encodeURIComponent(session.token)}`);
     assert.equal(res.status, 200);
+    // #48: per-category and per-day spend buckets ride along on the same response.
+    const body = await res.json();
+    assert.deepEqual(body.spendByCategory, []);
+    assert.deepEqual(body.spendByDay, []);
   });
 
   test('GET /payers/:address/questions rejects a session token for a DIFFERENT address', async () => {

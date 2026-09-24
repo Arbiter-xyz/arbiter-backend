@@ -1,0 +1,33 @@
+# Proactive dependency updates (#35). CI's `npm audit --audit-level=high`
+# only catches a vulnerability when something else triggers a run; this
+# watches package.json / package-lock.json on a schedule and opens PRs for
+# available updates, including newly disclosed CVEs in already-installed
+# packages.
+#
+# Scope: this split-out arbiter-backend repo carries exactly one npm package,
+# at the repository root, so the job targets "/". (In the retired monorepo
+# the same package lived under backend/.)
+#
+# No auto-merge on purpose: this code moves real funds, so a human reviews
+# every dependency bump.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+      include: scope
+    groups:
+      # One PR per week for all non-breaking bumps keeps PR volume sane;
+      # major versions still get their own PR each so they're reviewed on
+      # their own merits.
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
