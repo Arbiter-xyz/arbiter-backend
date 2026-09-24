@@ -39,8 +39,18 @@ import { recordAnchorTransaction, recordAnchorKyc } from './anchorRecords.js';
 import { resolveApiKey } from './apiKeyAuth.js';
 import { isBillingConfigured, createCheckoutSession, handleStripeWebhook, getCreditBalanceStroops, reserveCredit, settleReservation } from './billing.js';
 import { logger, httpLogger } from './logger.js';
+import { enforceSecurityPosture } from './securityPosture.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Refuse to boot a real deployment that left a severe insecure default in
+// place, and log loudly about the rest — see securityPosture.js. Local dev
+// with every default untouched passes silently.
+if (!enforceSecurityPosture(process.env, logger)) {
+  console.error('[security-posture] refusing to start: fix the setting(s) named above.');
+  await new Promise((resolve) => logger.flush(resolve));
+  process.exit(1);
+}
 
 const app = express();
 // One structured log line per request (method/path/status/duration/request
