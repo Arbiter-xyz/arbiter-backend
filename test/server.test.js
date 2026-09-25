@@ -443,6 +443,24 @@ describe('sandbox mode over real HTTP', () => {
     assert.equal(job.sandbox, true);
     assert.equal(job.outcome, 'resolved');
   });
+
+  test('POST /oracle/:jobId/cancel is wired up: unknown jobs 404, sandbox jobs are not cancellable', async () => {
+    const unknown = await fetch(`${base}/oracle/does-not-exist/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: 'x' }),
+    });
+    assert.equal(unknown.status, 404);
+
+    const sandboxRes = await fetch(`${base}/oracle/sandbox`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: 'can I cancel a sandbox job?' }),
+    });
+    const { jobId } = await sandboxRes.json();
+    const cancelRes = await fetch(`${base}/oracle/${jobId}/cancel`, { method: 'POST' });
+    assert.equal(cancelRes.status, 404, 'sandbox jobs have no payment to refund');
+  });
 });
 
 describe('sandbox rate limiting (isolated server so its counter is not shared with other sandbox tests)', () => {

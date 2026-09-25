@@ -4,7 +4,7 @@ import express from 'express';
 import cors from 'cors';
 
 import { config } from './config.js';
-import { issueChallengeIdempotent, verifyPayment, startFulfillment, getJobStatus } from './oracle.js';
+import { issueChallengeIdempotent, verifyPayment, startFulfillment, getJobStatus, cancelJob } from './oracle.js';
 import {
   onlineWorkerCount,
   checkConnectionRateLimit,
@@ -209,7 +209,7 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
     }
 
     try {
-      const result = await askMetered(config.billing.fiatPoolAddress, question, tier, category, consensus.rule);
+      const result = await askMetered(config.billing.fiatPoolAddress, question, tier, category, { apiKeyAccountId });
       await settleReservation(apiKeyAccountId, maxStroops, Number(result.amountStroops));
       return res.status(202).json({ ...result, statusUrl: `/oracle/${result.jobId}` });
     } catch (err) {
@@ -277,12 +277,13 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
       return res.status(verdict.status).json({ questionId, reason: verdict.reason });
     }
 
-    const { jobId } = await startFulfillment(questionId, verdict.pending, verdict.tier, verdict.payerAddress);
+    const { jobId, cancellableUntil } = await startFulfillment(questionId, verdict.pending, verdict.tier, verdict.payerAddress);
     return res.status(202).json({
       jobId,
       questionId,
       question: verdict.pending.question,
       statusUrl: `/oracle/${jobId}`,
+      ...(cancellableUntil ? { cancellableUntil, cancelUrl: `/oracle/${jobId}/cancel` } : {}),
       quorumSize: verdict.tier.quorumSize,
       timeoutMs: verdict.tier.timeoutMs,
     });
@@ -337,6 +338,23 @@ app.get('/oracle/:jobId', async (req, res) => {
   if (!job) return res.status(404).json({ error: 'unknown or expired jobId' });
   const httpStatus = job.status === 'settled' ? 200 : 202;
   return res.status(httpStatus).json({ jobId: req.params.jobId, ...job });
+});
+
+// Undo window (see undoWindow.js / oracle.js's cancelJob): a paid,
+// non-instant question can be cancelled and refunded while its job is still
+// 'holding', before dispatch. Authenticated as the payer — a session token
+// for the job's payer address in body.token, or, for an API-key-funded
+// question, the same `Authorization: Bearer ak_live_...` key that asked it.
+app.post('/oracle/:jobId/cancel', rateLimited('oracle', byIp), async (req, res) => {
+  try {
+    const apiKeyAccountId = await resolveApiKey(req);
+    const result = await cancelJob(req.params.jobId, { sessionToken: (req.body || {}).token, apiKeyAccountId });
+    if (!result.ok) return res.status(result.status).json({ jobId: req.params.jobId, error: result.error });
+    return res.json({ jobId: req.params.jobId, ...result.job });
+  } catch (err) {
+    req.log.error({ err, jobId: req.params.jobId }, 'cancel failed');
+    return res.status(500).json({ error: 'failed to cancel question' });
+  }
 });
 
 // A payer's own question history — there's no account system, so this is

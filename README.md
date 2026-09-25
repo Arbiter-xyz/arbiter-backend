@@ -61,33 +61,22 @@ build narrative live in the archived
   Credit reservations are atomic and webhook delivery is idempotent per
   Stripe event id.
 
-- **Escalating quorum (`auto` tier)** — asks one worker first and recruits
-  more only when that answer isn't confident enough. The confidence signal
-  for a lone answer is the worker's own reputation (Laplace-smoothed match
-  ratio, zero for unestablished workers — see `singleAnswerConfidence` in
-  `dispatch.js` for why not a vote or an LLM check), and the settle/escalate
-  decision is a pure function (`decideEscalation`). The final size isn't
-  known at quote time, so it is quoted and charged at the ceiling (the
-  full-cap price). The real recruited count and effective price are stored on
-  the job (`recruitedWorkers`, `quorumSizeUsed`, `effectiveAmountStroops`).
-  On the prepaid/API-key path the unused portion is refunded to the
-  customer's credit; on the on-chain `submit()` path the escrow can't shrink,
-  so the platform keeps the difference (same as the surge-price ceiling).
-  The fixed tiers are unchanged.
-- **Security headers** — every response carries a same-origin-only
-  `Content-Security-Policy` (no inline/eval script, no framing, no plugins),
-  `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
-  `Referrer-Policy` and `Strict-Transport-Security`
-  (`securityHeaders.js`). If the UI is hosted on another origin, list it in
-  `CSP_CONNECT_SRC`; `HSTS_ENABLED=false` turns HSTS off.
-- **MCP server** — [`mcp-server/`](mcp-server/README.md) exposes Arbiter as
-  agent-callable tools (`@arbiter-xyz/mcp-server`).
+## Client SDKs
+
+First-party clients for the agent-facing API (ask → pay → poll, payer
+session auth, the undo window, and the public reads), each with its own
+README, tests, and changelog:
+
+- **TypeScript / JavaScript**: [`sdk/typescript`](sdk/typescript) (`@arbiter-xyz/sdk`), for Node 18+ and browsers
+- **Python**: [`sdk/python`](sdk/python) (`arbiter-sdk`), for Python 3.9+
+
+Both can be tried against `POST /oracle/sandbox` with no wallet at all.
 
 ## Running it
 
 ```sh
 npm install
-npm test              # 241 tests, no chain needed
+npm test              # no chain needed
 cp .env.example .env  # fill in ORACLE_CONTRACT_ID / PLATFORM_SECRET for real use
 npm start
 ```

@@ -82,27 +82,28 @@ export const config = Object.freeze({
 
   minConfidence: num(process.env.MIN_CONFIDENCE, 0.6),
 
+  // Undo window (see undoWindow.js): how long a paid, non-instant question
+  // is held after payment before it's dispatched to workers, during which
+  // the payer can POST /oracle/:jobId/cancel for a refund. 0 disables it.
+  undoWindowMs: num(process.env.UNDO_WINDOW_MS, 8_000),
+
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
   anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-sonnet-5',
 
-  // Fleet-wide (not per-IP) hard cost cap on real Claude API spend. Per-IP
-  // rate limits (SANDBOX_RATE_LIMIT_MAX, ORACLE_RATE_LIMIT_MAX) bound a
-  // single source, but a distributed attacker across many IPs can still
-  // multiply real Anthropic spend arbitrarily. This rolling budget is
-  // tracked in Redis (see costBudget.js) so it holds across every backend
-  // instance, not just per-process. When exhausted, sandbox falls back to
-  // canned/deterministic answers and the Instant tier fails closed to a
-  // refund — never a hung or broken request. 0 disables the cap (preserves
-  // today's behavior for local dev / tests).
-  claudeCostBudget: Object.freeze({
-    // Max real Claude API spend allowed per rolling window, in USD.
-    maxUsd: num(process.env.CLAUDE_COST_BUDGET_USD, 0),
-    // Length of the rolling window the budget is measured over.
-    windowMs: num(process.env.CLAUDE_COST_BUDGET_WINDOW_MS, 3_600_000),
-    // Conservative per-call cost estimate (USD) reserved before each real
-    // Claude call, so concurrent in-flight calls can't collectively blow
-    // past the cap before any of them report actual usage.
-    estimatedCostPerCallUsd: num(process.env.CLAUDE_COST_PER_CALL_USD, 0.01),
+  // Draft-answer suggestions for human-quorum tiers (see oracle.js's
+  // shouldDraftSuggestion): one extra Claude call per dispatched question,
+  // delivered to workers as an unverified prefill. Opt-in, off by default:
+  // it adds real per-question Claude spend, and a visible draft can anchor
+  // workers toward the LLM's answer instead of their own independent one —
+  // a trade-off an operator should choose deliberately, not inherit.
+  draftSuggestions: Object.freeze({
+    enabled: process.env.DRAFT_SUGGESTIONS_ENABLED === 'true',
+    tiers: Object.freeze(
+      (process.env.DRAFT_SUGGESTION_TIERS || 'standard,express,priority')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
   }),
 
   pendingQuestionTtlMs: num(process.env.PENDING_QUESTION_TTL_MS, 600_000),

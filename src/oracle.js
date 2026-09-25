@@ -11,9 +11,14 @@ import { notifyWorker } from './push.js';
 import { jobLogger } from './logger.js';
 import { store } from './store.js';
 import { config } from './config.js';
-import { DEFAULT_CONSENSUS_MODE } from './consensus.js';
+import { undoWindowFor, holdThenDispatch, cancelHeld } from './undoWindow.js';
+import { verifySessionToken } from './workerAuth.js';
+import { restoreCredit } from './billing.js';
 
 const IDEMPOTENCY_PREFIX = 'idempotency:';
+// Who may cancel an API-key-funded job. Kept out of the job record itself,
+// which GET /oracle/:jobId returns verbatim to anyone holding the jobId.
+const JOB_OWNER_PREFIX = 'job-owner:';
 
 /**
  * `consensusRule` is a validated rule from consensus.js's
@@ -148,18 +153,21 @@ export async function verifyPayment(questionId) {
  * submit()-based flow (verifyPayment) and the prepaid-balance flow
  * (askMetered) converge, instead of duplicated in each caller.
  *
- * `hooks.onEffectiveCost(effectiveStroops)` (optional) is called once, for
- * escalating-quorum tiers only, when dispatch finishes and the real cost is
- * known. The prepaid/API-key flow uses it to refund the unused part of the
- * ceiling it charged up front; the on-chain submit() flow passes nothing
- * because its escrow can't shrink (the platform keeps the delta — see the
- * `auto` tier in pricing.js). A throwing hook never affects settlement.
+ * Non-instant tiers are first held for the undo window (see undoWindow.js)
+ * in status 'holding'; dispatch only starts once the hold elapses without
+ * a cancelJob() claiming the job first. `apiKeyAccountId` marks a job
+ * funded through the API-key path, whose `payerAddress` is the platform's
+ * pooled fiat address — it's what cancelJob() authenticates against there.
  */
-export async function startFulfillment(questionId, pending, tier, payerAddress, hooks = {}) {
+export async function startFulfillment(questionId, pending, tier, payerAddress, { apiKeyAccountId } = {}) {
   const claimed = await claimJob(questionId);
   if (!claimed) return { jobId: questionId };
 
+  const holdMs = undoWindowFor(tier);
+  const cancellableUntil = holdMs > 0 ? Date.now() + holdMs : null;
+
   await createJob(questionId, {
+    ...(cancellableUntil ? { status: 'holding', cancellableUntil } : {}),
     question: pending.question,
     tier: tier.key,
     quorumSize: tier.quorumSize,
@@ -172,9 +180,31 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
     ...(pending.consensusTolerance ? { consensusTolerance: pending.consensusTolerance } : {}),
   });
 
+  if (apiKeyAccountId) {
+    await store.set(JOB_OWNER_PREFIX + questionId, { apiKeyAccountId }, config.jobResultTtlMs);
+  }
   if (payerAddress) await recordPayerQuestion(payerAddress, questionId);
 
-  fulfillOracleCall(questionId, pending, tier, payerAddress).catch((err) => {
+  if (!cancellableUntil) {
+    runFulfillment(questionId, pending, tier);
+    return { jobId: questionId };
+  }
+
+  holdThenDispatch(
+    questionId,
+    holdMs,
+    async () => {
+      await updateJob(questionId, { status: 'awaiting_workers', cancellableUntil: null, dispatchedAt: Date.now() });
+      runFulfillment(questionId, pending, tier);
+    },
+    (err) => jobLogger(questionId).error({ err }, 'failed to start dispatch after the undo window'),
+  );
+
+  return { jobId: questionId, cancellableUntil };
+}
+
+function runFulfillment(questionId, pending, tier) {
+  fulfillOracleCall(questionId, pending, tier).catch((err) => {
     // fulfillOracleCall is written to always settle the escrow before
     // returning; this catch is a last-resort net so a bug there can't leave
     // the job record stuck in 'awaiting_workers' forever.
@@ -186,8 +216,83 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
       autoRefundAfterLedgers: config.timeoutLedgers,
     }).catch(() => {});
   });
+}
 
-  return { jobId: questionId };
+/**
+ * Cancels a paid question inside its undo window and refunds it through
+ * settleRefunded() — the exact refund()/refund_pending_timeout path every
+ * other refund takes, not a parallel one.
+ *
+ * Who may cancel: whoever paid, proven the same way every other
+ * payer-scoped route proves it.
+ *  - Classic submit() flow and the prepaid/metered flow: a session token
+ *    for the job's `payer` address (POST /payers/:address/session). For the
+ *    classic flow the payer is only known once verifyPayment() reads it off
+ *    the on-chain Question, so this is the one proof that works for both —
+ *    the canceller signs the same throwaway challenge workerAuth.js uses.
+ *  - API-key flow: the same API key that asked. Its on-chain payer is the
+ *    platform's pooled fiat address, so a session token can't identify the
+ *    customer there; the refund returns to the pool and the customer's
+ *    credit is restored here. That credit is restored even if refund()
+ *    itself fails, because a cancelled job is never dispatched and so can
+ *    never be resolve()d — its escrow can only ever go back to the pool,
+ *    via refund() now or refund_timeout() later.
+ *
+ * Returns `{ ok: true, job }` or `{ ok: false, status, error }`. Never
+ * races dispatch: undoWindow.js's atomic decision claim guarantees exactly
+ * one of "cancel" or "dispatch" wins, so a cancel that loses gets a 409
+ * instead of refunding a question workers are already answering.
+ */
+export async function cancelJob(jobId, { sessionToken, apiKeyAccountId } = {}) {
+  const job = await getJob(jobId);
+  if (!job || job.sandbox) return { ok: false, status: 404, error: 'unknown or expired jobId' };
+
+  const owner = await store.get(JOB_OWNER_PREFIX + jobId);
+  const authorized = owner?.apiKeyAccountId
+    ? Boolean(apiKeyAccountId) && apiKeyAccountId === owner.apiKeyAccountId
+    : Boolean(job.payer) && verifySessionToken(sessionToken) === job.payer;
+  if (!authorized) {
+    return {
+      ok: false,
+      status: 401,
+      error: owner?.apiKeyAccountId
+        ? 'the API key that asked this question is required to cancel it'
+        : "a valid session token for this job's payer is required — see POST /payers/:address/session",
+    };
+  }
+
+  if (job.tier === 'instant') {
+    return { ok: false, status: 409, error: 'instant-tier questions have no undo window' };
+  }
+  if (job.status !== 'holding') {
+    return { ok: false, status: 409, error: notCancellableReason(job.status) };
+  }
+
+  const { cancelled } = await cancelHeld(jobId, async () => {
+    await updateJob(jobId, { status: 'cancelling', cancellableUntil: null, cancelledAt: Date.now() });
+    await settleRefunded(
+      jobId,
+      [],
+      {
+        consensus: null,
+        confidence: 0,
+        matchingWorkerIds: [],
+        method: 'cancelled-by-payer',
+        reason: 'cancelled by the payer during the undo window',
+      },
+      { cancelledByPayer: true },
+    );
+    if (owner?.apiKeyAccountId) await restoreCredit(owner.apiKeyAccountId, Number(job.amountStroops));
+  });
+
+  if (!cancelled) return { ok: false, status: 409, error: notCancellableReason('awaiting_workers') };
+  return { ok: true, job: await getJob(jobId) };
+}
+
+function notCancellableReason(status) {
+  if (status === 'settled') return 'this question has already settled';
+  if (status === 'cancelling') return 'this question is already being cancelled';
+  return 'already dispatched to workers — the undo window has closed';
 }
 
 export async function getJobStatus(questionId) {
@@ -195,46 +300,30 @@ export async function getJobStatus(questionId) {
 }
 
 /**
- * Private pools (see privatePools.js): when the payer has registered one,
- * dispatch is restricted to those workers, and this FAILS CLOSED: if none
- * of them is online, the question is refunded without being broadcast at
- * all, rather than falling back to the open pool the payer opted out of.
- * The same goes for a failed pool lookup, since we can't tell whether the
- * payer has a restriction. A payer with no pool gets whitelist = null,
- * which is exactly today's open-pool dispatch.
+ * Whether a human-quorum question should get an LLM draft sent to workers
+ * as a prefill suggestion. Pure (settings are a parameter, defaulting to
+ * config) so every combination is testable despite config being frozen at
+ * load — same reason stakeGateAllows() exists as its own function. Never
+ * for `instant`, which already drafts and settles on its own.
  */
-async function fulfillOracleCall(questionId, pending, tier, payerAddress) {
+export function shouldDraftSuggestion(tier, settings = { ...config.draftSuggestions, apiKey: config.anthropicApiKey }) {
+  if (!tier || tier.instant) return false;
+  if (!settings.enabled || !settings.apiKey) return false;
+  return settings.tiers.includes(tier.key);
+}
+
+async function fulfillOracleCall(questionId, pending, tier) {
   if (tier.instant) {
     return fulfillInstant(questionId, pending);
   }
 
-  let whitelist = null;
-  try {
-    const pool = await getPrivatePool(payerAddress);
-    if (pool.length > 0) whitelist = pool;
-  } catch (err) {
-    jobLogger(questionId).error({ err }, 'private pool lookup failed, refunding rather than risk the open pool');
-    return settleRefunded(questionId, [], {
-      consensus: null,
-      confidence: 0,
-      matchingWorkerIds: [],
-      method: 'private-pool-unavailable',
-      reason: "could not load the payer's private worker pool",
-    });
-  }
-
-  if (whitelist) {
-    await updateJob(questionId, { privatePool: true, privatePoolSize: whitelist.length });
-    if (!hasOnlineWhitelistedWorker(whitelist)) {
-      return settleRefunded(questionId, [], {
-        consensus: null,
-        confidence: 0,
-        matchingWorkerIds: [],
-        method: 'no-private-pool-workers',
-        reason: "none of the workers in the payer's private pool were online",
-      });
-    }
-  }
+  // Started concurrently with dispatch, never awaited here — the suggestion
+  // is additive, so it can't be allowed to delay or fail the broadcast (see
+  // dispatchAndCollect's `suggestion` option for the delivery side).
+  // draftAnswer() never throws and resolves null on any failure.
+  const suggestion = shouldDraftSuggestion(tier)
+    ? draftAnswer(pending.question, questionId, { purpose: 'worker-suggestion' })
+    : undefined;
 
   let submissions = [];
   // Only set for escalating tiers; see dispatchEscalating's return shape.
@@ -245,7 +334,7 @@ async function fulfillOracleCall(questionId, pending, tier, payerAddress) {
       timeoutMs: tier.timeoutMs,
       category: pending.category,
       preferEstablished: tier.preferEstablished,
-      whitelist,
+      suggestion,
     });
   } catch (err) {
     // dispatchAndCollect is designed to never reject, but guard anyway — an
@@ -439,7 +528,7 @@ async function settleResolved(questionId, submissions, result) {
   }
 }
 
-async function settleRefunded(questionId, submissions, result) {
+async function settleRefunded(questionId, submissions, result, extraJobFields = {}) {
   const hash = await refundQuestion(questionId)
     .then((r) => r.hash)
     .catch((err) => {
@@ -469,6 +558,7 @@ async function settleRefunded(questionId, submissions, result) {
     totalAnswers: submissions.length,
     refundTx: hash,
     ...(hash ? {} : { autoRefundAfterLedgers: config.timeoutLedgers }),
+    ...extraJobFields,
   });
 }
 

@@ -174,11 +174,14 @@ const REPORT_DRAFT_TOOL = {
  * "nobody answered, refund," which is exactly the wrong behavior here.
  * Never throws; oracle.js's instant-tier branch treats a null return the
  * same as any other unable-to-answer case (refund, fail closed).
+ *
+ * Also reused for worker-facing draft suggestions on human-quorum tiers
+ * (see oracle.js's fulfillOracleCall); `purpose` only labels the logs.
  */
-export async function draftAnswer(question, questionId) {
+export async function draftAnswer(question, questionId, { purpose = 'instant-tier' } = {}) {
   const client = getClient();
   if (!client) {
-    logger.warn({ questionId }, 'instant tier requested but ANTHROPIC_API_KEY not configured');
+    logger.warn({ questionId, purpose }, `${purpose} draft requested but ANTHROPIC_API_KEY not configured`);
     return null;
   }
 
@@ -197,7 +200,7 @@ export async function draftAnswer(question, questionId) {
     const { answer, confidence } = toolUse.input;
     return { consensus: answer, confidence, matchingWorkerIds: [], method: 'llm-draft' };
   } catch (err) {
-    logger.error({ err, questionId }, 'instant-tier draft answer failed');
+    logger.error({ err, questionId, purpose }, `${purpose} draft answer failed`);
     return null;
   }
 }
