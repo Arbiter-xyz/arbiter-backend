@@ -102,7 +102,53 @@ export function isAllowedRedirectUrl(url) {
   }
 }
 
-export async function createCheckoutSession(amountUsd, successUrl, cancelUrl) {
+/**
+ * Supported fiat currencies for the Stripe onramp, each with the number of
+ * minor units Stripe expects in `unit_amount` (USD/EUR cents, JPY has none)
+ * and the FX rate to USDC face value. Rates are a periodically-updated
+ * static table rather than a live lookup: the issue explicitly allows this
+ * when precision-to-the-cent isn't required, and it keeps the webhook path
+ * free of an external dependency that could be unreachable at credit time.
+ * `usdToStroops` remains the USD anchor (config.billing.usdToStroops) so
+ * the existing 1:1 USD conversion is unchanged.
+ */
+const SUPPORTED_CURRENCIES = {
+  usd: { minorUnits: 100, usdPerUnit: 1 },
+  eur: { minorUnits: 100, usdPerUnit: 1.08 },
+  gbp: { minorUnits: 100, usdPerUnit: 1.27 },
+};
+
+/**
+ * Resolves a currency code to its FX descriptor, or throws for an
+ * unsupported/malformed code. Callers turn the throw into a 400 — an
+ * unknown currency must never silently fall back to USD.
+ */
+export function resolveCurrency(currency) {
+  if (typeof currency !== 'string') {
+    throw new Error('currency must be a string');
+  }
+  const code = currency.trim().toLowerCase();
+  if (!/^[a-z]{3}$/.test(code) || !SUPPORTED_CURRENCIES[code]) {
+    throw new Error(`unsupported currency: ${currency}`);
+  }
+  return { code, ...SUPPORTED_CURRENCIES[code] };
+}
+
+/**
+ * Converts a fiat amount (in the currency's major unit) to stroops of USDC
+ * face value, using the currency's FX rate. The rate is resolved once at
+ * checkout time and snapshotted into the Stripe session metadata so the
+ * webhook credits at exactly the rate the customer saw — mirroring how
+ * pricing.js's priceForTier() snapshots a surge-adjusted price at quote
+ * time so it can't move under the payer before settlement.
+ */
+function fiatToStroops(amount, currency) {
+  const { usdPerUnit } = resolveCurrency(currency);
+  const usd = amount * usdPerUnit;
+  return BigInt(Math.round(usd * Number(config.billing.usdToStroops)));
+}
+
+export async function createCheckoutSession(amountUsd, successUrl, cancelUrl, currency = 'usd') {
   if (!Number.isFinite(amountUsd) || amountUsd < config.billing.minTopupUsd) {
     throw new Error(`amountUsd must be a number >= ${config.billing.minTopupUsd}`);
   }
@@ -110,20 +156,32 @@ export async function createCheckoutSession(amountUsd, successUrl, cancelUrl) {
     throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
   }
 
+  // Reject unsupported/malformed currencies before creating any account or
+  // Stripe session — a bad currency is a 400, never a silent USD default.
+  const { code, minorUnits, usdPerUnit } = resolveCurrency(currency);
+
   const { accountId, rawKey } = await createAccount();
   const session = await getStripe().checkout.sessions.create({
     mode: 'payment',
     line_items: [
       {
         price_data: {
-          currency: 'usd',
+          currency: code,
           product_data: { name: 'Arbiter API credit' },
-          unit_amount: Math.round(amountUsd * 100),
+          unit_amount: Math.round(amountUsd * minorUnits),
         },
         quantity: 1,
       },
     ],
-    metadata: { accountId },
+    // Snapshot the FX rate (as stroops per major unit) at checkout time so
+    // the webhook credits at the rate the customer actually saw, immune to
+    // rate drift between checkout and webhook delivery.
+    metadata: {
+      accountId,
+      currency: code,
+      stroopsPerUnit: String(fiatToStroops(1, code)),
+      usdPerUnit: String(usdPerUnit),
+    },
     success_url: `${successUrl}?apiKey=${rawKey}`,
     cancel_url: cancelUrl,
   });
@@ -154,10 +212,14 @@ export async function handleStripeWebhook(rawBody, signature) {
     return;
   }
 
-  // amount_total is USD cents (integer, no float involved). stroopsPerCent
-  // is exact (10_000_000n / 100n = 100_000n) at USDC's 7-decimal
-  // convention, so this conversion never loses a fraction of a cent.
-  const stroopsPerCent = config.billing.usdToStroops / 100n;
-  const amountStroops = BigInt(session.amount_total) * stroopsPerCent;
+  // Credit using the FX rate locked in at checkout time (snapshotted into
+  // session metadata), NOT a rate refetched now — rate drift between
+  // checkout and webhook delivery must not change the credited amount.
+  // amount_total is in the currency's minor units (integer, no float).
+  const currency = session.metadata?.currency || 'usd';
+  const { minorUnits } = resolveCurrency(currency);
+  const stroopsPerUnit = BigInt(session.metadata?.stroopsPerUnit || String(fiatToStroops(1, currency)));
+  const stroopsPerMinorUnit = stroopsPerUnit / BigInt(minorUnits);
+  const amountStroops = BigInt(session.amount_total) * stroopsPerMinorUnit;
   await store.incrBy(`credit:${accountId}`, Number(amountStroops));
 }
