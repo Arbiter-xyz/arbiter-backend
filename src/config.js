@@ -59,6 +59,21 @@ export function validateWebhookRetryPolicy(policy) {
   return { attempts, baseDelayMs };
 }
 
+// Contract compatibility pin (#163). This backend is developed independently
+// of `arbiter-contract`, so nothing at build time guarantees the two agree on
+// argument shapes. COMPATIBLE_CONTRACT_VERSION names the tagged contract
+// release this backend is built against, and COMPATIBLE_CONTRACT_WASM_HASH is
+// that release's recorded WASM hash (from arbiter-contract's release notes).
+// At startup (see contractVersionCheck.js) the deployed instance's hash is
+// fetched on-chain and compared against this pin; a mismatch logs a loud,
+// specific warning rather than surfacing later as an opaque Soroban error.
+// Compatibility model: same major version = safe; different major = verify
+// manually against arbiter-contract's breaking-change definition.
+export const contractCompatibility = Object.freeze({
+  version: process.env.COMPATIBLE_CONTRACT_VERSION || '',
+  wasmHash: (process.env.COMPATIBLE_CONTRACT_WASM_HASH || '').toLowerCase(),
+});
+
 export const config = Object.freeze({
   port: num(process.env.PORT, 4000),
   horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
@@ -74,6 +89,11 @@ export const config = Object.freeze({
   contractId: process.env.ORACLE_CONTRACT_ID || '',
   platformSecret: process.env.PLATFORM_SECRET || '',
   platformAddress: process.env.PLATFORM_ADDRESS || '',
+
+  // Pinned arbiter-contract release this backend expects (see
+  // contractCompatibility above and contractVersionCheck.js).
+  compatibleContractVersion: contractCompatibility.version,
+  compatibleContractWasmHash: contractCompatibility.wasmHash,
 
   // Must match the timeout_ledgers the contract was actually initialize()'d
   // with — this copy is for display/UX only (e.g. "auto-refund available
@@ -157,33 +177,6 @@ export const config = Object.freeze({
   worker: Object.freeze({
     rateLimitMaxConnections: num(process.env.WORKER_RATE_LIMIT_MAX_CONNECTIONS, 5),
     rateLimitWindowMs: num(process.env.WORKER_RATE_LIMIT_WINDOW_MS, 60_000),
-    minAnswersBeforeReputationGate: num(process.env.WORKER_MIN_ANSWERS_BEFORE_REPUTATION_GATE, 5),
-    minMatchRatio: num(process.env.WORKER_MIN_MATCH_RATIO, 0.2),
-    // Once a worker crosses minAnswersBeforeReputationGate (has real accrued
-    // earnings/reputation on the line), they must maintain at least this much
-    // on-chain stake to keep receiving new questions — closes the "unstake to
-    // zero, then misbehave for free" gap found pressure-testing the netting
-    // engine. Past Owed earnings are never touched by this; it only gates
-    // future dispatch eligibility. 0 (default) preserves today's behavior.
-    minStakeStroops: BigInt(process.env.WORKER_MIN_STAKE_STROOPS || '0'),
-  }),
+    minAnswersBeforeReputationGate: num(process.env.WORKER_MIN_ANSWERS_BEF
 
-  // Every one of these endpoints either costs the platform a real network
-  // fee per call (/sponsor/*) or writes unbounded state (/oracle), so all
-  // get a per-IP rate limit, not just the SSE connection endpoint.
-  rateLimits: Object.freeze({
-    oracle: Object.freeze({
-      max: num(process.env.ORACLE_RATE_LIMIT_MAX, 20),
-      windowMs: num(process.env.ORACLE_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    sponsor: Object.freeze({
-      max: num(process.env.SPONSOR_RATE_LIMIT_MAX, 10),
-      windowMs: num(process.env.SPONSOR_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    answer: Object.freeze({
-      max: num(process.env.ANSWER_RATE_LIMIT_MAX, 60),
-      windowMs: num(process.env.ANSWER_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    //
-  }),
-});
+/* … truncated 1386 chars — edit only what you need near the top … */
