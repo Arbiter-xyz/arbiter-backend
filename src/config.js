@@ -21,6 +21,35 @@ function sessionSecret() {
 }
 const SESSION_SECRET = sessionSecret();
 
+// Graceful SESSION_SECRET rotation: during a bounded grace window, session
+// verification also accepts tokens signed by the immediately-prior secret
+// (SESSION_SECRET_PREVIOUS), so a rotation doesn't instantly kick every
+// live worker/payer. Once the window elapses the old secret is ignored and
+// those tokens are rejected like any other invalid signature. The window is
+// measured from process start (i.e. from when the rotation was deployed),
+// so it self-expires without any extra bookkeeping. 0 disables dual-key
+// acceptance entirely (preserves today's single-secret behavior).
+const SESSION_SECRET_PREVIOUS = process.env.SESSION_SECRET_PREVIOUS || '';
+const SESSION_SECRET_ROTATION_GRACE_MS = num(process.env.SESSION_SECRET_ROTATION_GRACE_MS, 0);
+const SESSION_SECRET_ROTATION_STARTED_AT = Date.now();
+
+// Returns the secrets that are currently valid for verifying a session
+// token, most-preferred first. Always includes the current secret; includes
+// the previous secret only while a grace window is configured and still
+// open. Callers must try each in order and accept a match from any of them.
+function sessionSecrets() {
+  const secrets = [SESSION_SECRET];
+  if (
+    SESSION_SECRET_PREVIOUS &&
+    SESSION_SECRET_PREVIOUS !== SESSION_SECRET &&
+    SESSION_SECRET_ROTATION_GRACE_MS > 0 &&
+    Date.now() - SESSION_SECRET_ROTATION_STARTED_AT < SESSION_SECRET_ROTATION_GRACE_MS
+  ) {
+    secrets.push(SESSION_SECRET_PREVIOUS);
+  }
+  return secrets;
+}
+
 export const config = Object.freeze({
   port: num(process.env.PORT, 4000),
   horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
@@ -46,6 +75,26 @@ export const config = Object.freeze({
 
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
   anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-sonnet-5',
+
+  // Fleet-wide (not per-IP) hard cost cap on real Claude API spend. Per-IP
+  // rate limits (SANDBOX_RATE_LIMIT_MAX, ORACLE_RATE_LIMIT_MAX) bound a
+  // single source, but a distributed attacker across many IPs can still
+  // multiply real Anthropic spend arbitrarily. This rolling budget is
+  // tracked in Redis (see costBudget.js) so it holds across every backend
+  // instance, not just per-process. When exhausted, sandbox falls back to
+  // canned/deterministic answers and the Instant tier fails closed to a
+  // refund — never a hung or broken request. 0 disables the cap (preserves
+  // today's behavior for local dev / tests).
+  claudeCostBudget: Object.freeze({
+    // Max real Claude API spend allowed per rolling window, in USD.
+    maxUsd: num(process.env.CLAUDE_COST_BUDGET_USD, 0),
+    // Length of the rolling window the budget is measured over.
+    windowMs: num(process.env.CLAUDE_COST_BUDGET_WINDOW_MS, 3_600_000),
+    // Conservative per-call cost estimate (USD) reserved before each real
+    // Claude call, so concurrent in-flight calls can't collectively blow
+    // past the cap before any of them report actual usage.
+    estimatedCostPerCallUsd: num(process.env.CLAUDE_COST_PER_CALL_USD, 0.01),
+  }),
 
   pendingQuestionTtlMs: num(process.env.PENDING_QUESTION_TTL_MS, 600_000),
   jobResultTtlMs: num(process.env.JOB_RESULT_TTL_MS, 3_600_000),
@@ -134,6 +183,14 @@ export const config = Object.freeze({
     // How long a worker's session (proven once via a signed challenge
     // transaction) stays valid before they'd need to re-authenticate.
     ttlMs: num(process.env.WORKER_SESSION_TTL_MS, 12 * 60 * 60 * 1000),
+    // Graceful rotation: the set of secrets currently valid for verifying a
+    // session token (current first, then the prior secret while the grace
+    // window is open). Verification must accept a match from any of these;
+    // signing always uses `secret`. Empty/absent previous secret or a 0
+    // grace window yields a single-element list — identical to today.
+    secrets: sessionSecrets,
+    // Length of the rotation grace window in ms (0 = disabled).
+    rotationGraceMs: SESSION_SECRET_ROTATION_GRACE_MS,
   }),
 
   // Single shared operator secret for the /admin/* console — this codebase
@@ -144,33 +201,5 @@ export const config = Object.freeze({
     token: process.env.ADMIN_TOKEN || '',
   }),
 
-  // Home domain of the SEP-24/SEP-12 anchor Arbiter integrates with for
-  // fiat rails (bank deposit/withdraw, KYC status). Arbiter is a CLIENT of
-  // this anchor's stellar.toml — it never stores PII or bank details
-  // itself. Unset disables the /anchor/* routes entirely.
-  anchor: Object.freeze({
-    homeDomain: process.env.ANCHOR_HOME_DOMAIN || '',
-  }),
-
-  // The non-crypto onramp (see billing.js): API-key customers pay in fiat
-  // via Stripe and are settled on-chain from ONE pooled balance under this
-  // dedicated identity — deliberately separate from platformSecret/
-  // platformAddress above (which already collects platform fee revenue via
-  // resolve()/refund()), so customer float and fee revenue never commingle
-  // in one account. Unset disables the /billing/* routes and the API-key
-  // branch of POST /oracle entirely (same fail-closed-if-unconfigured
-  // posture as admin.token above).
-  billing: Object.freeze({
-    stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
-    stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
-    fiatPoolSecret: process.env.FIAT_POOL_SECRET || '',
-    fiatPoolAddress: process.env.FIAT_POOL_ADDRESS || '',
-    // 1 USD = 1 USDC face value, at USDC's existing 7-decimal stroop
-    // convention (see pricing.js's stroopsToUsdc) — the simplest possible
-    // conversion for v1. Stripe's own processing fee is absorbed by the
-    // platform, not passed through to the credited balance; revisit if
-    // margin matters before volume does.
-    usdToStroops: 10_000_000n,
-    minTopupUsd: num(process.env.MIN_TOPUP_USD, 10),
-  }),
+  // Home domain of the SEP-24/SEP-12 anchor Arbiter integr
 });
