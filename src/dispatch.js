@@ -4,6 +4,8 @@ import { checkRateLimit } from './rateLimit.js';
 import { getPushEligibleWorkerIds, notifyWorker } from './push.js';
 import { getStakeOnChain, touchWorker } from './stellarClient.js';
 import { jobLogger, logger } from './logger.js';
+import { recordWorkerActivity } from './workerAnalytics.js';
+import { syncBadges } from './gamification.js';
 import { trace, context, propagation, SpanKind, SpanStatusCode } from '@opentelemetry/api';
 
 // Live worker registry — inherently process-local because it holds open SSE
@@ -111,6 +113,16 @@ export async function recordOutcome(workerId, matched) {
     if (!known.includes(workerId)) {
       await store.set(WORKER_INDEX_KEY, [workerId, ...known].slice(0, MAX_TRACKED_WORKERS));
     }
+  }
+
+  // Analytics + gamification are observability only — a failure here must
+  // never fail settlement, so it's logged and swallowed.
+  try {
+    await recordWorkerActivity(workerId, matched);
+    const newlyEarned = await syncBadges(workerId);
+    if (newlyEarned.length > 0) logger.info({ workerId, badges: newlyEarned }, 'worker earned badges');
+  } catch (err) {
+    logger.warn({ err, workerId }, 'failed to record worker analytics');
   }
 }
 
