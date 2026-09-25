@@ -148,6 +148,49 @@ and `GET /admin/transactions` return it. `GET /payers/:address/questions`
 also returns `spendByCategory` and `spendByDay` (UTC days) buckets for spend
 dashboards.
 
+## Referrals and onboarding
+
+A worker gets a referral code (`ARB-XXXXXXXX`) from
+`POST /workers/:address/referral-code` with `{ token }`, and tracks each
+referee's progress at `GET /workers/:address/referrals?token=...`. A referee
+is `pending` until established, then `qualified`. They become `disqualified`
+if their match ratio is under the routing gate, or if collusion detection
+flags them together with their referrer. Codes are tracked only by this
+backend. There's no on-chain referral payout.
+
+A new worker onboards with one call. They get a session token for the new
+address (the challenge is signed offline, so the account doesn't need to
+exist yet), then call `POST /workers/:address/onboard` with
+`{ token, referralCode }`. This redeems the code and returns the sponsored
+account + USDC trustline transaction. The worker signs it and submits it to
+`POST /sponsor/onboard/submit`. `GET /referrals/:code` checks a code before
+the worker signs anything.
+
+Each address can redeem one code, and only before it has any answer history.
+Self-referral is rejected, and each code has a use cap
+(`REFERRAL_MAX_USES_PER_CODE`). Set `REFERRAL_REQUIRED_FOR_SPONSORED_ONBOARDING=true`
+to require a referral code for sponsored onboarding.
+
+## Collusion detection
+
+`collusion.js` scores pairs of workers across the quorums they share. It
+combines five signals with a weighted noisy-OR:
+
+- identical wrong answers
+- agreement above what their individual match ratios predict
+- answers submitted within `COLLUSION_SYNC_WINDOW_MS` of each other
+- a referral link between them
+- a shared connection IP (stored only as an HMAC)
+
+When a pair's score reaches `COLLUSION_FLAG_SCORE`, the pair is flagged. Any
+quorum where a flagged pair gives the same answer skips the reconcile fast
+path and goes to review. When a pair's score reaches `COLLUSION_SUSPEND_SCORE`,
+both workers are also dropped from routing. Like the other routing gates, this
+one fails open. Operators review pairs at `GET /admin/collusion` and
+`GET /admin/collusion/workers/:workerId`, and clear them with
+`POST /admin/collusion/clear`. After a pair is cleared, only a worse score
+suspends it again. These are heuristics: nothing here slashes stake.
+
 ## Dependency updates
 
 `.github/dependabot.yml` runs a weekly npm update job. Minor and patch bumps
