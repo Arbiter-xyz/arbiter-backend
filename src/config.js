@@ -69,6 +69,20 @@ const sorobanRpcUrls = (process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.
   .map((s) => s.trim())
   .filter(Boolean);
 
+// Deployment profile (#150). 'demo' is the disposable free-tier deployment
+// documented in README's "Try it live" table; 'sandbox' is the long-lived
+// developer sandbox environment that integrators point at. The profile only
+// selects defaults below — every value stays overridable via its own env var
+// so a single service can still be tuned without a code change.
+const deploymentProfile = process.env.DEPLOYMENT_PROFILE === 'sandbox' ? 'sandbox' : 'demo';
+
+// Rate-limit ceilings per profile (#150). The sandbox absorbs sustained
+// integrator traffic rather than one-off demo hits, so it gets a more
+// generous ceiling while still reusing the same rateLimit.js machinery.
+const rateLimitDefaults = deploymentProfile === 'sandbox'
+  ? { windowMs: 60_000, max: 600 }
+  : { windowMs: 60_000, max: 120 };
+
 export const config = Object.freeze({
   port: num(process.env.PORT, 4000),
   horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
@@ -78,6 +92,11 @@ export const config = Object.freeze({
   // Full ordered list of configured RPC endpoints (primary first).
   sorobanRpcUrls: Object.freeze(sorobanRpcUrls),
   networkPassphrase: process.env.NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015',
+
+  // Which deployment this process is (#150): 'demo' (disposable) or
+  // 'sandbox' (long-lived developer sandbox). Surfaced so /health and the
+  // README can distinguish the two environments unambiguously.
+  deploymentProfile,
 
   usdc: Object.freeze({
     sacId: process.env.USDC_SAC_ID || '',
@@ -147,6 +166,15 @@ export const config = Object.freeze({
   maxQuestionLength: num(process.env.MAX_QUESTION_LENGTH, 2000),
   maxAnswerLength: num(process.env.MAX_ANSWER_LENGTH, 2000),
 
+  // Rate-limit ceilings (#150). Reuses the existing rateLimit.js machinery;
+  // the sandbox profile gets a more generous default than the demo profile
+  // since it absorbs sustained integrator traffic. Both windowMs and max
+  // remain individually overridable via env for either profile.
+  rateLimits: Object.freeze({
+    windowMs: num(process.env.RATE_LIMIT_WINDOW_MS, rateLimitDefaults.windowMs),
+    max: num(process.env.RATE_LIMIT_MAX, rateLimitDefaults.max),
+  }),
+
   worker: Object.freeze({
     rateLimitMaxConnections: num(process.env.WORKER_RATE_LIMIT_MAX_CONNECTIONS, 5),
     rateLimitWindowMs: num(process.env.WORKER_RATE_LIMIT_WINDOW_MS, 60_000),
@@ -161,20 +189,6 @@ export const config = Object.freeze({
     minStakeStroops: BigInt(process.env.WORKER_MIN_STAKE_STROOPS || '0'),
   }),
 
-  // Every one of these endpoints either costs the platform a real network
-  // fee per call (/sponsor/*) or writes unbounded state (/oracle), so all
-  // get a per-IP rate limit, not just the SSE connection endpoint.
-  rateLimits: Object.freeze({
-    oracle: Object.freeze({
-      max: num(process.env.ORACLE_RATE_LIMIT_MAX, 20),
-      windowMs: num(process.env.ORACLE_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    sponsor: Object.freeze({
-      max: num(process.env.SPONSOR_RATE_LIMIT_MAX, 10),
-      windowMs: num(process.env.SPONSOR_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    answer: Object.freeze({
-      max: num(process.env.ANSWER_RATE_LIMIT_MAX, 60),
-      windowMs: num(process.env.ANSWER_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    //
+  // Every one of these endpoints
+
+/* … truncated 708 chars — edit only what you need near the top … */
