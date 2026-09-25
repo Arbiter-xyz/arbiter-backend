@@ -133,6 +133,28 @@ export const config = Object.freeze({
   maxQuestionLength: num(process.env.MAX_QUESTION_LENGTH, 2000),
   maxAnswerLength: num(process.env.MAX_ANSWER_LENGTH, 2000),
 
+  // Profanity/spam screen on worker answers (see answerFilter.js). A
+  // rejected answer is never recorded in the quorum collector, so it can't
+  // count toward consensus. Off by default; the blocklist is operator-
+  // supplied (comma-separated) since what's unacceptable is audience-
+  // specific. A negative maxLinks, or 0 for the other numeric limits,
+  // disables that individual check.
+  answerFilter: Object.freeze({
+    enabled: process.env.ANSWER_FILTER_ENABLED === 'true',
+    blocklist: Object.freeze(
+      (process.env.ANSWER_FILTER_BLOCKLIST || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
+    maxLinks: num(process.env.ANSWER_FILTER_MAX_LINKS, 2),
+    maxRepeatedChars: num(process.env.ANSWER_FILTER_MAX_REPEATED_CHARS, 10),
+    maxUppercaseRatio: num(process.env.ANSWER_FILTER_MAX_UPPERCASE_RATIO, 0.8),
+    // Short answers ("YES", "NO", "USA") are legitimately all-caps, so the
+    // uppercase-ratio check only applies once an answer has this many letters.
+    minLettersForCaseCheck: num(process.env.ANSWER_FILTER_MIN_LETTERS_FOR_CASE_CHECK, 20),
+  }),
+
   worker: Object.freeze({
     rateLimitMaxConnections: num(process.env.WORKER_RATE_LIMIT_MAX_CONNECTIONS, 5),
     rateLimitWindowMs: num(process.env.WORKER_RATE_LIMIT_WINDOW_MS, 60_000),
