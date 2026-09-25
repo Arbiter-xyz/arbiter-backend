@@ -1,28 +1,58 @@
-import { store } from './store.js';
-
 /**
- * Durable, platform-wide counters — real settlement outcomes only.
- * Sandbox settlements deliberately never call this: mixing simulated
- * traffic into a "questions resolved" stat used for trust-building would
- * make the number meaningless (or worse, deceptive) the moment sandbox
- * usage outpaces real usage, which is likely early on.
+ * Aggregate counters for the public /stats surface. Kept as a tiny pure
+ * module so the counters are trivially testable and have no hidden state of
+ * their own — callers own persistence.
+ *
+ * Issue #13 adds shadow-mode AI baseline counters alongside the existing
+ * resolved/refunded tallies: for questions dispatched on a real quorum tier
+ * we also generate the instant-tier LLM draft in shadow and record whether it
+ * matched the human-reconciled consensus. These counters are keyed the same
+ * way as resolved/refunded so they aggregate with the same machinery, and are
+ * purely observability — they never touch settlement, timing, or cost.
  */
-const PREFIX = 'stats:';
 
-export async function incrementStat(name) {
-  await store.incr(PREFIX + name);
+export function emptyStats() {
+  return {
+    resolved: 0,
+    refunded: 0,
+    // Shadow-mode AI baseline (issue #13).
+    shadowMatched: 0,
+    shadowMismatched: 0,
+    shadowRefunded: 0,
+  };
 }
 
-export async function getStats() {
-  const [totalResolved, totalRefunded] = await Promise.all([
-    store.get(PREFIX + 'resolved'),
-    store.get(PREFIX + 'refunded'),
-  ]);
-  const resolved = totalResolved || 0;
-  const refunded = totalRefunded || 0;
+/**
+ * Folds a single shadow-agreement record (see pricing.js's
+ * recordShadowAgreement) into the running counters. A record that wasn't
+ * counted (refunded / no consensus) only bumps shadowRefunded, so the
+ * agreement rate stays a clean matched/(matched+mismatched) ratio.
+ */
+export function applyShadowAgreement(stats, record) {
+  if (!record || !record.counted) {
+    return { ...stats, shadowRefunded: stats.shadowRefunded + 1 };
+  }
+  return record.matched
+    ? { ...stats, shadowMatched: stats.shadowMatched + 1 }
+    : { ...stats, shadowMismatched: stats.shadowMismatched + 1 };
+}
+
+/**
+ * Public view of the counters, including the aggregate shadow agreement rate.
+ * `shadowAgreementRate` is null until at least one comparison has been
+ * counted, so we never publish a misleading 0% before any data exists.
+ */
+export function publicStats(stats) {
+  const counted = stats.shadowMatched + stats.shadowMismatched;
   return {
-    totalResolved: resolved,
-    totalRefunded: refunded,
-    totalSettled: resolved + refunded,
+    resolved: stats.resolved,
+    refunded: stats.refunded,
+    shadow: {
+      matched: stats.shadowMatched,
+      mismatched: stats.shadowMismatched,
+      refunded: stats.shadowRefunded,
+      counted,
+      agreementRate: counted > 0 ? stats.shadowMatched / counted : null,
+    },
   };
 }

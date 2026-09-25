@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { fork } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { store, RedisStore } from '../src/store.js';
 
 function uniqueKey(prefix) {
@@ -133,4 +136,81 @@ test('decrIfAtLeast succeeds atomically when the balance covers the amount', asy
 
 test('decrIfAtLeast treats a never-written key as a zero balance', async () => {
   assert.equal(await store.decrIfAtLeast(uniqueKey('credit'), 1), false);
+});
+
+// ---------------------------------------------------------------------------
+// Multi-process Redis-backed concurrency proof (issue #1).
+//
+// The tests above run against MemoryStore (or a single-process fake). They
+// cannot prove that claimJob / session storage / job-state transitions stay
+// correct when *separate OS processes* race against the *same* Redis under
+// genuine network-latency-shaped interleaving. These tests fork real child
+// processes (child_process.fork) that each open their own Redis connection
+// and hammer the same keys, then assert the invariants hold.
+//
+// CI must provide a real Redis (see .github/workflows/ci.yml service
+// container). When REDIS_URL is unset the multi-process tests are skipped so
+// the suite still runs locally without Redis.
+// ---------------------------------------------------------------------------
+
+const REDIS_URL = process.env.REDIS_URL;
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const WORKER = join(__dirname, 'fixtures', 'redis-concurrency-worker.js');
+
+function runWorker(env) {
+  return new Promise((resolve, reject) => {
+    const child = fork(WORKER, [], {
+      env: { ...process.env, REDIS_URL, ...env },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    let out = '';
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { out += d; });
+    child.on('error', reject);
+    child.on('exit', (code) => {
+      if (code !== 0) return reject(new Error(`worker exited ${code}: ${out}`));
+      try {
+        resolve(JSON.parse(out.trim().split('\n').pop()));
+      } catch (err) {
+        reject(new Error(`worker produced no JSON result: ${out}`));
+      }
+    });
+  });
+}
+
+test('claimJob is atomic across 2+ real OS processes racing the same Redis', { skip: !REDIS_URL }, async () => {
+  const jobId = uniqueKey('job');
+  const workers = 4;
+  const results = await Promise.all(
+    Array.from({ length: workers }, () => runWorker({ MODE: 'claim', JOB_ID: jobId }))
+  );
+  const winners = results.filter((r) => r.claimed);
+  assert.equal(winners.length, 1, 'exactly one process may claim the job');
+  assert.equal(results.filter((r) => !r.claimed).length, workers - 1);
+});
+
+test('session storage stays consistent across concurrent processes', { skip: !REDIS_URL }, async () => {
+  const sessionKey = uniqueKey('session');
+  const workers = 4;
+  const results = await Promise.all(
+    Array.from({ length: workers }, (_, i) => runWorker({ MODE: 'session', SESSION_KEY: sessionKey, WORKER_ID: String(i) }))
+  );
+  // Every process must read back exactly what it wrote, and the final value
+  // must be one of the written values (no torn/partial writes).
+  for (const r of results) assert.equal(r.readBack, r.wrote);
+  const final = await runWorker({ MODE: 'read', SESSION_KEY: sessionKey });
+  assert.ok(results.some((r) => r.wrote === final.value), 'final value must be a complete write');
+});
+
+test('job-state transitions remain correct under multi-process contention', { skip: !REDIS_URL }, async () => {
+  const jobId = uniqueKey('state');
+  const workers = 4;
+  const results = await Promise.all(
+    Array.from({ length: workers }, () => runWorker({ MODE: 'transition', JOB_ID: jobId }))
+  );
+  // Only one process may move the job out of its initial state; the rest must
+  // observe the already-transitioned state rather than clobbering it.
+  assert.equal(results.filter((r) => r.transitioned).length, 1);
+  const final = await runWorker({ MODE: 'readState', JOB_ID: jobId });
+  assert.equal(final.state, 'claimed');
 });

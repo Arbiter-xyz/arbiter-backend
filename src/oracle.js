@@ -1,11 +1,12 @@
 import { nextQuestionId, stashQuestion, getStashedQuestion, dropStashedQuestion } from './pendingQuestions.js';
 import { createJob, updateJob, getJob, claimJob } from './jobs.js';
-import { dispatchAndCollect, recordOutcome, getSmoothedOnlineWorkerCount } from './dispatch.js';
+import { dispatchAndCollect, recordOutcome, getSmoothedOnlineWorkerCount, hasOnlineWhitelistedWorker } from './dispatch.js';
 import { reconcile, draftAnswer } from './reconcile.js';
 import { resolveQuestion, refundQuestion, getQuestionOnChain } from './stellarClient.js';
-import { resolveTier, listTiersForClient, stroopsToUsdc, priceForTier } from './pricing.js';
+import { resolveTier, listTiersForClient, stroopsToUsdc, priceForTier, effectiveEscalatedPriceStroops } from './pricing.js';
 import { incrementStat } from './stats.js';
 import { recordPayerQuestion } from './payerIndex.js';
+import { getPrivatePool } from './privatePools.js';
 import { notifyWorker } from './push.js';
 import { jobLogger } from './logger.js';
 import { store } from './store.js';
@@ -19,7 +20,24 @@ const IDEMPOTENCY_PREFIX = 'idempotency:';
 // which GET /oracle/:jobId returns verbatim to anyone holding the jobId.
 const JOB_OWNER_PREFIX = 'job-owner:';
 
-export async function issueChallenge(questionText, tierKey, category) {
+/**
+ * `consensusRule` is a validated rule from consensus.js's
+ * parseConsensusRule(), or null for the default exact-match mode. Only a
+ * non-default rule adds fields to the stash and the response, so the
+ * default path's records are unchanged.
+ */
+export function consensusStashFields(consensusRule) {
+  if (!consensusRule) return {};
+  return { consensusMode: consensusRule.mode, consensusTolerance: consensusRule.tolerance };
+}
+
+/** Rebuilds the rule reconcile() takes from a stashed pending question. */
+export function consensusRuleFromPending(pending) {
+  if (!pending?.consensusMode || pending.consensusMode === DEFAULT_CONSENSUS_MODE) return null;
+  return { mode: pending.consensusMode, tolerance: pending.consensusTolerance };
+}
+
+export async function issueChallenge(questionText, tierKey, category, consensusRule = null) {
   const questionId = (await nextQuestionId()).toString();
   // Price is snapshotted NOW, at quote time, from a SMOOTHED (trailing-
   // average) worker-supply signal rather than the instantaneous online
@@ -40,6 +58,7 @@ export async function issueChallenge(questionText, tierKey, category) {
     timeoutMs: priced.timeoutMs,
     category: category || null,
     createdAt: Date.now(),
+    ...consensusStashFields(consensusRule),
   });
 
   return {
@@ -54,6 +73,7 @@ export async function issueChallenge(questionText, tierKey, category) {
     tiers: listTiersForClient(),
     quorumSize: priced.quorumSize,
     timeoutMs: priced.timeoutMs,
+    ...consensusStashFields(consensusRule),
     autoRefundAfterLedgers: config.timeoutLedgers,
     instructions:
       `Call submit(payer, ${questionId}, ${priced.priceStroops.toString()}) on contract ${config.contractId}, ` +
@@ -75,14 +95,14 @@ export async function issueChallenge(questionText, tierKey, category) {
  * questionId itself is already a natural idempotency key there (see
  * startFulfillment's claimJob() usage).
  */
-export async function issueChallengeIdempotent(questionText, tierKey, category, idempotencyKey) {
-  if (!idempotencyKey) return issueChallenge(questionText, tierKey, category);
+export async function issueChallengeIdempotent(questionText, tierKey, category, idempotencyKey, consensusRule = null) {
+  if (!idempotencyKey) return issueChallenge(questionText, tierKey, category, consensusRule);
 
   const cacheKey = IDEMPOTENCY_PREFIX + idempotencyKey;
   const cached = await store.get(cacheKey);
   if (cached) return cached;
 
-  const challenge = await issueChallenge(questionText, tierKey, category);
+  const challenge = await issueChallenge(questionText, tierKey, category, consensusRule);
   await store.set(cacheKey, challenge, config.pendingQuestionTtlMs);
   return challenge;
 }
@@ -155,6 +175,9 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
     amountStroops: tier.priceStroops.toString(),
     amount: stroopsToUsdc(tier.priceStroops),
     payer: payerAddress || null,
+    // What rule reconcile() will apply, visible on GET /oracle/:jobId.
+    consensusMode: pending.consensusMode || DEFAULT_CONSENSUS_MODE,
+    ...(pending.consensusTolerance ? { consensusTolerance: pending.consensusTolerance } : {}),
   });
 
   if (apiKeyAccountId) {
@@ -303,6 +326,8 @@ async function fulfillOracleCall(questionId, pending, tier) {
     : undefined;
 
   let submissions = [];
+  // Only set for escalating tiers; see dispatchEscalating's return shape.
+  let escalated = null;
   try {
     submissions = await dispatchAndCollect(questionId, pending.question, {
       quorumSize: tier.quorumSize,
@@ -321,7 +346,17 @@ async function fulfillOracleCall(questionId, pending, tier) {
 
   await updateJob(questionId, { status: 'reconciling', totalAnswers: submissions.length });
 
-  const result = await reconcile(pending.question, submissions, questionId);
+  const result = await reconcile(pending.question, submissions, questionId, consensusRuleFromPending(pending));
+
+  // A lone answer has no peers to be reconciled against, so reconcile()'s
+  // "unanimous + established" fast path reports confidence 1 for it. Settling
+  // on one worker must not get to skip the confidence bar by construction:
+  // cap it at the confidence dispatch actually had in that worker, so the
+  // shouldResolve / MIN_CONFIDENCE gate below judges the real number, exactly
+  // as it does for every other path.
+  if (escalated && submissions.length === 1 && escalated.confidence !== null) {
+    result.confidence = Math.min(result.confidence, escalated.confidence);
+  }
 
   const shouldResolve =
     submissions.length > 0 && result.matchingWorkerIds.length > 0 && result.confidence >= config.minConfidence;
@@ -330,6 +365,32 @@ async function fulfillOracleCall(questionId, pending, tier) {
     await settleResolved(questionId, submissions, result);
   } else {
     await settleRefunded(questionId, submissions, result);
+  }
+}
+
+/**
+ * Persists what an escalating question really cost — recruited-worker count,
+ * final quorum target, and the effective price against the ceiling that was
+ * charged — on the job record (surfaced by GET /oracle/:jobId and the admin
+ * console), then lets the caller refund the difference if its billing flow
+ * can (see startFulfillment). `amountStroops` stays the amount actually
+ * charged; `effectiveAmountStroops` is what the recruited quorum was worth.
+ */
+async function recordEscalationCost(questionId, tier, escalated, hooks) {
+  const effective = effectiveEscalatedPriceStroops(tier, escalated.recruitedWorkers);
+  await updateJob(questionId, {
+    recruitedWorkers: escalated.recruitedWorkers,
+    quorumSizeUsed: escalated.finalQuorumSize,
+    dispatchSettledBy: escalated.settledBy,
+    effectiveAmountStroops: effective.toString(),
+    effectiveAmount: stroopsToUsdc(effective),
+  });
+  if (hooks.onEffectiveCost) {
+    try {
+      await hooks.onEffectiveCost(effective);
+    } catch (err) {
+      jobLogger(questionId).error({ err }, 'onEffectiveCost hook failed');
+    }
   }
 }
 

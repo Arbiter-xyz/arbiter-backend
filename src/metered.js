@@ -2,7 +2,7 @@ import { nextQuestionId, stashQuestion } from './pendingQuestions.js';
 import { priceForTier, listTiersForClient, stroopsToUsdc } from './pricing.js';
 import { getSmoothedOnlineWorkerCount } from './dispatch.js';
 import { chargeBalance, getBalanceOnChain } from './stellarClient.js';
-import { startFulfillment } from './oracle.js';
+import { startFulfillment, consensusStashFields } from './oracle.js';
 import { config } from './config.js';
 
 /**
@@ -42,6 +42,7 @@ export async function askMetered(payerAddress, questionText, tierKey, category, 
     timeoutMs: priced.timeoutMs,
     category: category || null,
     createdAt: Date.now(),
+    ...consensusStashFields(consensusRule),
   };
   await stashQuestion(questionId, pending);
 

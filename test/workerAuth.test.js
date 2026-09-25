@@ -112,3 +112,58 @@ test('verifying with a bogus challenge address (no outstanding challenge) fails 
 test('buildChallengeXdr rejects a non-address input rather than building a meaningless challenge', async () => {
   await assert.rejects(() => buildChallengeXdr('not-an-address'));
 });
+
+test('a token signed with the previous SESSION_SECRET is accepted during the grace window', async () => {
+  const worker = Keypair.random();
+  const xdr = await buildChallengeXdr(worker.publicKey());
+  const tx = new Transaction(xdr, 'Test SDF Network ; September 2015');
+  tx.sign(worker);
+
+  const { token } = await verifyChallengeAndIssueSession(worker.publicKey(), tx.toXDR());
+  assert.ok(token);
+
+  // Simulate a rotation: the token was issued under the old secret, which is
+  // now the previous secret and still within the grace window.
+  const previousSecret = process.env.SESSION_SECRET;
+  const rotatedSecret = `${previousSecret}-rotated`;
+  process.env.SESSION_SECRET = rotatedSecret;
+  process.env.SESSION_SECRET_PREVIOUS = previousSecret;
+  process.env.SESSION_SECRET_GRACE_MS = String(60 * 60 * 1000);
+  process.env.SESSION_SECRET_ROTATED_AT = String(Date.now());
+
+  try {
+    assert.equal(verifySessionToken(token), worker.publicKey());
+  } finally {
+    process.env.SESSION_SECRET = previousSecret;
+    delete process.env.SESSION_SECRET_PREVIOUS;
+    delete process.env.SESSION_SECRET_GRACE_MS;
+    delete process.env.SESSION_SECRET_ROTATED_AT;
+  }
+});
+
+test('a token signed with the previous SESSION_SECRET is rejected once the grace window elapses', async () => {
+  const worker = Keypair.random();
+  const xdr = await buildChallengeXdr(worker.publicKey());
+  const tx = new Transaction(xdr, 'Test SDF Network ; September 2015');
+  tx.sign(worker);
+
+  const { token } = await verifyChallengeAndIssueSession(worker.publicKey(), tx.toXDR());
+  assert.ok(token);
+
+  const previousSecret = process.env.SESSION_SECRET;
+  const rotatedSecret = `${previousSecret}-rotated`;
+  process.env.SESSION_SECRET = rotatedSecret;
+  process.env.SESSION_SECRET_PREVIOUS = previousSecret;
+  process.env.SESSION_SECRET_GRACE_MS = String(1000);
+  // Rotation happened well before the grace window, so the old key has expired.
+  process.env.SESSION_SECRET_ROTATED_AT = String(Date.now() - 60 * 60 * 1000);
+
+  try {
+    assert.equal(verifySessionToken(token), null);
+  } finally {
+    process.env.SESSION_SECRET = previousSecret;
+    delete process.env.SESSION_SECRET_PREVIOUS;
+    delete process.env.SESSION_SECRET_GRACE_MS;
+    delete process.env.SESSION_SECRET_ROTATED_AT;
+  }
+});

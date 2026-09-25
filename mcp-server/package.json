@@ -1,0 +1,41 @@
+{
+  "name": "@arbiter-xyz/mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server exposing Arbiter, the pay-per-question human-intelligence oracle, as agent-callable tools",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "arbiter-mcp": "src/bin.js"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "arbiter",
+    "stellar",
+    "oracle"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Arbiter-xyz/arbiter-backend.git",
+    "directory": "mcp-server"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "start": "node src/bin.js",
+    "test": "node --test --test-timeout=30000 \"tests/*.spec.js\""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.1",
+    "zod": "^3.25.0"
+  }
+}
