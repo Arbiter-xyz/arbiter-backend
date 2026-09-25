@@ -182,6 +182,13 @@ export const config = Object.freeze({
       max: num(process.env.WEBHOOKS_RATE_LIMIT_MAX, 20),
       windowMs: num(process.env.WEBHOOKS_RATE_LIMIT_WINDOW_MS, 60_000),
     }),
+    // Code minting/redemption and onboarding. Tight on purpose: each
+    // redemption is a durable write, and onboarding builds a transaction
+    // the platform would pay reserves for.
+    referrals: Object.freeze({
+      max: num(process.env.REFERRALS_RATE_LIMIT_MAX, 10),
+      windowMs: num(process.env.REFERRALS_RATE_LIMIT_WINDOW_MS, 60_000),
+    }),
   }),
 
   vapid: Object.freeze({
@@ -276,5 +283,37 @@ export const config = Object.freeze({
     // hashed like API keys. Without a key they're stored as-is, which is the
     // same trust level as the store itself.
     secretEncryptionKey: process.env.WEBHOOK_SECRET_ENCRYPTION_KEY || '',
+  }),
+
+  // Referral-based worker onboarding (see referrals.js). A worker mints one
+  // code; new workers redeem it once, at onboarding time. The code is
+  // bookkeeping plus a sybil speed bump, not a payout mechanism: there is no
+  // on-chain referral reward, so nothing here moves money.
+  referrals: Object.freeze({
+    // Total redemptions one code allows. Bounds how far a single referrer
+    // can fan out a ring of fresh identities under one code.
+    maxUsesPerCode: num(process.env.REFERRAL_MAX_USES_PER_CODE, 25),
+    // When true, POST /workers/:address/onboard refuses to build a
+    // sponsored-onboarding transaction without a valid referral code.
+    // Off by default so open onboarding keeps working as it does today.
+    requiredForSponsoredOnboarding: process.env.REFERRAL_REQUIRED_FOR_SPONSORED_ONBOARDING === 'true',
+  }),
+
+  // Collusion-detection heuristics (see collusion.js). Every threshold is a
+  // tunable heuristic, not a proof: flags are for operator review and for
+  // denying the reconcile fast path, never for slashing on their own.
+  collusion: Object.freeze({
+    // Co-answered questions a pair needs before agreement-lift is scored at
+    // all; below this, one lucky streak looks exactly like a ring.
+    minSharedQuestions: num(process.env.COLLUSION_MIN_SHARED_QUESTIONS, 5),
+    // Two answers landing within this window of each other count as
+    // "synchronized" for the timing heuristic.
+    syncWindowMs: num(process.env.COLLUSION_SYNC_WINDOW_MS, 1_500),
+    // Pair score at or above which the pair is flagged for review and its
+    // shared quorums lose the reconcile fast path.
+    flagScore: num(process.env.COLLUSION_FLAG_SCORE, 0.6),
+    // Pair score at or above which both workers are also dropped from
+    // routing eligibility (soft, fails open like every other routing gate).
+    suspendScore: num(process.env.COLLUSION_SUSPEND_SCORE, 0.85),
   }),
 });

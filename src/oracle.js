@@ -1,6 +1,7 @@
 import { nextQuestionId, stashQuestion, getStashedQuestion, dropStashedQuestion } from './pendingQuestions.js';
 import { createJob, updateJob, getJob, claimJob } from './jobs.js';
-import { dispatchAndCollect, recordOutcome, getSmoothedOnlineWorkerCount, hasOnlineWhitelistedWorker } from './dispatch.js';
+import { dispatchAndCollect, recordOutcome, getReputation, getSmoothedOnlineWorkerCount, hasOnlineWhitelistedWorker } from './dispatch.js';
+import { assessQuorum, recordQuorumObservation } from './collusion.js';
 import { reconcile, draftAnswer } from './reconcile.js';
 import { resolveQuestion, refundQuestion, getQuestionOnChain } from './stellarClient.js';
 import { resolveTier, listTiersForClient, stroopsToUsdc, priceForTier, effectiveEscalatedPriceStroops } from './pricing.js';
@@ -356,6 +357,19 @@ async function fulfillOracleCall(questionId, pending, tier) {
 
   await updateJob(questionId, { status: 'reconciling', totalAnswers: submissions.length });
 
+  // A flagged pair (collusion.js) that gave the same answer in this quorum
+  // loses the reconcile fast path: their shared track record is exactly
+  // what's in doubt, so it can't be what vouches for this consensus. They
+  // are treated as unestablished for this one quorum, which also keeps the
+  // provenance record's `established` flags consistent with the path taken.
+  const collusionCheck = await assessQuorum(submissions);
+  if (collusionCheck.suspicious) {
+    const flagged = new Set(collusionCheck.workerIds);
+    submissions = submissions.map((s) => (flagged.has(s.workerId) ? { ...s, established: false } : s));
+    jobLogger(questionId).warn({ pairs: collusionCheck.pairs }, 'quorum contains a flagged collusion pair — forcing review');
+    await updateJob(questionId, { collusionReview: { pairs: collusionCheck.pairs.map((p) => ({ pair: p.pair, score: p.score })) } });
+  }
+
   const result = await reconcile(pending.question, submissions, questionId, consensusRuleFromPending(pending));
 
   // A lone answer has no peers to be reconciled against, so reconcile()'s
@@ -528,7 +542,7 @@ async function settleResolved(questionId, submissions, result) {
     const losingWorkerIds = submissions.map((s) => s.workerId).filter((id) => !matchingSet.has(id));
 
     const { hash } = await resolveQuestion(questionId, result.matchingWorkerIds, losingWorkerIds);
-    await recordReputationOutcomes(submissions, result.matchingWorkerIds);
+    await recordReputationOutcomes(questionId, submissions, result.matchingWorkerIds);
     await dropStashedQuestion(questionId);
     await incrementStat('resolved');
 
@@ -569,7 +583,7 @@ async function settleResolved(questionId, submissions, result) {
     const onChainNow = await getQuestionOnChain(questionId).catch(() => null);
     if (onChainNow && onChainNow.status === 'refunded') {
       jobLogger(questionId).warn('lost the settlement race to a third-party refund_timeout()');
-      await recordReputationOutcomes(submissions, []);
+      await recordReputationOutcomes(questionId, submissions, []);
       await incrementStat('refunded');
       const job = await updateJob(questionId, {
         status: 'settled',
@@ -607,7 +621,7 @@ async function settleRefunded(questionId, submissions, result, extraJobFields = 
       return null;
     });
 
-  await recordReputationOutcomes(submissions, result.matchingWorkerIds || []);
+  await recordReputationOutcomes(questionId, submissions, result.matchingWorkerIds || []);
   if (hash) {
     await dropStashedQuestion(questionId);
     await incrementStat('refunded');
@@ -648,7 +662,10 @@ function describeRefundReason(result) {
   return `confidence ${result.confidence.toFixed(2)} below MIN_CONFIDENCE threshold`;
 }
 
-async function recordReputationOutcomes(submissions, matchingWorkerIds) {
+async function recordReputationOutcomes(questionId, submissions, matchingWorkerIds) {
   const matchingSet = new Set(matchingWorkerIds);
   await Promise.all(submissions.map((s) => recordOutcome(s.workerId, matchingSet.has(s.workerId))));
+  // After reputation, so the pair scoring's agreement baseline includes
+  // this question. Never throws (see collusion.js).
+  await recordQuorumObservation(questionId, submissions, matchingWorkerIds, { getReputation });
 }

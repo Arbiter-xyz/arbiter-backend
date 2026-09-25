@@ -4,6 +4,7 @@ import { checkRateLimit } from './rateLimit.js';
 import { getPushEligibleWorkerIds, notifyWorker } from './push.js';
 import { getStakeOnChain, touchWorker } from './stellarClient.js';
 import { jobLogger, logger } from './logger.js';
+import { isCollusionSuspended } from './collusion.js';
 import { trace, context, propagation, SpanKind, SpanStatusCode } from '@opentelemetry/api';
 
 // Live worker registry — inherently process-local because it holds open SSE
@@ -140,6 +141,10 @@ export function stakeGateAllows(cachedStake, minStakeStroops) {
 }
 
 async function isEligible(workerId) {
+  // A worker suspended by collusion.js's heuristics sits out routing until
+  // an operator reviews the pair. Like every gate here it fails open —
+  // selectTargets() never lets eligibility zero out the recipient list.
+  if (await isCollusionSuspended(workerId)) return false;
   const rep = await getReputation(workerId);
   if (rep.total < config.worker.minAnswersBeforeReputationGate) return true;
   if (rep.matched / rep.total < config.worker.minMatchRatio) return false;
