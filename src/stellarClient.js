@@ -139,6 +139,40 @@ export async function resolveQuestion(questionId, matchingWorkerAddresses, losin
   ]);
 }
 
+/** Batch-aware variant of resolve(): settles several questions' worth of
+ * fee/slash bookkeeping in ONE platform-signed transaction, cutting the
+ * per-question serialization + network-fee cost that resolveQuestion()
+ * pays individually. Each entry carries its own matching/losing worker
+ * sets, so a batch can mix questions with different outcomes.
+ *
+ * The contract's resolve_batch() is expected to settle each member
+ * independently and return a per-question outcome vector (e.g. one of
+ * "resolved" / "not_pending" / "already_refunded"), so a single member
+ * losing the refund_timeout() race does NOT fail the whole batch — the
+ * caller inspects the returned outcomes and tags only the racing member
+ * as lost_race_to_timeout_refund. */
+export async function resolveQuestionsBatch(entries) {
+  const questionIds = entries.map((e) => u64Arg(e.questionId));
+  const matching = entries.map((e) => vecOfAddresses(e.matchingWorkerAddresses ?? []));
+  const losing = entries.map((e) => vecOfAddresses(e.losingWorkerAddresses ?? []));
+  return invokeAsAdmin('resolve_batch', [
+    nativeToScVal(questionIds, { type: 'Vec' }),
+    nativeToScVal(matching, { type: 'Vec' }),
+    nativeToScVal(losing, { type: 'Vec' }),
+  ]);
+}
+
+/** Batch-aware variant of refund(): force-refunds several questions in one
+ * platform-signed transaction. Mirrors resolveQuestionsBatch()'s
+ * per-question independence — a member already resolved or already
+ * refunded is reported in the returned outcome vector rather than
+ * aborting the whole batch. */
+export async function refundQuestionsBatch(questionIds) {
+  return invokeAsAdmin('refund_batch', [
+    nativeToScVal(questionIds.map((id) => u64Arg(id)), { type: 'Vec' }),
+  ]);
+}
+
 export async function refundQuestion(questionId) {
   return invokeAsAdmin('refund', [u64Arg(questionId)]);
 }
@@ -184,54 +218,23 @@ async function simulateReadOnly(method, scValArgs = []) {
         .build();
 
       const sim = await srv.simulateTransaction(tx);
-      if (rpc.Api.isSimulationError(sim)) {
-        if (/QuestionNotFound|Error\(Contract, #5\)/.test(sim.error ?? '')) return null;
-        throw new Error(`simulation of ${method} failed: ${sim.error}`);
-      }
-      if (!sim.result?.retval) return null;
-      return scValToNative(sim.result.retval);
+      if (sim.error) throw new Error(`simulate ${method} failed: ${sim.error}`);
+      return sim;
     },
-    { attempts: 2, timeoutMs: 5_000, baseDelayMs: 200, label: `simulateReadOnly(${method})` },
+    { attempts: 2, timeoutMs: 10_000, baseDelayMs: 300, label: `simulateReadOnly(${method})` },
   );
 }
 
-/** Zero-fee simulated read — checks payment state without needing a signature. */
-export async function getQuestionOnChain(questionId) {
-  const native = await simulateReadOnly('get_question', [u64Arg(questionId)]);
-  if (!native) return null;
-  return {
-    payer: native.payer,
-    amount: BigInt(native.amount),
-    status: decodeStatus(native.status),
-    createdAt: Number(native.created_at),
-  };
+export async function readQuestion(questionId) {
+  const sim = await simulateReadOnly('get_question', [u64Arg(questionId)]);
+  const raw = sim.result?.retval;
+  if (raw === undefined) return null;
+  return scValToNative(raw);
 }
 
-export async function getTimeoutLedgersOnChain() {
-  return simulateReadOnly('get_timeout_ledgers');
-}
-
-export async function getOwedOnChain(workerAddress) {
-  const owed = await simulateReadOnly('get_owed', [addressArg(workerAddress)]);
-  return BigInt(owed ?? 0);
-}
-
-export async function getStakeOnChain(workerAddress) {
-  const stake = await simulateReadOnly('get_stake', [addressArg(workerAddress)]);
-  return BigInt(stake ?? 0);
-}
-
-export async function getBalanceOnChain(payerAddress) {
-  const balance = await simulateReadOnly('get_balance', [addressArg(payerAddress)]);
-  return BigInt(balance ?? 0);
-}
-
-/** Refreshes storage TTL on a worker's Owed/Stake entries via the
- * contract's permissionless touch() — no worker signature involved, so
- * this can run on the platform's own admin key exactly like resolve()
- * does. See touch()'s doc comment in lib.rs for why a periodic sweep needs
- * to exist at all (a worker who earns once and never returns has no other
- * way to keep their balance from archiving off-chain storage). */
-export async function touchWorker(workerAddress) {
-  return invokeAsAdmin('touch', [addressArg(workerAddress)]);
+export async function readWorker(workerAddress) {
+  const sim = await simulateReadOnly('get_worker', [addressArg(workerAddress)]);
+  const raw = sim.result?.retval;
+  if (raw === undefined) return null;
+  return scValToNative(raw);
 }
