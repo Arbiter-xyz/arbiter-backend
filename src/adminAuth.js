@@ -20,3 +20,12 @@ export function requireAdmin(req, res, next) {
 
   next();
 }
+
+/**
+ * Gate for GET /metrics. Reuses the exact same bearer-token check as
+ * /admin/* (requireAdmin) so the Prometheus scrape endpoint is protected
+ * by the same ADMIN_TOKEN and the same fail-closed behavior when it is
+ * unset. Kept as a named alias rather than a second implementation so the
+ * two surfaces can never drift apart.
+ */
+export const requireMetricsAuth = requireAdmin;

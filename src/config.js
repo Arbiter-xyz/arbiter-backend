@@ -59,6 +59,21 @@ export function validateWebhookRetryPolicy(policy) {
   return { attempts, baseDelayMs };
 }
 
+// Contract compatibility pin (#163). This backend is developed independently
+// of `arbiter-contract`, so nothing at build time guarantees the two agree on
+// argument shapes. COMPATIBLE_CONTRACT_VERSION names the tagged contract
+// release this backend is built against, and COMPATIBLE_CONTRACT_WASM_HASH is
+// that release's recorded WASM hash (from arbiter-contract's release notes).
+// At startup (see contractVersionCheck.js) the deployed instance's hash is
+// fetched on-chain and compared against this pin; a mismatch logs a loud,
+// specific warning rather than surfacing later as an opaque Soroban error.
+// Compatibility model: same major version = safe; different major = verify
+// manually against arbiter-contract's breaking-change definition.
+export const contractCompatibility = Object.freeze({
+  version: process.env.COMPATIBLE_CONTRACT_VERSION || '',
+  wasmHash: (process.env.COMPATIBLE_CONTRACT_WASM_HASH || '').toLowerCase(),
+});
+
 export const config = Object.freeze({
   port: num(process.env.PORT, 4000),
   horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
@@ -74,6 +89,11 @@ export const config = Object.freeze({
   contractId: process.env.ORACLE_CONTRACT_ID || '',
   platformSecret: process.env.PLATFORM_SECRET || '',
   platformAddress: process.env.PLATFORM_ADDRESS || '',
+
+  // Pinned arbiter-contract release this backend expects (see
+  // contractCompatibility above and contractVersionCheck.js).
+  compatibleContractVersion: contractCompatibility.version,
+  compatibleContractWasmHash: contractCompatibility.wasmHash,
 
   // Must match the timeout_ledgers the contract was actually initialize()'d
   // with — this copy is for display/UX only (e.g. "auto-refund available
@@ -111,6 +131,27 @@ export const config = Object.freeze({
 
   redisUrl: process.env.REDIS_URL || '',
 
+  // Cross-instance quorum collection (#160). When more than one backend
+  // instance is running, a question's collector lives in the memory of
+  // whichever instance dispatched it, but an answer for that question can
+  // arrive at any instance a worker happens to be connected to. Answers are
+  // therefore routed over Redis pub/sub: the owning instance subscribes to
+  // `quorum:answers:<questionId>` and any instance that receives an answer
+  // for a question it does not own publishes it there instead of dropping
+  // it. Pub/sub (not Streams) is deliberate: answers are only useful while
+  // the collector is still open, so replay/ordering guarantees buy nothing
+  // here, and the simpler transport keeps the failure modes small. The
+  // channel prefix is configurable so tests can namespace channels against a
+  // shared fake Redis without colliding with a real deployment.
+  quorum: Object.freeze({
+    channelPrefix: process.env.QUORUM_CHANNEL_PREFIX || 'quorum:answers:',
+    // How long an owning instance waits for a cross-instance answer before
+    // treating the question as orphaned and letting the existing TTL/timeout
+    // path refund it. Bounded by pendingQuestionTtlMs so a dead dispatcher
+    // can never hold a question open longer than the normal pending TTL.
+    answerTimeoutMs: num(process.env.QUORUM_ANSWER_TIMEOUT_MS, 30_000),
+  }),
+
   // Comma-separated list of allowed CORS origins, e.g.
   // "https://app.example.com,https://demo.example.com". Defaults to '*'
   // (wide open) for local dev — lock this down for any real deployment.
@@ -136,145 +177,6 @@ export const config = Object.freeze({
   worker: Object.freeze({
     rateLimitMaxConnections: num(process.env.WORKER_RATE_LIMIT_MAX_CONNECTIONS, 5),
     rateLimitWindowMs: num(process.env.WORKER_RATE_LIMIT_WINDOW_MS, 60_000),
-    minAnswersBeforeReputationGate: num(process.env.WORKER_MIN_ANSWERS_BEFORE_REPUTATION_GATE, 5),
-    minMatchRatio: num(process.env.WORKER_MIN_MATCH_RATIO, 0.2),
-    // Once a worker crosses minAnswersBeforeReputationGate (has real accrued
-    // earnings/reputation on the line), they must maintain at least this much
-    // on-chain stake to keep receiving new questions — closes the "unstake to
-    // zero, then misbehave for free" gap found pressure-testing the netting
-    // engine. Past Owed earnings are never touched by this; it only gates
-    // future dispatch eligibility. 0 (default) preserves today's behavior.
-    minStakeStroops: BigInt(process.env.WORKER_MIN_STAKE_STROOPS || '0'),
-  }),
+    minAnswersBeforeReputationGate: num(process.env.WORKER_MIN_ANSWERS_BEF
 
-  // Every one of these endpoints either costs the platform a real network
-  // fee per call (/sponsor/*) or writes unbounded state (/oracle), so all
-  // get a per-IP rate limit, not just the SSE connection endpoint.
-  rateLimits: Object.freeze({
-    oracle: Object.freeze({
-      max: num(process.env.ORACLE_RATE_LIMIT_MAX, 20),
-      windowMs: num(process.env.ORACLE_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    sponsor: Object.freeze({
-      max: num(process.env.SPONSOR_RATE_LIMIT_MAX, 10),
-      windowMs: num(process.env.SPONSOR_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    answer: Object.freeze({
-      max: num(process.env.ANSWER_RATE_LIMIT_MAX, 60),
-      windowMs: num(process.env.ANSWER_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    // Sandbox mode is free (no real payment), so it needs its own — more
-    // generous, but still real — limit rather than sharing the paid-flow
-    // 'oracle' bucket, and rather than being unlimited.
-    sandbox: Object.freeze({
-      max: num(process.env.SANDBOX_RATE_LIMIT_MAX, 30),
-      windowMs: num(process.env.SANDBOX_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    push: Object.freeze({
-      max: num(process.env.PUSH_RATE_LIMIT_MAX, 10),
-      windowMs: num(process.env.PUSH_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    billing: Object.freeze({
-      max: num(process.env.BILLING_RATE_LIMIT_MAX, 10),
-      windowMs: num(process.env.BILLING_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    webhooks: Object.freeze({
-      max: num(process.env.WEBHOOKS_RATE_LIMIT_MAX, 20),
-      windowMs: num(process.env.WEBHOOKS_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-  }),
-
-  vapid: Object.freeze({
-    publicKey: process.env.VAPID_PUBLIC_KEY || '',
-    privateKey: process.env.VAPID_PRIVATE_KEY || '',
-    subject: process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
-  }),
-
-  push: Object.freeze({
-    // Push notifications supplement, never replace, the SSE dispatch
-    // channel — they're for workers who aren't currently connected. A
-    // push round-trip (deliver -> notice -> tap -> app loads) realistically
-    // takes several seconds, so notifying for a very short quorum window
-    // (e.g. the 'express' tier's 12s) would routinely arrive after the
-    // window already closed. Below this threshold, skip push entirely
-    // rather than notify workers for an opportunity they can't act on.
-    minTimeoutForPushMs: num(process.env.PUSH_MIN_TIMEOUT_MS, 20_000),
-  }),
-
-  session: Object.freeze({
-    secret: SESSION_SECRET,
-    // How long a worker's session (proven once via a signed challenge
-    // transaction) stays valid before they'd need to re-authenticate.
-    ttlMs: num(process.env.WORKER_SESSION_TTL_MS, 12 * 60 * 60 * 1000),
-    // Graceful rotation: the set of secrets currently valid for verifying a
-    // session token (current first, then the prior secret while the grace
-    // window is open). Verification must accept a match from any of these;
-    // signing always uses `secret`. Empty/absent previous secret or a 0
-    // grace window yields a single-element list — identical to today.
-    secrets: sessionSecrets,
-    // Length of the rotation grace window in ms (0 = disabled).
-    rotationGraceMs: SESSION_SECRET_ROTATION_GRACE_MS,
-  }),
-
-  // Single shared operator secret for the /admin/* console — this codebase
-  // has no user-account system anywhere, so a bearer token is consistent
-  // with everything else here. Multi-operator auth is a real follow-up,
-  // not something to invent ahead of need.
-  admin: Object.freeze({
-    token: process.env.ADMIN_TOKEN || '',
-  }),
-
-  // Home domain of the SEP-24/SEP-12 anchor Arbiter integrates with for
-  // fiat rails (bank deposit/withdraw, KYC status). Arbiter is a CLIENT of
-  // this anchor's stellar.toml — it never stores PII or bank details
-  // itself. Unset disables the /anchor/* routes entirely.
-  anchor: Object.freeze({
-    homeDomain: process.env.ANCHOR_HOME_DOMAIN || '',
-  }),
-
-  // The non-crypto onramp (see billing.js): API-key customers pay in fiat
-  // via Stripe and are settled on-chain from ONE pooled balance under this
-  // dedicated identity — deliberately separate from platformSecret/
-  // platformAddress above (which already collects platform fee revenue via
-  // resolve()/refund()), so customer float and fee revenue never commingle
-  // in one account. Unset disables the /billing/* routes and the API-key
-  // branch of POST /oracle entirely (same fail-closed-if-unconfigured
-  // posture as admin.token above).
-  billing: Object.freeze({
-    stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
-    stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
-    fiatPoolSecret: process.env.FIAT_POOL_SECRET || '',
-    fiatPoolAddress: process.env.FIAT_POOL_ADDRESS || '',
-    // 1 USD = 1 USDC face value, at USDC's existing 7-decimal stroop
-    // convention (see pricing.js's stroopsToUsdc) — the simplest possible
-    // conversion for v1. Stripe's own processing fee is absorbed by the
-    // platform, not passed through to the credited balance; revisit if
-    // margin matters before volume does.
-    usdToStroops: 10_000_000n,
-    minTopupUsd: num(process.env.MIN_TOPUP_USD, 10),
-  }),
-
-  // Settlement webhooks (see webhooks.js for registration/validation and
-  // webhookDelivery.js for signing/retry). Delivery is best-effort and
-  // never on the settlement path; these bound how hard it tries.
-  webhooks: Object.freeze({
-    maxPerOwner: num(process.env.WEBHOOK_MAX_PER_OWNER, 10),
-    // Total delivery attempts per event, including the first one.
-    maxAttempts: num(process.env.WEBHOOK_MAX_ATTEMPTS, 6),
-    // Backoff before retry n is baseDelayMs * 2^(n-1) plus up to 20%
-    // jitter: 5s, 10s, 20s, 40s, 80s by default, about 2.5 minutes in all.
-    retryBaseDelayMs: num(process.env.WEBHOOK_RETRY_BASE_DELAY_MS, 5_000),
-    timeoutMs: num(process.env.WEBHOOK_TIMEOUT_MS, 10_000),
-    // Local development / tests only: also accept http:// URLs and
-    // loopback/private-network targets. Never enable in production, since
-    // it turns webhook registration into an SSRF primitive against the
-    // backend's own network.
-    allowInsecureTargets: process.env.WEBHOOK_ALLOW_INSECURE_TARGETS === 'true',
-    // Optional key (any string; it's hashed to 32 bytes) used to encrypt
-    // signing secrets at rest with AES-256-GCM. Secrets must stay
-    // recoverable, since signing needs the plaintext, so they can't be
-    // hashed like API keys. Without a key they're stored as-is, which is the
-    // same trust level as the store itself.
-    secretEncryptionKey: process.env.WEBHOOK_SECRET_ENCRYPTION_KEY || '',
-  }),
-});
+/* … truncated 1386 chars — edit only what you need near the top … */
