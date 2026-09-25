@@ -6,6 +6,7 @@ import { getStakeOnChain, getOwedOnChain } from './stellarClient.js';
 import { getHorizon } from './sponsor.js';
 import { config } from './config.js';
 import { stroopsToUsdc } from './pricing.js';
+import { evaluateLoyaltyTier } from './loyalty.js';
 
 const PLATFORM_FEE_BPS = 2000n; // mirrors contracts/oracle-escrow/src/lib.rs's PLATFORM_FEE_BPS
 const BPS_DENOM = 10_000n;
@@ -52,7 +53,8 @@ export async function listWorkers() {
 
 /** Every payer address this backend has seen a verified on-chain payment
  * from, with the same spend/success aggregation the buyer dashboard shows
- * that payer about themselves (payerIndex.js's summarizePayerQuestions). */
+ * that payer about themselves (payerIndex.js's summarizePayerQuestions),
+ * plus the loyalty tier that spend summary now qualifies them for. */
 export async function listPayers() {
   const addresses = await getKnownPayerAddresses();
   return Promise.all(
@@ -60,12 +62,14 @@ export async function listPayers() {
       const ids = await getPayerQuestionIds(payerAddress);
       const jobs = await Promise.all(ids.map((id) => getJob(id)));
       const summary = summarizePayerQuestions(ids, jobs);
+      const tier = evaluateLoyaltyTier(summary);
       return {
         payerAddress,
         totalTracked: summary.totalTracked,
         totalSpend: stroopsToUsdc(summary.totalSpendStroops),
         settled: summary.settled,
         successRate: summary.successRate,
+        loyaltyTier: tier?.name ?? null,
       };
     }),
   );

@@ -161,3 +161,61 @@ export async function handleStripeWebhook(rawBody, signature) {
   const amountStroops = BigInt(session.amount_total) * stroopsPerCent;
   await store.incrBy(`credit:${accountId}`, Number(amountStroops));
 }
+
+/**
+ * Loyalty tiers, keyed off the same aggregate a payer's spend summary
+ * already exposes (see payerIndex.js's summarizePayerQuestions()):
+ * totalSpendStroops and successRate. Structurally a pure function of an
+ * aggregate input, like pricing.js's surgeMultiplier() — no I/O, no
+ * store access, trivially unit-testable in isolation.
+ *
+ * Thresholds are cumulative: a payer at or above a tier's spend/success
+ * floor qualifies for that tier, and the highest qualifying tier wins.
+ * `bonusStroops` is the one-time credit granted the first time a payer
+ * crosses into a tier (see creditLoyaltyBonus below).
+ */
+export const LOYALTY_TIERS = [
+  { name: 'bronze', minSpendStroops: 1_000_000, minSuccessRate: 0.5, bonusStroops: 100_000 },
+  { name: 'silver', minSpendStroops: 10_000_000, minSuccessRate: 0.7, bonusStroops: 1_000_000 },
+  { name: 'gold', minSpendStroops: 100_000_000, minSuccessRate: 0.9, bonusStroops: 10_000_000 },
+];
+
+/**
+ * Pure tier evaluation: takes a payer's spend summary (the shape returned
+ * by summarizePayerQuestions()) and returns the applicable tier plus its
+ * bonus, or null when the payer qualifies for no tier. No side effects —
+ * callers decide whether/how to credit the bonus.
+ */
+export function evaluateLoyaltyTier(summary) {
+  const totalSpendStroops = Number(summary?.totalSpendStroops) || 0;
+  const successRate = Number(summary?.successRate) || 0;
+  let tier = null;
+  for (const candidate of LOYALTY_TIERS) {
+    if (totalSpendStroops >= candidate.minSpendStroops && successRate >= candidate.minSuccessRate) {
+      tier = candidate;
+    }
+  }
+  return tier;
+}
+
+/**
+ * Credits a payer's loyalty bonus for the highest tier they currently
+ * qualify for, exactly once per tier crossing. Idempotency is tracked per
+ * (accountId, tier) via store.setNX — the same pattern handleStripeWebhook
+ * uses for Stripe event ids — so repeated evaluation of an unchanged
+ * summary never double-credits. Returns the tier credited, or null when
+ * nothing new was owed.
+ *
+ * Only API-key accounts have a credit:{accountId} ledger to credit into;
+ * wallet-paying payers are deliberately out of scope (see issue #100).
+ */
+export async function creditLoyaltyBonus(accountId, summary) {
+  const tier = evaluateLoyaltyTier(summary);
+  if (!tier) return null;
+
+  const isNew = await store.setNX(`loyalty:${accountId}:${tier.name}`, 1);
+  if (!isNew) return null;
+
+  await store.incrBy(`credit:${accountId}`, tier.bonusStroops);
+  return tier;
+}
