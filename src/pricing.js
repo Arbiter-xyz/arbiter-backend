@@ -46,6 +46,36 @@ export const PRICING_TIERS = Object.freeze({
     // first." See dispatch.js's selectTargets for the fail-open behavior.
     preferEstablished: true,
   }),
+  // Self-driving quorum: asks one worker first and only recruits more when
+  // that answer isn't confident enough (see dispatch.js's decideEscalation).
+  // The final quorum size isn't known at quote time, so this is quoted and
+  // charged at a CEILING — the price of the fully-escalated quorum
+  // (escalation.maxQuorum workers, same per-worker rate as `priority`).
+  // quorumSize is that ceiling on purpose: surgeMultiplier() scales off it,
+  // so worker-supply scarcity is judged against the worst-case recruit.
+  // What happens to the difference once the real size is known:
+  //   - metered / API-key flow: the unused portion is refunded to the
+  //     customer's credit (billing.js settleReservation, via
+  //     effectiveEscalatedPriceStroops below).
+  //   - classic on-chain submit() flow: the escrowed amount is fixed at
+  //     payment time and the contract can't shrink it, so the platform keeps
+  //     the delta — same as today's surge ceiling. The job record shows both
+  //     numbers (amountStroops charged vs effectiveAmountStroops used).
+  auto: Object.freeze({
+    key: 'auto',
+    label: 'Auto — starts with one worker, recruits more only if unsure (charged at the maximum, unused portion refunded on API-key/prepaid billing)',
+    priceStroops: 6_000_000n,
+    quorumSize: 5,
+    timeoutMs: 45_000,
+    escalation: Object.freeze({
+      initialQuorum: 1,
+      maxQuorum: 5,
+      // Minimum confidence in a lone worker's answer to settle on it alone.
+      confidenceThreshold: 0.8,
+      // How long to wait on the current recruits before recruiting more.
+      stepTimeoutMs: 10_000,
+    }),
+  }),
 });
 
 export const DEFAULT_TIER_KEY = 'standard';
@@ -75,6 +105,9 @@ export function listTiersForClient() {
     amountStroops: t.priceStroops.toString(),
     quorumSize: t.quorumSize,
     timeoutMs: t.timeoutMs,
+    ...(t.escalation
+      ? { escalating: true, initialQuorum: t.escalation.initialQuorum, maxQuorum: t.escalation.maxQuorum }
+      : {}),
   }));
 }
 
@@ -117,34 +150,18 @@ export function priceForTier(tierKey, onlineWorkers) {
 }
 
 /**
- * Splits an escrowed amount into per-worker payout shares plus the platform
- * fee, guaranteeing the fund-accounting invariant that the sum of all
- * payouts plus the platform fee plus any rounding dust exactly equals the
- * escrowed amount — never more. This is the single source of truth the
- * property-based fuzzing suite (test/pricing.property.test.js) asserts
- * against: payoutShare * workerCount + platformFee + dust === escrowed.
- *
- * The platform fee is taken first (floored, so it can never round up past
- * the escrow), then the remainder is split evenly across workers with the
- * integer-division remainder recorded as dust rather than silently dropped
- * or, worse, over-paid. workerCount <= 0 yields a zero share and routes the
- * whole remainder to dust so callers can't divide by zero or mint value.
+ * What an escalating-quorum question really cost once dispatch finished: the
+ * ceiling `tier.priceStroops` (already surge-adjusted at quote time) split
+ * evenly across the maxQuorum workers it was priced for, times the workers
+ * actually recruited. At least one worker's share is always charged — even a
+ * question nobody answered took a dispatch slot — and never more than the
+ * ceiling, so a bug upstream can't inflate the bill. Pure so both the
+ * settlement path and tests can use it directly. Tiers without `escalation`
+ * are fixed-price: their effective price is just priceStroops.
  */
-export function splitPayout(escrowedStroops, workerCount, platformFeeBps = 0) {
-  const escrowed = BigInt(escrowedStroops);
-  if (escrowed < 0n) throw new RangeError('escrowedStroops must be non-negative');
-  const bps = BigInt(platformFeeBps);
-  if (bps < 0n || bps > 10_000n) throw new RangeError('platformFeeBps must be within [0, 10000]');
-
-  const platformFee = (escrowed * bps) / 10_000n;
-  const distributable = escrowed - platformFee;
-
-  const workers = BigInt(workerCount);
-  if (workers <= 0n) {
-    return { payoutShare: 0n, workerCount: 0n, platformFee, dust: distributable };
-  }
-
-  const payoutShare = distributable / workers;
-  const dust = distributable - payoutShare * workers;
-  return { payoutShare, workerCount: workers, platformFee, dust };
+export function effectiveEscalatedPriceStroops(tier, recruitedWorkers) {
+  if (!tier.escalation) return tier.priceStroops;
+  const { maxQuorum } = tier.escalation;
+  const n = Math.min(Math.max(Math.trunc(Number(recruitedWorkers)) || 0, 1), maxQuorum);
+  return (tier.priceStroops * BigInt(n)) / BigInt(maxQuorum);
 }
