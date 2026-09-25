@@ -55,3 +55,17 @@ export const httpLogger = pinoHttp({
 export function jobLogger(questionId) {
   return logger.child({ questionId: String(questionId) });
 }
+
+/**
+ * Logger for the scheduled synthetic monitor (#111). Every line carries
+ * `synthetic: true` so a synthetic run's lifecycle (dispatch -> reconcile
+ * -> settle) is trivially separable from real customer traffic in logs
+ * and alerting — a failed synthetic run (timeout, refund, error) is
+ * distinguishable from a successful one without being confused with a
+ * real incident. The synthetic monitor follows the same real paid
+ * /oracle path as demo-agent/ask.js, so it reuses jobLogger()'s
+ * questionId correlation and just adds the synthetic tag on top.
+ */
+export function syntheticLogger(questionId) {
+  return jobLogger(questionId).child({ synthetic: true });
+}
