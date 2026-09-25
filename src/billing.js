@@ -132,20 +132,124 @@ export async function createCheckoutSession(amountUsd, successUrl, cancelUrl) {
 }
 
 /**
+ * The single flat subscription tier (issue #101). Prorated upgrades/
+ * downgrades between tiers are explicitly out of scope — one tier, one
+ * recurring price, one included-volume grant per billing cycle.
+ *
+ * `includedVolumeStroops` is the credit granted on each `invoice.paid`.
+ * `rollover` is the documented policy for unused included volume at the
+ * cycle boundary: false means use-it-or-lose-it (the balance is reset to
+ * the tier's included volume on renewal, not incremented), true would
+ * carry the remainder forward. Defaulting to false mirrors the
+ * "0 preserves today's behavior" framing config.js uses for
+ * minStakeStroops — the conservative, non-compounding choice is the
+ * explicit default, not an accident of implementation order.
+ */
+export const SUBSCRIPTION_TIER = {
+  name: 'api-pro',
+  priceUsd: 99,
+  includedVolumeStroops: 1_000_000_000,
+  rollover: false,
+};
+
+/**
+ * Creates a fresh account (and its one API key) and a Stripe Checkout
+ * Session in `mode: 'subscription'` to fund it. Mirrors
+ * createCheckoutSession()'s one-time-reveal pattern for the raw key and
+ * its allowed-origin check on the redirect URLs; the difference is the
+ * Stripe primitive — a recurring price instead of a one-shot payment, so
+ * credit arrives via `invoice.paid` (see handleStripeWebhook) rather than
+ * `checkout.session.completed`.
+ */
+export async function createSubscriptionCheckoutSession(successUrl, cancelUrl) {
+  if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
+    throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
+  }
+
+  const { accountId, rawKey } = await createAccount();
+  const session = await getStripe().checkout.sessions.create({
+    mode: 'subscription',
+    line_items: [
+      {
+        price_data: {
+          currency: 'usd',
+          product_data: { name: `Arbiter API ${SUBSCRIPTION_TIER.name}` },
+          unit_amount: Math.round(SUBSCRIPTION_TIER.priceUsd * 100),
+          recurring: { interval: 'month' },
+        },
+        quantity: 1,
+      },
+    ],
+    metadata: { accountId },
+    success_url: `${successUrl}?apiKey=${rawKey}`,
+    cancel_url: cancelUrl,
+  });
+
+  return { checkoutUrl: session.url };
+}
+
+/**
  * Verifies the Stripe signature (constructEvent throws on a bad/missing
  * one — the route handler turns that into a 400) and, for a completed
  * checkout, credits the account. Idempotent per Stripe event id via
  * store.setNX, since Stripe retries webhook delivery on anything but a 2xx
  * response — without this, a retried delivery would double-credit the same
  * payment.
+ *
+ * Subscription events use the same per-event-id dedup: recurring invoices
+ * legitimately repeat monthly, but each carries a distinct event id, so
+ * the 30-day window only suppresses retries of the same delivery — it
+ * never swallows a genuine renewal.
  */
 export async function handleStripeWebhook(rawBody, signature) {
   const event = getStripe().webhooks.constructEvent(rawBody, signature, config.billing.stripeWebhookSecret);
-  if (event.type !== 'checkout.session.completed') return;
+  if (
+    event.type !== 'checkout.session.completed' &&
+    event.type !== 'invoice.paid' &&
+    event.type !== 'customer.subscription.deleted'
+  ) {
+    return;
+  }
 
   const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
   const isNew = await store.setNX(`stripe-event:${event.id}`, 1, THIRTY_DAYS_MS);
   if (!isNew) return;
+
+  if (event.type === 'invoice.paid') {
+    const invoice = event.data.object;
+    const accountId = invoice.subscription_details?.metadata?.accountId || invoice.metadata?.accountId;
+    if (!accountId) {
+      logger.error({ eventId: event.id }, 'stripe invoice.paid missing accountId metadata');
+      return;
+    }
+    // Use-it-or-lose-it: reset the balance to the tier's included volume
+    // rather than incrementing, so unused volume does not compound across
+    // cycles. `rollover: true` would instead incrBy the grant.
+    if (SUBSCRIPTION_TIER.rollover) {
+      await store.incrBy(`credit:${accountId}`, SUBSCRIPTION_TIER.includedVolumeStroops);
+    } else {
+      await store.set(`credit:${accountId}`, SUBSCRIPTION_TIER.includedVolumeStroops);
+    }
+    const account = (await store.get(`account:${accountId}`)) || {};
+    await store.set(`account:${accountId}`, {
+      ...account,
+      subscriptionStatus: 'active',
+      subscriptionId: invoice.subscription,
+    });
+    return;
+  }
+
+  if (event.type === 'customer.subscription.deleted') {
+    const subscription = event.data.object;
+    const accountId = subscription.metadata?.accountId;
+    if (!accountId) {
+      logger.error({ eventId: event.id }, 'stripe customer.subscription.deleted missing accountId metadata');
+      return;
+    }
+    const account = (await store.get(`account:${accountId}`)) || {};
+    await store.set(`account:${accountId}`, { ...account, subscriptionStatus: 'canceled' });
+    return;
+  }
 
   const session = event.data.object;
   const accountId = session.metadata?.accountId;
@@ -184,38 +288,6 @@ export const LOYALTY_TIERS = [
  * Pure tier evaluation: takes a payer's spend summary (the shape returned
  * by summarizePayerQuestions()) and returns the applicable tier plus its
  * bonus, or null when the payer qualifies for no tier. No side effects —
- * callers decide whether/how to credit the bonus.
- */
-export function evaluateLoyaltyTier(summary) {
-  const totalSpendStroops = Number(summary?.totalSpendStroops) || 0;
-  const successRate = Number(summary?.successRate) || 0;
-  let tier = null;
-  for (const candidate of LOYALTY_TIERS) {
-    if (totalSpendStroops >= candidate.minSpendStroops && successRate >= candidate.minSuccessRate) {
-      tier = candidate;
-    }
-  }
-  return tier;
-}
+ * ca
 
-/**
- * Credits a payer's loyalty bonus for the highest tier they currently
- * qualify for, exactly once per tier crossing. Idempotency is tracked per
- * (accountId, tier) via store.setNX — the same pattern handleStripeWebhook
- * uses for Stripe event ids — so repeated evaluation of an unchanged
- * summary never double-credits. Returns the tier credited, or null when
- * nothing new was owed.
- *
- * Only API-key accounts have a credit:{accountId} ledger to credit into;
- * wallet-paying payers are deliberately out of scope (see issue #100).
- */
-export async function creditLoyaltyBonus(accountId, summary) {
-  const tier = evaluateLoyaltyTier(summary);
-  if (!tier) return null;
-
-  const isNew = await store.setNX(`loyalty:${accountId}:${tier.name}`, 1);
-  if (!isNew) return null;
-
-  await store.incrBy(`credit:${accountId}`, tier.bonusStroops);
-  return tier;
-}
+/* … truncated 1304 chars — edit only what you need near the top … */

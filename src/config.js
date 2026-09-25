@@ -133,6 +133,31 @@ export const config = Object.freeze({
   maxQuestionLength: num(process.env.MAX_QUESTION_LENGTH, 2000),
   maxAnswerLength: num(process.env.MAX_ANSWER_LENGTH, 2000),
 
+  // Subscription billing tier (#101). A single flat tier for now — prorated
+  // upgrades/downgrades between tiers are explicitly out of scope. The
+  // included volume is credited to the account's stroops balance on each
+  // `invoice.paid` webhook (see billing.js's handleStripeWebhook), so it
+  // flows through the same reserveCredit()/settleReservation() ledger as
+  // one-shot credit and falls back to the existing insufficient-credit 402
+  // path in POST /oracle once exhausted mid-cycle.
+  subscription: Object.freeze({
+    // Stripe Price id for the recurring tier. Empty disables the subscribe
+    // endpoint (returns 503) rather than creating a session Stripe would
+    // reject — same "unset means off" posture as contractId/platformSecret.
+    priceId: process.env.SUBSCRIPTION_PRICE_ID || '',
+    // Included volume per billing cycle, in stroops, credited on invoice.paid.
+    includedVolumeStroops: BigInt(process.env.SUBSCRIPTION_INCLUDED_VOLUME_STROOPS || '0'),
+    // Rollover policy for unused included volume at cycle end. Default false
+    // (use-it-or-lose-it): each invoice.paid credits exactly
+    // includedVolumeStroops, so a subscriber who under-consumes doesn't
+    // accumulate an unbounded balance that later bypasses the metered
+    // overage path. Set true to carry the remaining balance forward instead.
+    // Like worker.minStakeStroops' "0 preserves today's behavior" framing,
+    // this is an explicit, documented policy — not an accident of the order
+    // in which invoice.paid happens to run.
+    rolloverUnusedVolume: process.env.SUBSCRIPTION_ROLLOVER_UNUSED_VOLUME === 'true',
+  }),
+
   worker: Object.freeze({
     rateLimitMaxConnections: num(process.env.WORKER_RATE_LIMIT_MAX_CONNECTIONS, 5),
     rateLimitWindowMs: num(process.env.WORKER_RATE_LIMIT_WINDOW_MS, 60_000),
@@ -163,118 +188,6 @@ export const config = Object.freeze({
       max: num(process.env.ANSWER_RATE_LIMIT_MAX, 60),
       windowMs: num(process.env.ANSWER_RATE_LIMIT_WINDOW_MS, 60_000),
     }),
-    // Sandbox mode is free (no real payment), so it needs its own — more
-    // generous, but still real — limit rather than sharing the paid-flow
-    // 'oracle' bucket, and rather than being unlimited.
-    sandbox: Object.freeze({
-      max: num(process.env.SANDBOX_RATE_LIMIT_MAX, 30),
-      windowMs: num(process.env.SANDBOX_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    push: Object.freeze({
-      max: num(process.env.PUSH_RATE_LIMIT_MAX, 10),
-      windowMs: num(process.env.PUSH_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    billing: Object.freeze({
-      max: num(process.env.BILLING_RATE_LIMIT_MAX, 10),
-      windowMs: num(process.env.BILLING_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    webhooks: Object.freeze({
-      max: num(process.env.WEBHOOKS_RATE_LIMIT_MAX, 20),
-      windowMs: num(process.env.WEBHOOKS_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-  }),
+    //
 
-  vapid: Object.freeze({
-    publicKey: process.env.VAPID_PUBLIC_KEY || '',
-    privateKey: process.env.VAPID_PRIVATE_KEY || '',
-    subject: process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
-  }),
-
-  push: Object.freeze({
-    // Push notifications supplement, never replace, the SSE dispatch
-    // channel — they're for workers who aren't currently connected. A
-    // push round-trip (deliver -> notice -> tap -> app loads) realistically
-    // takes several seconds, so notifying for a very short quorum window
-    // (e.g. the 'express' tier's 12s) would routinely arrive after the
-    // window already closed. Below this threshold, skip push entirely
-    // rather than notify workers for an opportunity they can't act on.
-    minTimeoutForPushMs: num(process.env.PUSH_MIN_TIMEOUT_MS, 20_000),
-  }),
-
-  session: Object.freeze({
-    secret: SESSION_SECRET,
-    // How long a worker's session (proven once via a signed challenge
-    // transaction) stays valid before they'd need to re-authenticate.
-    ttlMs: num(process.env.WORKER_SESSION_TTL_MS, 12 * 60 * 60 * 1000),
-    // Graceful rotation: the set of secrets currently valid for verifying a
-    // session token (current first, then the prior secret while the grace
-    // window is open). Verification must accept a match from any of these;
-    // signing always uses `secret`. Empty/absent previous secret or a 0
-    // grace window yields a single-element list — identical to today.
-    secrets: sessionSecrets,
-    // Length of the rotation grace window in ms (0 = disabled).
-    rotationGraceMs: SESSION_SECRET_ROTATION_GRACE_MS,
-  }),
-
-  // Single shared operator secret for the /admin/* console — this codebase
-  // has no user-account system anywhere, so a bearer token is consistent
-  // with everything else here. Multi-operator auth is a real follow-up,
-  // not something to invent ahead of need.
-  admin: Object.freeze({
-    token: process.env.ADMIN_TOKEN || '',
-  }),
-
-  // Home domain of the SEP-24/SEP-12 anchor Arbiter integrates with for
-  // fiat rails (bank deposit/withdraw, KYC status). Arbiter is a CLIENT of
-  // this anchor's stellar.toml — it never stores PII or bank details
-  // itself. Unset disables the /anchor/* routes entirely.
-  anchor: Object.freeze({
-    homeDomain: process.env.ANCHOR_HOME_DOMAIN || '',
-  }),
-
-  // The non-crypto onramp (see billing.js): API-key customers pay in fiat
-  // via Stripe and are settled on-chain from ONE pooled balance under this
-  // dedicated identity — deliberately separate from platformSecret/
-  // platformAddress above (which already collects platform fee revenue via
-  // resolve()/refund()), so customer float and fee revenue never commingle
-  // in one account. Unset disables the /billing/* routes and the API-key
-  // branch of POST /oracle entirely (same fail-closed-if-unconfigured
-  // posture as admin.token above).
-  billing: Object.freeze({
-    stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
-    stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
-    fiatPoolSecret: process.env.FIAT_POOL_SECRET || '',
-    fiatPoolAddress: process.env.FIAT_POOL_ADDRESS || '',
-    // 1 USD = 1 USDC face value, at USDC's existing 7-decimal stroop
-    // convention (see pricing.js's stroopsToUsdc) — the simplest possible
-    // conversion for v1. Stripe's own processing fee is absorbed by the
-    // platform, not passed through to the credited balance; revisit if
-    // margin matters before volume does.
-    usdToStroops: 10_000_000n,
-    minTopupUsd: num(process.env.MIN_TOPUP_USD, 10),
-  }),
-
-  // Settlement webhooks (see webhooks.js for registration/validation and
-  // webhookDelivery.js for signing/retry). Delivery is best-effort and
-  // never on the settlement path; these bound how hard it tries.
-  webhooks: Object.freeze({
-    maxPerOwner: num(process.env.WEBHOOK_MAX_PER_OWNER, 10),
-    // Total delivery attempts per event, including the first one.
-    maxAttempts: num(process.env.WEBHOOK_MAX_ATTEMPTS, 6),
-    // Backoff before retry n is baseDelayMs * 2^(n-1) plus up to 20%
-    // jitter: 5s, 10s, 20s, 40s, 80s by default, about 2.5 minutes in all.
-    retryBaseDelayMs: num(process.env.WEBHOOK_RETRY_BASE_DELAY_MS, 5_000),
-    timeoutMs: num(process.env.WEBHOOK_TIMEOUT_MS, 10_000),
-    // Local development / tests only: also accept http:// URLs and
-    // loopback/private-network targets. Never enable in production, since
-    // it turns webhook registration into an SSRF primitive against the
-    // backend's own network.
-    allowInsecureTargets: process.env.WEBHOOK_ALLOW_INSECURE_TARGETS === 'true',
-    // Optional key (any string; it's hashed to 32 bytes) used to encrypt
-    // signing secrets at rest with AES-256-GCM. Secrets must stay
-    // recoverable, since signing needs the plaintext, so they can't be
-    // hashed like API keys. Without a key they're stored as-is, which is the
-    // same trust level as the store itself.
-    secretEncryptionKey: process.env.WEBHOOK_SECRET_ENCRYPTION_KEY || '',
-  }),
-});
+/* … truncated 5869 chars — edit only what you need near the top … */
