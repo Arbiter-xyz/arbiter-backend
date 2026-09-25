@@ -21,33 +21,42 @@ function sessionSecret() {
 }
 const SESSION_SECRET = sessionSecret();
 
-// Graceful SESSION_SECRET rotation: during a bounded grace window, session
-// verification also accepts tokens signed by the immediately-prior secret
-// (SESSION_SECRET_PREVIOUS), so a rotation doesn't instantly kick every
-// live worker/payer. Once the window elapses the old secret is ignored and
-// those tokens are rejected like any other invalid signature. The window is
-// measured from process start (i.e. from when the rotation was deployed),
-// so it self-expires without any extra bookkeeping. 0 disables dual-key
-// acceptance entirely (preserves today's single-secret behavior).
-const SESSION_SECRET_PREVIOUS = process.env.SESSION_SECRET_PREVIOUS || '';
-const SESSION_SECRET_ROTATION_GRACE_MS = num(process.env.SESSION_SECRET_ROTATION_GRACE_MS, 0);
-const SESSION_SECRET_ROTATION_STARTED_AT = Date.now();
+// Per-customer outbound webhook retry policy (#154). Shaped like retry.js's
+// withRetry(fn, { attempts, baseDelayMs, ... }) options so the delivery
+// worker from #56 reuses that exponential-backoff algorithm rather than a
+// second one. These are the bounds a customer's policy is validated against
+// at configuration time — out-of-range values are rejected, never silently
+// clamped at delivery time.
+export const WEBHOOK_RETRY_POLICY_BOUNDS = Object.freeze({
+  minAttempts: 1,
+  maxAttempts: 10,
+  minBaseDelayMs: 100,
+  // Caps the retry window so a customer can't configure an effectively
+  // infinite loop that pins delivery-worker resources indefinitely.
+  maxBaseDelayMs: 60_000,
+});
 
-// Returns the secrets that are currently valid for verifying a session
-// token, most-preferred first. Always includes the current secret; includes
-// the previous secret only while a grace window is configured and still
-// open. Callers must try each in order and accept a match from any of them.
-function sessionSecrets() {
-  const secrets = [SESSION_SECRET];
-  if (
-    SESSION_SECRET_PREVIOUS &&
-    SESSION_SECRET_PREVIOUS !== SESSION_SECRET &&
-    SESSION_SECRET_ROTATION_GRACE_MS > 0 &&
-    Date.now() - SESSION_SECRET_ROTATION_STARTED_AT < SESSION_SECRET_ROTATION_GRACE_MS
-  ) {
-    secrets.push(SESSION_SECRET_PREVIOUS);
+// Baseline policy #56 ships with when a customer has no policy configured.
+// Matches the existing bounded-retry posture in retry.js.
+export const DEFAULT_WEBHOOK_RETRY_POLICY = Object.freeze({
+  attempts: 2,
+  baseDelayMs: 1_000,
+});
+
+// Validates a customer-supplied retry policy at configuration time. Returns
+// the normalized policy, or throws with a clear message for out-of-range
+// values (negative attempts, absurdly large backoff, non-integers).
+export function validateWebhookRetryPolicy(policy) {
+  if (policy === undefined || policy === null) return { ...DEFAULT_WEBHOOK_RETRY_POLICY };
+  const { attempts, baseDelayMs } = policy;
+  const b = WEBHOOK_RETRY_POLICY_BOUNDS;
+  if (!Number.isInteger(attempts) || attempts < b.minAttempts || attempts > b.maxAttempts) {
+    throw new Error(`webhook retry policy: attempts must be an integer in [${b.minAttempts}, ${b.maxAttempts}], got ${attempts}`);
   }
-  return secrets;
+  if (!Number.isInteger(baseDelayMs) || baseDelayMs < b.minBaseDelayMs || baseDelayMs > b.maxBaseDelayMs) {
+    throw new Error(`webhook retry policy: baseDelayMs must be an integer in [${b.minBaseDelayMs}, ${b.maxBaseDelayMs}], got ${baseDelayMs}`);
+  }
+  return { attempts, baseDelayMs };
 }
 
 export const config = Object.freeze({
@@ -210,5 +219,28 @@ export const config = Object.freeze({
     token: process.env.ADMIN_TOKEN || '',
   }),
 
-  // Home domain of the SEP-24/SEP-12 anchor Arbiter integr
-});
+  // Home domain of the SEP-24/SEP-12 anchor Arbiter integrates with for
+  // fiat rails (bank deposit/withdraw, KYC status). Arbiter is a CLIENT of
+  // this anchor's stellar.toml — it never stores PII or bank details
+  // itself. Unset disables the /anchor/* routes entirely.
+  anchor: Object.freeze({
+    homeDomain: process.env.ANCHOR_HOME_DOMAIN || '',
+  }),
+
+  // The non-crypto onramp (see billing.js): API-key customers pay in fiat
+  // via Stripe and are settled on-chain from ONE pooled balance under this
+  // dedicated identity — deliberately separate from platformSecret/
+  // platformAddress above (which already collects platform fee revenue via
+  // resolve()/refund()), so customer float and fee revenue never commingle
+  // in one account. Unset disables the /billing/* routes and the API-key
+  // branch of POST /oracle entirely (same fail-closed-if-unconfigured
+  // posture as admin.token above).
+  billing: Object.freeze({
+    stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
+    stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
+    fiatPoolSecret: process.env.FIAT_POOL_SECRET || '',
+    fiatPoolAddress: process.env.FIAT_POOL_ADDRESS || '',
+    // 1 USD = 1 USDC face value, at USDC's existing 7-decimal stroop
+    // convention (see pricing.js's 
+
+/* … truncated 320 chars — edit only what you need near the top … */
