@@ -29,6 +29,8 @@ import { getStashedQuestion, nextQuestionId } from './pendingQuestions.js';
 import { getOwedOnChain, getStakeOnChain } from './stellarClient.js';
 import { askMetered, getMeteredBalance, depositInstructions } from './metered.js';
 import { getLeaderboard } from './leaderboard.js';
+import { getWorkerDashboard } from './workerAnalytics.js';
+import { getGamificationProfile, getXpLeaderboard, badgeCatalog } from './gamification.js';
 import { stroopsToUsdc, resolveTier, MAX_SURGE_MULTIPLIER } from './pricing.js';
 import { checkRateLimit } from './rateLimit.js';
 import { issueSandboxChallenge, startSandboxFulfillment } from './sandbox.js';
@@ -127,6 +129,22 @@ app.get('/leaderboard', async (req, res) => {
     req.log.error({ err }, 'failed to build leaderboard');
     res.status(500).json({ error: 'failed to build leaderboard' });
   }
+});
+
+// Gamification XP leaderboard — see gamification.js. Includes non-established
+// workers, unlike /leaderboard, since XP is dominated by matched answers.
+app.get('/leaderboard/xp', async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+    res.json({ leaderboard: await getXpLeaderboard(limit) });
+  } catch (err) {
+    req.log.error({ err }, 'failed to build xp leaderboard');
+    res.status(500).json({ error: 'failed to build xp leaderboard' });
+  }
+});
+
+app.get('/gamification/badges', (req, res) => {
+  res.json({ badges: badgeCatalog() });
 });
 
 app.get('/stats', async (req, res) => {
@@ -659,6 +677,31 @@ app.get('/workers/:address/reputation', async (req, res) => {
   const rep = await getReputation(req.params.address);
   const matchRatio = rep.total > 0 ? rep.matched / rep.total : null;
   res.json({ matched: rep.matched, total: rep.total, matchRatio });
+});
+
+// Worker performance analytics dashboard — daily answered/matched buckets
+// over a trailing window, trend vs. the previous window, streaks, and rank.
+// Public like /reputation: it's the same outcome data, just broken down by
+// day (see workerAnalytics.js).
+app.get('/workers/:address/analytics', async (req, res) => {
+  try {
+    res.json(await getWorkerDashboard(req.params.address, { window: req.query.days }));
+  } catch (err) {
+    req.log.error({ err }, 'worker analytics lookup failed');
+    res.status(500).json({ error: 'failed to build worker analytics' });
+  }
+});
+
+// XP, level, streaks and badges — derived from the same data as the
+// analytics above, never a separate ledger (see gamification.js).
+app.get('/workers/:address/gamification', async (req, res) => {
+  try {
+    const { newlyEarned, ...profile } = await getGamificationProfile(req.params.address);
+    res.json(profile);
+  } catch (err) {
+    req.log.error({ err }, 'worker gamification lookup failed');
+    res.status(500).json({ error: 'failed to build gamification profile' });
+  }
 });
 
 // ---------------------------------------------------------------------
