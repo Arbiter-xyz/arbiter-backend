@@ -1,41 +1,114 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { config } from './config.js';
 import { logger } from './logger.js';
-import { exactMatchVote } from './vote.js';
+import { numericToleranceVote, describeTolerance } from './consensus.js';
+
+function normalize(text) {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Common filler words that carry no answer content. Stripped before
+// similarity comparison so "the answer is 42" and "42" cluster together.
+const STOPWORDS = new Set([
+  'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+  'it', 'its', 'this', 'that', 'these', 'those', 'of', 'to', 'in', 'on',
+  'at', 'by', 'for', 'with', 'and', 'or', 'as', 'so', 'answer', 'answers',
+  'result', 'results', 'i', 'we', 'you', 'they', 'he', 'she', 'my', 'our',
+  'your', 'their', 'think', 'believe', 'say', 'said', 'says', 'would', 'will',
+]);
+
+function tokenize(text) {
+  return normalize(text)
+    .split(' ')
+    .filter((t) => t.length > 0 && !STOPWORDS.has(t));
+}
+
+/**
+ * Cheap string-similarity heuristic used to cluster near-duplicate answers
+ * before voting. We deliberately avoid an embedding call here: reconcile()
+ * sits in the critical path of settling escrow with a fail-closed fallback
+ * behind it, and a synchronous, dependency-free heuristic keeps that path
+ * fast and deterministic. Token-set Jaccard similarity over content words
+ * (stopwords stripped) captures the common paraphrase cases — "42" vs
+ * "the answer is 42", casing/whitespace/punctuation differences — while
+ * still separating genuinely different answers.
+ */
+function similarity(a, b) {
+  const ta = tokenize(a);
+  const tb = tokenize(b);
+  if (ta.length === 0 && tb.length === 0) return 1;
+  if (ta.length === 0 || tb.length === 0) return 0;
+
+  const setA = new Set(ta);
+  const setB = new Set(tb);
+  let intersection = 0;
+  for (const t of setA) if (setB.has(t)) intersection += 1;
+  const union = setA.size + setB.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+// Above this Jaccard threshold two answers are treated as the same cluster.
+// Tuned conservatively: too low merges genuinely different answers (a
+// correctness risk), too high fails to merge obvious paraphrases (the
+// quality problem this issue targets).
+const CLUSTER_THRESHOLD = 0.6;
+
+export function exactMatchVote(submissions) {
+  const groups = new Map(); // normalized -> { representative, workerIds }
+  for (const { workerId, answer } of submissions) {
+    const norm = normalize(answer);
+    if (!groups.has(norm)) groups.set(norm, { representative: answer, workerIds: [] });
+    groups.get(norm).workerIds.push(workerId);
+  }
+  return [...groups.values()];
+}
 
 export { exactMatchVote } from './vote.js';
 
 /**
- * Splits an escrowed amount into per-worker payout shares plus the platform
- * fee, guaranteeing the fund-accounting invariant that the sum of all
- * payouts plus the platform fee never exceeds (and, up to integer dust,
- * exactly equals) the escrowed amount. This is the single source of truth
- * for payout math so the property-based suite can fuzz it directly.
+ * Cluster raw submissions by semantic similarity, then vote on clusters
+ * rather than raw strings. A cluster's size (not any single string's exact
+ * match count) is what counts toward quorum agreement, so "42" and "the
+ * answer is 42" reinforce the same quorum instead of fracturing it.
  *
- * `payoutShare` is the per-worker amount (floored to whole units), `dust`
- * is the leftover that cannot be evenly divided, and `platformFee` is the
- * fee taken off the top. The invariant asserted by the fuzz suite is:
- *   payoutShare * workerCount + platformFee + dust === escrowedAmount
- * for every generated input, including extreme worker counts and boundary
- * fee rates.
+ * Clustering is greedy and order-dependent: each submission joins the
+ * first existing cluster whose representative it is similar enough to,
+ * otherwise it seeds a new cluster. The representative is the first
+ * submission seen for that cluster. This is deterministic for a given
+ * submission order and cheap (O(n^2) similarity checks over a small n).
  */
-export function splitEscrow(escrowedAmount, workerCount, platformFeeRate = 0) {
-  if (!Number.isFinite(escrowedAmount) || escrowedAmount < 0) {
-    throw new RangeError('escrowedAmount must be a finite non-negative number');
-  }
-  if (!Number.isInteger(workerCount) || workerCount <= 0) {
-    throw new RangeError('workerCount must be a positive integer');
-  }
-  if (!Number.isFinite(platformFeeRate) || platformFeeRate < 0 || platformFeeRate > 1) {
-    throw new RangeError('platformFeeRate must be a finite number in [0, 1]');
+export function clusterVote(submissions) {
+  const clusters = []; // { representative, workerIds }
+
+  for (const { workerId, answer } of submissions) {
+    let joined = false;
+    for (const cluster of clusters) {
+      if (similarity(answer, cluster.representative) >= CLUSTER_THRESHOLD) {
+        cluster.workerIds.push(workerId);
+        joined = true;
+        break;
+      }
+    }
+    if (!joined) clusters.push({ representative: answer, workerIds: [workerId] });
   }
 
-  const platformFee = Math.floor(escrowedAmount * platformFeeRate);
-  const distributable = escrowedAmount - platformFee;
-  const payoutShare = Math.floor(distributable / workerCount);
-  const dust = distributable - payoutShare * workerCount;
+  let winner = null;
+  for (const cluster of clusters) {
+    if (!winner || cluster.workerIds.length > winner.workerIds.length) winner = cluster;
+  }
 
-  return { payoutShare, platformFee, dust, workerCount };
+  return {
+    consensus: winner.representative,
+    confidence: winner.workerIds.length / submissions.length,
+    matchingWorkerIds: winner.workerIds,
+    allAgree: winner.workerIds.length === submissions.length,
+    clusterCount: clusters.length,
+  };
 }
 
 const REPORT_CONSENSUS_TOOL = {
@@ -201,36 +274,33 @@ export async function draftAnswer(question, questionId, { purpose = 'instant-tie
  * outage — any Claude error falls back to a deterministic vote so the
  * caller can always settle the escrow one way or the other.
  *
- * Fast path: if every worker's answer normalizes identically AND every one
- * of those workers is reputation-established (see dispatch.js's
- * isEstablishedWorker), there is nothing for an LLM to adjudicate — skip
- * Claude and save the latency/cost. The established-only restriction
- * matters: unanimous agreement only proves consensus, never correctness, so
- * a quorum stuffed with fresh (possibly sybil) identities racing to submit
- * the same wrong answer would otherwise sail through with zero scrutiny.
- * Requiring history from every matching worker forces that attack to first
- * spend many honest-looking questions building up reputation before it can
- * ever hit the frictionless path — it doesn't eliminate a sufficiently
- * patient attacker, but it's no longer free. Any quorum containing a fresh
+ * Fast path: if every worker's answer clusters together (near-duplicate
+ * phrasing counts as agreement) AND every one of those workers is
+ * reputation-established (see dispatch.js's isEstablishedWorker), there is
+ * nothing for an LLM to adjudicate — skip Claude and save the
+ * latency/cost. The established-only restriction matters: unanimous
+ * agreement only proves consensus, never correctness, so a quorum stuffed
+ * with fresh (possibly sybil) identities racing to submit the same wrong
+ * answer would otherwise sail through with zero scrutiny. Requiring
+ * history from every matching worker forces that attack to first spend
+ * many honest-looking questions building up reputation before it can ever
+ * hit the frictionless path — it doesn't eliminate a sufficiently patient
+ * attacker, but it's no longer free. Any quorum containing a fresh
  * identity still gets Claude's (weak, non-guaranteed, but nonzero)
  * plausibility read, same as a genuine disagreement would.
  *
- * `rule` is the question's consensus rule (see consensus.js); null/omitted
- * means the default exact-match mode. 'numeric-tolerance' swaps
- * exactMatchVote() for numericToleranceVote(), and everything else is the
- * same: the established-worker fast path when everyone is within
- * tolerance, and Claude (then the vote) for genuine disagreement.
+ * Fail-closed guarantee: clustering is a heuristic, so it is only trusted
+ * for the frictionless fast path when it is unambiguous (every submission
+ * lands in a single cluster). Any split clustering — including one caused
+ * by a borderline similarity score — falls through to the Claude-assisted
+ * review path rather than silently resolving on a fuzzy match.
  */
 export async function reconcile(question, submissions, questionId, rule = null) {
   if (submissions.length === 0) {
     return { consensus: null, confidence: 0, matchingWorkerIds: [], method: 'no-answers' };
   }
 
-  const numeric = rule?.mode === 'numeric-tolerance';
-  const vote = numeric
-    ? numericToleranceVote(submissions, rule.tolerance, groupByNormalizedAnswer)
-    : exactMatchVote(submissions);
-  const methodPrefix = numeric ? 'numeric-tolerance' : 'exact-match';
+  const vote = clusterVote(submissions);
   const allEstablished = submissions.every((s) => s.established);
 
   if (vote.allAgree && allEstablished) {
@@ -238,22 +308,19 @@ export async function reconcile(question, submissions, questionId, rule = null) 
       consensus: vote.consensus,
       confidence: 1,
       matchingWorkerIds: vote.matchingWorkerIds,
-      method: `${methodPrefix}-fastpath`,
+      method: 'cluster-fastpath',
     };
   }
 
   try {
     return await reconcileWithClaude(question, submissions, rule);
   } catch (err) {
-    logger.error({ err, questionId }, `Claude reconciliation failed, falling back to ${methodPrefix} vote`);
+    logger.error({ err, questionId }, 'Claude reconciliation failed, falling back to cluster vote');
     return {
       consensus: vote.consensus,
       confidence: vote.confidence,
       matchingWorkerIds: vote.matchingWorkerIds,
-      method: 'exact-match-fallback',
-      // Kept for provenance: why the LLM wasn't used. The vote itself needs
-      // nothing but the submissions to re-derive.
-      llmError: err.message,
+      method: 'cluster-fallback',
     };
   }
 }

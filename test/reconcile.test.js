@@ -35,6 +35,48 @@ test('case/punctuation/whitespace differences still count as an exact-match agre
   assert.equal(result.confidence, 1);
 });
 
+test('near-duplicate phrasing that agrees by meaning clusters together and takes the fast path', async () => {
+  // "42" and "the answer is 42" are the same answer phrased differently.
+  // Clustering by semantic similarity must merge them so the quorum is not
+  // fractured by surface-level wording differences.
+  const result = await reconcile('What is 6*7?', [
+    established('w1', '42'),
+    established('w2', 'the answer is 42'),
+    established('w3', '42'),
+  ]);
+  assert.equal(result.method, 'exact-match-fastpath');
+  assert.equal(result.confidence, 1);
+  assert.deepEqual(result.matchingWorkerIds.sort(), ['w1', 'w2', 'w3']);
+});
+
+test('near-duplicate phrasing clusters count toward quorum agreement in the fallback vote', async () => {
+  // Two workers agree by meaning ("Rust" / "the answer is Rust") while a
+  // third genuinely disagrees. The agreeing cluster must win the plurality
+  // vote rather than the two phrasings splitting into separate buckets.
+  const result = await reconcile('Best programming language?', [
+    established('w1', 'Rust'),
+    established('w2', 'the answer is Rust'),
+    established('w3', 'Python'),
+  ]);
+  assert.equal(result.method, 'exact-match-fallback');
+  assert.ok(Math.abs(result.confidence - 2 / 3) < 1e-9);
+  assert.deepEqual(result.matchingWorkerIds.sort(), ['w1', 'w2']);
+});
+
+test('genuinely different answers do NOT cluster together', async () => {
+  // "Rust" and "Python" are different answers and must remain separate
+  // clusters — clustering must not over-merge distinct meanings.
+  const result = await reconcile('Best programming language?', [
+    established('w1', 'Rust'),
+    established('w2', 'Python'),
+    established('w3', 'Rust'),
+  ]);
+  assert.equal(result.method, 'exact-match-fallback');
+  assert.equal(result.consensus, 'Rust');
+  assert.ok(Math.abs(result.confidence - 2 / 3) < 1e-9);
+  assert.deepEqual(result.matchingWorkerIds.sort(), ['w1', 'w3']);
+});
+
 test('unanimous agreement from FRESH (unestablished) workers does NOT take the fast path, even though it agrees perfectly', async () => {
   // A quorum of brand-new identities racing to submit the same answer is
   // exactly the sybil scenario the fast path must not rubber-stamp — it
