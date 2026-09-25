@@ -39,6 +39,7 @@ import { recordAnchorTransaction, recordAnchorKyc } from './anchorRecords.js';
 import { resolveApiKey } from './apiKeyAuth.js';
 import { isBillingConfigured, createCheckoutSession, handleStripeWebhook, getCreditBalanceStroops, reserveCredit, settleReservation } from './billing.js';
 import { logger, httpLogger } from './logger.js';
+import { securityHeadersMiddleware } from './securityHeaders.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -48,6 +49,9 @@ const app = express();
 // further context (questionId, workerId, etc.) to that same request's
 // trace. Placed before every other middleware so nothing is unlogged.
 app.use(httpLogger);
+
+// Security response headers on every response (API and static UI alike).
+app.use(securityHeadersMiddleware());
 
 // Wide open ('*') by default for local dev; set ALLOWED_ORIGINS to a
 // comma-separated list to lock this down for a real deployment. Wide-open

@@ -62,6 +62,15 @@ export const config = Object.freeze({
   logFormat: process.env.LOG_FORMAT || 'pretty',
   logLevel: process.env.LOG_LEVEL || 'info',
 
+  // Response security headers (see securityHeaders.js). CSP_CONNECT_SRC is a
+  // comma-separated list of extra origins the frontend may fetch()/stream
+  // from — only needed when the UI is hosted on a different origin than
+  // this API. HSTS_ENABLED=false turns off Strict-Transport-Security.
+  securityHeaders: Object.freeze({
+    connectSrc: (process.env.CSP_CONNECT_SRC || '').split(',').map((s) => s.trim()).filter(Boolean),
+    hsts: process.env.HSTS_ENABLED !== 'false',
+  }),
+
   maxQuestionLength: num(process.env.MAX_QUESTION_LENGTH, 2000),
   maxAnswerLength: num(process.env.MAX_ANSWER_LENGTH, 2000),
 
