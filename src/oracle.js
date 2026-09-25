@@ -8,6 +8,8 @@ import { incrementStat } from './stats.js';
 import { recordPayerQuestion } from './payerIndex.js';
 import { getPrivatePool } from './privatePools.js';
 import { notifyWorker } from './push.js';
+import { enqueueSettlementWebhooks } from './webhookDelivery.js';
+import { setJobWebhookOwner } from './webhooks.js';
 import { jobLogger } from './logger.js';
 import { store } from './store.js';
 import { buildProvenanceRecord, saveProvenance, attachSettlement } from './provenance.js';
@@ -160,7 +162,7 @@ export async function verifyPayment(questionId) {
  * funded through the API-key path, whose `payerAddress` is the platform's
  * pooled fiat address — it's what cancelJob() authenticates against there.
  */
-export async function startFulfillment(questionId, pending, tier, payerAddress, { apiKeyAccountId } = {}) {
+export async function startFulfillment(questionId, pending, tier, payerAddress, { ownerAccountId } = {}) {
   const claimed = await claimJob(questionId);
   if (!claimed) return { jobId: questionId };
 
@@ -176,15 +178,20 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
     amountStroops: tier.priceStroops.toString(),
     amount: stroopsToUsdc(tier.priceStroops),
     payer: payerAddress || null,
-    // What rule reconcile() will apply, visible on GET /oracle/:jobId.
-    consensusMode: pending.consensusMode || DEFAULT_CONSENSUS_MODE,
-    ...(pending.consensusTolerance ? { consensusTolerance: pending.consensusTolerance } : {}),
+    // Persisted past dispatch time (it already routes dispatch in
+    // fulfillOracleCall) so per-category spend is visible to every reader
+    // of the job record: GET /oracle/:jobId, GET /payers/:address/questions
+    // and GET /admin/transactions all spread the full record.
+    category: pending.category || null,
   });
 
   if (apiKeyAccountId) {
     await store.set(JOB_OWNER_PREFIX + questionId, { apiKeyAccountId }, config.jobResultTtlMs);
   }
   if (payerAddress) await recordPayerQuestion(payerAddress, questionId);
+  // API-key customers are charged from the shared fiat pool, so `payer`
+  // can't identify them; record who to send settlement webhooks to instead.
+  if (ownerAccountId) await setJobWebhookOwner(questionId, `account:${ownerAccountId}`);
 
   if (!cancellableUntil) {
     runFulfillment(questionId, pending, tier);
@@ -215,7 +222,9 @@ function runFulfillment(questionId, pending, tier) {
       outcome: 'refund_pending_timeout',
       reason: `internal error: ${err.message}`,
       autoRefundAfterLedgers: config.timeoutLedgers,
-    }).catch(() => {});
+    })
+      .then((job) => announceSettlement(questionId, job))
+      .catch(() => {});
   });
 }
 
@@ -478,7 +487,7 @@ async function settleInstantResolved(questionId, result) {
     const { hash } = await resolveQuestion(questionId, [config.platformAddress], []);
     await dropStashedQuestion(questionId);
     await incrementStat('resolved');
-    await updateJob(questionId, {
+    const job = await updateJob(questionId, {
       status: 'settled',
       outcome: 'resolved',
       answer: result.consensus,
@@ -490,12 +499,13 @@ async function settleInstantResolved(questionId, result) {
       payoutTx: hash,
       payoutModel: 'instant tier — no human worker involved, settled directly to the platform',
     });
+    announceSettlement(questionId, job);
   } catch (err) {
     const onChainNow = await getQuestionOnChain(questionId).catch(() => null);
     if (onChainNow && onChainNow.status === 'refunded') {
       jobLogger(questionId).warn('instant tier lost the settlement race to a third-party refund_timeout()');
       await incrementStat('refunded');
-      await updateJob(questionId, {
+      const job = await updateJob(questionId, {
         status: 'settled',
         outcome: 'lost_race_to_timeout_refund',
         reason: "a third party force-refunded via refund_timeout() before this backend's resolve() landed",
@@ -503,6 +513,7 @@ async function settleInstantResolved(questionId, result) {
         reconciliationMethod: result.method,
         totalAnswers: 0,
       });
+      announceSettlement(questionId, job);
       return;
     }
 
@@ -533,7 +544,7 @@ async function settleResolved(questionId, submissions, result) {
         type: 'credited',
       }).catch(() => {});
     }
-    await updateJob(questionId, {
+    const job = await updateJob(questionId, {
       status: 'settled',
       outcome: 'resolved',
       answer: result.consensus,
@@ -545,6 +556,7 @@ async function settleResolved(questionId, submissions, result) {
       payoutTx: hash,
       payoutModel: 'accrued-balance — matching workers were credited on-chain and withdraw() at their own discretion',
     });
+    announceSettlement(questionId, job);
   } catch (err) {
     // Don't guess at *why* resolve() failed by string-matching an opaque
     // XDR error — check the definitive source of truth instead. If the
@@ -559,7 +571,7 @@ async function settleResolved(questionId, submissions, result) {
       jobLogger(questionId).warn('lost the settlement race to a third-party refund_timeout()');
       await recordReputationOutcomes(submissions, []);
       await incrementStat('refunded');
-      await updateJob(questionId, {
+      const job = await updateJob(questionId, {
         status: 'settled',
         outcome: 'lost_race_to_timeout_refund',
         reason: "a third party (possibly the payer) force-refunded via refund_timeout() before this backend's resolve() landed",
@@ -567,6 +579,7 @@ async function settleResolved(questionId, submissions, result) {
         reconciliationMethod: result.method,
         totalAnswers: submissions.length,
       });
+      announceSettlement(questionId, job);
       return;
     }
 
@@ -600,7 +613,7 @@ async function settleRefunded(questionId, submissions, result, extraJobFields = 
     await incrementStat('refunded');
   }
 
-  await updateJob(questionId, {
+  const job = await updateJob(questionId, {
     status: 'settled',
     outcome: hash ? 'refunded' : 'refund_pending_timeout',
     reason: result.reason || describeRefundReason(result),
@@ -611,6 +624,23 @@ async function settleRefunded(questionId, submissions, result, extraJobFields = 
     ...(hash ? {} : { autoRefundAfterLedgers: config.timeoutLedgers }),
     ...extraJobFields,
   });
+  announceSettlement(questionId, job);
+}
+
+/**
+ * Settlement webhooks (webhookDelivery.js) are their own concern, separate
+ * from the worker push notifications above: the payer or API-key customer
+ * who asked is told the question settled. Called after the job record
+ * reaches its final `settled` state. enqueueSettlementWebhooks() returns
+ * immediately and never throws, so a slow or dead receiver can't delay or
+ * fail settlement.
+ */
+function announceSettlement(questionId, job) {
+  try {
+    enqueueSettlementWebhooks(questionId, job);
+  } catch (err) {
+    jobLogger(questionId).error({ err }, 'failed to enqueue settlement webhooks');
+  }
 }
 
 function describeRefundReason(result) {

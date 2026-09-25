@@ -1,4 +1,5 @@
 import { store } from './store.js';
+import { stroopsToUsdc } from './pricing.js';
 
 /**
  * Payers are otherwise anonymous to this API — there's no signup, no API
@@ -61,5 +62,52 @@ export function summarizePayerQuestions(ids, jobs) {
     resolved,
     settled,
     successRate: settled > 0 ? resolved / settled : null,
+  };
+}
+
+/**
+ * Spend dashboards (arbiter-app) chart spend by category and over time.
+ * Every input is already on the job record, but bucketing it here saves each
+ * consumer from re-deriving the same aggregation client-side.
+ *
+ * `questions` is summarizePayerQuestions()'s filtered list, so expired jobs
+ * are already gone. Questions without a category (asked without one, or
+ * created before category was persisted) share a single `null` bucket. Days
+ * are UTC calendar days of the question's createdAt, since that's when the
+ * spend happened. Stroop amounts are decimal strings, because BigInt isn't
+ * JSON-serializable, alongside the same 7-decimal USDC string used
+ * everywhere else. Refunded questions still count toward spend: this
+ * mirrors totalSpendStroops, which is the amount paid in, not the net.
+ */
+export function bucketPayerSpend(questions) {
+  const byCategory = new Map();
+  const byDay = new Map();
+
+  const add = (map, key, extra, amount, outcome) => {
+    const bucket = map.get(key) || { ...extra, questions: 0, resolved: 0, spendStroops: 0n };
+    bucket.questions += 1;
+    if (outcome === 'resolved') bucket.resolved += 1;
+    bucket.spendStroops += amount;
+    map.set(key, bucket);
+  };
+
+  for (const q of questions) {
+    const amount = BigInt(q.amountStroops || 0);
+    const category = q.category ? String(q.category).trim().toLowerCase() : null;
+    add(byCategory, category, { category }, amount, q.outcome);
+    if (Number.isFinite(q.createdAt)) {
+      const day = new Date(q.createdAt).toISOString().slice(0, 10);
+      add(byDay, day, { day }, amount, q.outcome);
+    }
+  }
+
+  const serialize = (b) => ({ ...b, spendStroops: b.spendStroops.toString(), spend: stroopsToUsdc(b.spendStroops) });
+  return {
+    // Biggest spend first; uncategorized sorts last among equals.
+    spendByCategory: [...byCategory.values()]
+      .sort((a, b) => (b.spendStroops > a.spendStroops ? 1 : b.spendStroops < a.spendStroops ? -1 : (a.category === null) - (b.category === null)))
+      .map(serialize),
+    // Chronological, ready to plot.
+    spendByDay: [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day)).map(serialize),
   };
 }

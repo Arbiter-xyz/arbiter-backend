@@ -178,6 +178,10 @@ export const config = Object.freeze({
       max: num(process.env.BILLING_RATE_LIMIT_MAX, 10),
       windowMs: num(process.env.BILLING_RATE_LIMIT_WINDOW_MS, 60_000),
     }),
+    webhooks: Object.freeze({
+      max: num(process.env.WEBHOOKS_RATE_LIMIT_MAX, 20),
+      windowMs: num(process.env.WEBHOOKS_RATE_LIMIT_WINDOW_MS, 60_000),
+    }),
   }),
 
   vapid: Object.freeze({
@@ -242,6 +246,35 @@ export const config = Object.freeze({
     fiatPoolSecret: process.env.FIAT_POOL_SECRET || '',
     fiatPoolAddress: process.env.FIAT_POOL_ADDRESS || '',
     // 1 USD = 1 USDC face value, at USDC's existing 7-decimal stroop
-    // convention (see pricing.js's 
+    // convention (see pricing.js's stroopsToUsdc) — the simplest possible
+    // conversion for v1. Stripe's own processing fee is absorbed by the
+    // platform, not passed through to the credited balance; revisit if
+    // margin matters before volume does.
+    usdToStroops: 10_000_000n,
+    minTopupUsd: num(process.env.MIN_TOPUP_USD, 10),
+  }),
 
-/* … truncated 320 chars — edit only what you need near the top … */
+  // Settlement webhooks (see webhooks.js for registration/validation and
+  // webhookDelivery.js for signing/retry). Delivery is best-effort and
+  // never on the settlement path; these bound how hard it tries.
+  webhooks: Object.freeze({
+    maxPerOwner: num(process.env.WEBHOOK_MAX_PER_OWNER, 10),
+    // Total delivery attempts per event, including the first one.
+    maxAttempts: num(process.env.WEBHOOK_MAX_ATTEMPTS, 6),
+    // Backoff before retry n is baseDelayMs * 2^(n-1) plus up to 20%
+    // jitter: 5s, 10s, 20s, 40s, 80s by default, about 2.5 minutes in all.
+    retryBaseDelayMs: num(process.env.WEBHOOK_RETRY_BASE_DELAY_MS, 5_000),
+    timeoutMs: num(process.env.WEBHOOK_TIMEOUT_MS, 10_000),
+    // Local development / tests only: also accept http:// URLs and
+    // loopback/private-network targets. Never enable in production, since
+    // it turns webhook registration into an SSRF primitive against the
+    // backend's own network.
+    allowInsecureTargets: process.env.WEBHOOK_ALLOW_INSECURE_TARGETS === 'true',
+    // Optional key (any string; it's hashed to 32 bytes) used to encrypt
+    // signing secrets at rest with AES-256-GCM. Secrets must stay
+    // recoverable, since signing needs the plaintext, so they can't be
+    // hashed like API keys. Without a key they're stored as-is, which is the
+    // same trust level as the store itself.
+    secretEncryptionKey: process.env.WEBHOOK_SECRET_ENCRYPTION_KEY || '',
+  }),
+});

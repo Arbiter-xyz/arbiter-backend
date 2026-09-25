@@ -15,7 +15,7 @@ import {
 } from './dispatch.js';
 import { getStats } from './stats.js';
 import { getVapidPublicKey, isPushConfigured, saveSubscription, removeSubscription } from './push.js';
-import { getPayerQuestionIds, summarizePayerQuestions } from './payerIndex.js';
+import { getPayerQuestionIds, summarizePayerQuestions, bucketPayerSpend } from './payerIndex.js';
 import { requiresAuth, buildChallengeXdr, verifyChallengeAndIssueSession, verifySessionToken } from './workerAuth.js';
 import {
   buildSponsoredOnboardTx,
@@ -40,6 +40,7 @@ import { resolveApiKey } from './apiKeyAuth.js';
 import { parseConsensusRule } from './consensus.js';
 import { getPrivatePool, addPoolWorkers, removePoolWorkers, PoolValidationError } from './privatePools.js';
 import { isBillingConfigured, createCheckoutSession, handleStripeWebhook, getCreditBalanceStroops, reserveCredit, settleReservation } from './billing.js';
+import { registerWebhook, listWebhooks, deleteWebhook, WebhookError } from './webhooks.js';
 import { logger, httpLogger } from './logger.js';
 import { getProvenance } from './provenance.js';
 import { enforceSecurityPosture } from './securityPosture.js';
@@ -219,7 +220,9 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
     }
 
     try {
-      const result = await askMetered(config.billing.fiatPoolAddress, question, tier, category, { apiKeyAccountId });
+      const result = await askMetered(config.billing.fiatPoolAddress, question, tier, category, {
+        ownerAccountId: apiKeyAccountId, // routes this customer's settlement webhooks
+      });
       await settleReservation(apiKeyAccountId, maxStroops, Number(result.amountStroops));
       return res.status(202).json({ ...result, statusUrl: `/oracle/${result.jobId}` });
     } catch (err) {
@@ -381,6 +384,7 @@ app.get('/payers/:address/questions', async (req, res) => {
   const ids = await getPayerQuestionIds(req.params.address);
   const jobs = await Promise.all(ids.map((id) => getJobStatus(id)));
   const summary = summarizePayerQuestions(ids, jobs);
+  const { spendByCategory, spendByDay } = bucketPayerSpend(summary.questions);
 
   res.json({
     questions: summary.questions,
@@ -388,6 +392,8 @@ app.get('/payers/:address/questions', async (req, res) => {
     totalSpendStroops: summary.totalSpendStroops.toString(),
     totalSpend: stroopsToUsdc(summary.totalSpendStroops),
     successRate: summary.successRate,
+    spendByCategory,
+    spendByDay,
   });
 });
 
@@ -476,6 +482,66 @@ app.get('/billing/account', async (req, res) => {
   if (!accountId) return res.status(401).json({ error: 'a valid API key is required' });
   const creditBalanceStroops = await getCreditBalanceStroops(accountId);
   res.json({ accountId, creditBalanceStroops: String(creditBalanceStroops), creditBalance: stroopsToUsdc(creditBalanceStroops) });
+});
+
+// ---------------------------------------------------------------------
+// Settlement webhooks — instead of polling GET /oracle/:jobId, an owner
+// registers a URL that receives a signed POST when each of their questions
+// settles (delivery/signing: webhookDelivery.js). An owner is either:
+//   - an API-key customer: `Authorization: Bearer ak_live_...`, or
+//   - a wallet payer: `address` + session `token` (from
+//     POST /payers/:address/session), in the JSON body or query string,
+//     the same proof every other payer-scoped route requires.
+// Only real Stellar addresses qualify on the payer side (the test-string
+// id convenience other routes allow doesn't apply). A webhook delivers
+// data, so the owner must be proven.
+// ---------------------------------------------------------------------
+
+async function resolveWebhookOwner(req) {
+  const accountId = await resolveApiKey(req);
+  if (accountId) return `account:${accountId}`;
+  const address = req.body?.address ?? req.query.address;
+  const token = req.body?.token ?? req.query.token;
+  if (typeof address === 'string' && requiresAuth(address) && verifySessionToken(token) === address) {
+    return `payer:${address}`;
+  }
+  return null;
+}
+
+const WEBHOOK_AUTH_ERROR =
+  'authenticate with an API key (Authorization: Bearer ak_live_...) or a payer address + session token — see POST /payers/:address/session';
+
+app.post('/webhooks', rateLimited('webhooks', byIp), async (req, res) => {
+  const owner = await resolveWebhookOwner(req);
+  if (!owner) return res.status(401).json({ error: WEBHOOK_AUTH_ERROR });
+  try {
+    const { url, description } = req.body || {};
+    const webhook = await registerWebhook(owner, url, { description });
+    // The signing secret appears in this response and nowhere else, ever.
+    res.status(201).json({
+      ...webhook,
+      note: 'Store `secret` now — it is never shown again. Verify each delivery\'s X-Arbiter-Signature with it (see README "Webhooks").',
+    });
+  } catch (err) {
+    if (err instanceof WebhookError) return res.status(err.status).json({ error: err.message });
+    req.log.error({ err }, 'failed to register webhook');
+    res.status(500).json({ error: 'failed to register webhook' });
+  }
+});
+
+app.get('/webhooks', rateLimited('webhooks', byIp), async (req, res) => {
+  const owner = await resolveWebhookOwner(req);
+  if (!owner) return res.status(401).json({ error: WEBHOOK_AUTH_ERROR });
+  res.json({ webhooks: await listWebhooks(owner) });
+});
+
+app.delete('/webhooks/:id', rateLimited('webhooks', byIp), async (req, res) => {
+  const owner = await resolveWebhookOwner(req);
+  if (!owner) return res.status(401).json({ error: WEBHOOK_AUTH_ERROR });
+  // 404 for someone else's webhook too, so ids can't be probed across owners.
+  const deleted = await deleteWebhook(owner, req.params.id);
+  if (!deleted) return res.status(404).json({ error: 'no such webhook' });
+  res.json({ ok: true, id: req.params.id });
 });
 
 // ---------------------------------------------------------------------
