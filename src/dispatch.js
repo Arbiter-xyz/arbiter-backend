@@ -186,9 +186,25 @@ function writeSse(res, event, data) {
  * that, not just "a bigger quorum." Still fails open: never lets the
  * established-only pool drop below quorumSize's worth of recipients, since
  * a starved quorum is a worse outcome than one with a fresh worker in it.
+ *
+ * `whitelist` (a payer's private pool — see privatePools.js) is the one
+ * filter here that deliberately FAILS CLOSED. Every other filter is a soft
+ * routing preference, so falling back to a wider pool beats stranding the
+ * question. A private pool is a hard requirement the payer explicitly asked
+ * for; falling back to the open pool would quietly defeat the feature and
+ * send their question to exactly the workers they excluded. So it runs
+ * first, and when no whitelisted worker is online this returns [] (the
+ * caller refunds rather than broadcasting). The soft filters below still
+ * fail open, but only as far as the whitelisted set, never past it.
  */
-async function selectTargets(category, { preferEstablished = false, quorumSize = 0 } = {}) {
+async function selectTargets(category, { preferEstablished = false, quorumSize = 0, whitelist = null } = {}) {
   let targets = [...workers.entries()];
+
+  if (whitelist) {
+    const allowed = new Set(whitelist);
+    targets = targets.filter(([id]) => allowed.has(id));
+    if (targets.length === 0) return [];
+  }
 
   if (category) {
     const norm = normalizeCategory(category);
@@ -216,24 +232,18 @@ async function selectTargets(category, { preferEstablished = false, quorumSize =
   return established.length >= quorumSize ? established : pool;
 }
 
-/**
- * `limit` / `exclude` exist for escalating dispatch: recruit only `limit`
- * workers (established ones first — the confidence signal for a lone answer
- * is the worker's track record, so ask the best-known worker first), and
- * skip anyone in `exclude` (already asked in an earlier round). Both default
- * to today's broadcast-to-everyone behavior. A limited broadcast also skips
- * the offline push fan-out: notifying every offline worker would defeat
- * the point of starting with a small pool.
- */
-export async function broadcast(questionId, questionText, { category, quorumSize, expiresInMs, preferEstablished, limit, exclude } = {}) {
+/** Whether any worker in `whitelist` is connected right now — i.e. whether
+ * selectTargets() would find anyone to send a private-pool question to. */
+export function hasOnlineWhitelistedWorker(whitelist) {
+  return whitelist.some((id) => workers.has(id));
+}
+
+export async function broadcast(questionId, questionText, { category, quorumSize, expiresInMs, preferEstablished, whitelist = null } = {}) {
   const payload = { questionId: questionId.toString(), question: questionText, quorumSize, expiresInMs };
-  let targets = await selectTargets(category, { preferEstablished, quorumSize });
-  if (exclude) targets = targets.filter(([id]) => !exclude.has(id));
-  if (limit !== undefined) {
-    const ranked = await Promise.all(targets.map(async (entry) => ({ entry, established: await isEstablishedWorker(entry[0]) })));
-    ranked.sort((a, b) => Number(b.established) - Number(a.established)); // stable: keeps connection order within a group
-    targets = ranked.slice(0, limit).map((r) => r.entry);
-  }
+  const targets = await selectTargets(category, { preferEstablished, quorumSize, whitelist });
+  // Private pool with nobody online: fail closed. No SSE broadcast and no
+  // push either, so the caller can refund right away (see selectTargets).
+  if (whitelist && targets.length === 0) return [];
   for (const [, w] of targets) writeSse(w.res, 'question', payload);
 
   // Supplement SSE with push notifications for workers who are eligible
@@ -242,7 +252,12 @@ export async function broadcast(questionId, questionText, { category, quorumSize
   // push.js for the honest tradeoff; short-timeout tiers skip this).
   if (limit === undefined && expiresInMs >= config.push.minTimeoutForPushMs) {
     const onlineIds = new Set(targets.map(([id]) => id));
-    const offlineEligible = getPushEligibleWorkerIds(category).filter((id) => !onlineIds.has(id));
+    // The push body carries the question text, so a private pool restricts
+    // push recipients as well as SSE recipients.
+    const allowed = whitelist ? new Set(whitelist) : null;
+    const offlineEligible = getPushEligibleWorkerIds(category).filter(
+      (id) => !onlineIds.has(id) && (!allowed || allowed.has(id)),
+    );
     for (const workerId of offlineEligible) {
       notifyWorker(workerId, {
         title: 'New question on Arbiter',
@@ -378,35 +393,27 @@ export function singleAnswerConfidence(rep, minAnswersBeforeEstablished) {
 }
 
 /**
- * Escalating dispatch: recruits `initialQuorum` workers, then either settles
- * on what came back or grows the target (up to `maxQuorum`) and recruits
- * more, re-evaluating on every submission. Reuses the same `collectors`
- * state and submitAnswer() path as dispatchAndCollect — the only differences
- * are that `quorumSize` is mutable and submitAnswer() delegates the "are we
- * done?" question to decideEscalation instead of a fixed size check.
+ * Always resolves, never rejects, with whatever submissions arrived —
+ * reconciliation downstream must never hang or throw just because dispatch
+ * had a bad day. Each submission is annotated with `established` (see
+ * isEstablishedWorker) so reconcile.js can decide whether a unanimous
+ * result is trustworthy enough to fast-path.
  *
- * Like dispatchAndCollect it always resolves, never rejects. Resolves with
- * { submissions, recruitedWorkers, finalQuorumSize, settledBy, confidence }
- * where `recruitedWorkers` is how many distinct workers were actually asked
- * (may be fewer than the target if not enough are online) and `confidence`
- * is the lone-answer confidence when exactly one answer was used (else null).
+ * With a `whitelist` (private pool), only whitelisted workers' answers are
+ * accepted, and if the broadcast reaches nobody the collector closes at
+ * once with no submissions instead of waiting out the timeout.
  */
-export function dispatchEscalating(
-  questionId,
-  questionText,
-  { timeoutMs, category, escalation, minAnswers = config.worker.minAnswersBeforeReputationGate } = {},
-) {
+export function dispatchAndCollect(questionId, questionText, { quorumSize, timeoutMs, category, preferEstablished, whitelist = null } = {}) {
   const qid = questionId.toString();
   const { initialQuorum, maxQuorum, confidenceThreshold, stepTimeoutMs } = escalation;
 
   return new Promise((resolvePromise) => {
-    const asked = new Set();
-    let stepTimer = null;
-    let evalChain = Promise.resolve();
-    let settledBy = 'timeout';
-    let lastConfidence = null;
-
-    const state = { submissions: new Map(), quorumSize: initialQuorum, finished: false };
+    const state = {
+      submissions: new Map(),
+      quorumSize,
+      finished: false,
+      allowedWorkers: whitelist ? new Set(whitelist) : null,
+    };
     collectors.set(qid, state);
 
     const timer = setTimeout(finish, timeoutMs);
@@ -432,72 +439,30 @@ export function dispatchEscalating(
     }
     state.finish = finish;
 
-    async function recruit(count) {
-      const ids = await broadcast(questionId, questionText, {
-        category,
-        quorumSize: state.quorumSize,
-        expiresInMs: timeoutMs,
-        preferEstablished: true,
-        limit: count,
-        exclude: asked,
+    broadcast(questionId, questionText, { category, quorumSize, expiresInMs: timeoutMs, preferEstablished, whitelist })
+      .then((targetIds) => {
+        if (whitelist && targetIds.length === 0) finish();
+      })
+      .catch((err) => {
+        jobLogger(questionId).error({ err }, 'broadcast failed');
       });
-      for (const id of ids) asked.add(id);
-      armStepTimer();
-    }
-
-    // If the current recruits go quiet, don't sit on a target that may
-    // never fill — widen the pool. Only ever grows, and stops at the cap.
-    function armStepTimer() {
-      clearTimeout(stepTimer);
-      if (state.finished || state.quorumSize >= maxQuorum) return;
-      stepTimer = setTimeout(() => {
-        if (state.finished) return;
-        grow(Math.min(maxQuorum, state.quorumSize * 2 + 1));
-      }, stepTimeoutMs);
-      stepTimer.unref?.();
-    }
-
-    function grow(newTarget) {
-      const extra = newTarget - state.quorumSize;
-      state.quorumSize = newTarget;
-      recruit(extra).catch((err) => jobLogger(questionId).error({ err }, 'escalation broadcast failed'));
-    }
-
-    async function evaluate() {
-      if (state.finished) return;
-      const answers = [...state.submissions.entries()].map(([workerId, answer]) => ({ workerId, answer }));
-      let singleConfidence = 0;
-      if (answers.length === 1) {
-        singleConfidence = singleAnswerConfidence(await getReputation(answers[0].workerId), minAnswers);
-        lastConfidence = singleConfidence;
-      }
-      if (state.finished) return;
-      const decision = decideEscalation({
-        submissionCount: answers.length,
-        targetSize: state.quorumSize,
-        maxQuorum,
-        singleConfidence,
-        threshold: confidenceThreshold,
-        allAgree: answers.length > 1 && exactMatchVote(answers).allAgree,
-      });
-      if (decision.action === 'settle') {
-        settledBy = decision.reason;
-        finish();
-      } else if (decision.action === 'escalate') {
-        grow(decision.newTarget);
-      }
-    }
-
-    state.escalation = {
-      // Serialized so two near-simultaneous submissions can't both decide
-      // to grow the target from the same starting size.
-      onSubmission() {
-        evalChain = evalChain.then(evaluate).catch((err) => jobLogger(questionId).error({ err }, 'escalation evaluation failed'));
-      },
-    };
-
-    recruit(initialQuorum).catch((err) => {
-      jobLogger(questionId).error({ err }, 'broadcast failed');
-    });
   });
+}
+
+async function annotateEstablished(submissions) {
+  return Promise.all(submissions.map(async (s) => ({ ...s, established: await isEstablishedWorker(s.workerId) })));
+}
+
+/** Returns false (never throws) if the question is closed/expired, this
+ * worker already answered it, or the question is restricted to a private
+ * pool this worker isn't in. Question ids aren't secret, so without that
+ * last check anyone could answer a private question they were never sent. */
+export function submitAnswer(questionId, workerId, answer) {
+  const state = collectors.get(questionId.toString());
+  if (!state || state.finished) return false;
+  if (state.allowedWorkers && !state.allowedWorkers.has(workerId)) return false;
+  if (state.submissions.has(workerId)) return false;
+  state.submissions.set(workerId, answer);
+  if (state.submissions.size >= state.quorumSize) state.finish();
+  return true;
 }
