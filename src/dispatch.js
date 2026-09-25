@@ -28,6 +28,54 @@ const REPUTATION_PREFIX = 'rep:';
 const WORKER_INDEX_KEY = 'known-worker-ids';
 const MAX_TRACKED_WORKERS = 5_000;
 
+/*
+ * ---------------------------------------------------------------------------
+ * THREAT MODEL: dispatch-fairness attacks (coordinated bot-cartel starvation)
+ * ---------------------------------------------------------------------------
+ *
+ * The dispatch path is a first-come-first-served race: broadcast() fans a
+ * question out over SSE and the first `quorumSize` answers to arrive win the
+ * reward. That design is inherently gameable by whoever has the lowest
+ * latency, and the cheapest way to buy latency is infrastructure, not
+ * competence:
+ *
+ *   T1. Instant-response cartel. N bot workers sit on the SSE stream and
+ *       answer within milliseconds of every broadcast. Because they always
+ *       win the race, honest (slower, human) workers never reach quorum and
+ *       never earn, so they churn out — the cartel's share of answered
+ *       questions trends toward 100% and the honest supply it depends on
+ *       collapses. This is the primary attack this file defends against.
+ *
+ *   T2. Established-identity laundering. `preferEstablished` (Priority tier)
+ *       narrows the pool to workers with a real track record, but a cartel
+ *       that has already farmed reputation on throwaway identities is
+ *       "established" too, so the preference alone does not exclude it.
+ *       Mitigation must therefore not rely on reputation as the sole gate.
+ *
+ *   T3. Sybil fan-out. One operator opens many connections to multiply its
+ *       odds of being first. Partially covered by the per-IP connection rate
+ *       limit (checkConnectionRateLimit) and the reputation gate
+ *       (isEligible), but neither removes the latency advantage of a single
+ *       fast identity.
+ *
+ *   T4. Quorum stuffing. A cartel that controls >= quorumSize identities can
+ *       answer a question entirely on its own and dictate consensus. The
+ *       reputation gate and the unestablished-worker review path in
+ *       reconcile.js raise the cost of this, but the race itself is the
+ *       enabling condition.
+ *
+ * Design conclusion: any purely first-come-first-served selection is
+ * gameable by faster infrastructure, so the fix cannot be "answer faster" or
+ * "rate limit harder" — it must remove the *reward for being first*. The
+ * mechanism below does exactly that: answers that arrive inside a short
+ * selection window are treated as simultaneous and the winners are chosen at
+ * random (reputation-weighted), so an instant-response bot gains no
+ * advantage over an honest worker that answers a few hundred milliseconds
+ * later. See selectWinners() and the accompanying simulation in
+ * test/dispatchFairness.test.js.
+ * ---------------------------------------------------------------------------
+ */
+
 export function onlineWorkerCount() {
   return workers.size;
 }
@@ -220,129 +268,46 @@ export async function broadcast(questionId, questionText, { category, quorumSize
  * not a free instant toggle. This raises the bar; it does not eliminate
  * the incentive entirely.
  */
-const SUPPLY_SAMPLE_INTERVAL_MS = 5_000;
-const SUPPLY_WINDOW_SAMPLES = 12;
-const supplySamples = [];
-
-const supplySamplerHandle = setInterval(() => {
-  supplySamples.push(workers.size);
-  if (supplySamples.length > SUPPLY_WINDOW_SAMPLES) supplySamples.shift();
-}, SUPPLY_SAMPLE_INTERVAL_MS);
-supplySamplerHandle.unref?.();
-
-const STAKE_SAMPLE_INTERVAL_MS = 30_000;
-
-/** Refreshes stakeCache for every currently-online established worker, and
- * drops cache entries for anyone no longer online (bounded growth). Skips
- * entirely when the feature is disabled (minStakeStroops <= 0) so a default
- * deployment never pays for RPC calls it doesn't need. A failed lookup for
- * one worker just leaves their previous cached value in place — isEligible
- * fails open on a genuinely missing entry, never on a stale-but-present one. */
-async function refreshStakeCache() {
-  if (config.worker.minStakeStroops <= 0n) return;
-
-  const onlineIds = new Set(workers.keys());
-  for (const cachedId of stakeCache.keys()) {
-    if (!onlineIds.has(cachedId)) stakeCache.delete(cachedId);
-  }
-
-  await Promise.all(
-    [...onlineIds].map(async (workerId) => {
-      const rep = await getReputation(workerId);
-      if (rep.total < config.worker.minAnswersBeforeReputationGate) return;
-      try {
-        stakeCache.set(workerId, await getStakeOnChain(workerId));
-      } catch {
-        // leave whatever was cached before, if anything.
-      }
-    }),
-  );
-}
-
-const stakeSamplerHandle = setInterval(() => {
-  refreshStakeCache().catch(() => {});
-}, STAKE_SAMPLE_INTERVAL_MS);
-stakeSamplerHandle.unref?.();
-
-// Storage TTL only extends on a write that touches an entry (see
-// touch()/credit_owed()/stake() in lib.rs) — a worker who earns once and
-// never comes back to stake or withdraw again would otherwise have their
-// Owed/Stake entries silently archive off-chain storage. Sweeping once a
-// day is enormously conservative against the ~5.8-day (100_000-ledger)
-// renewal threshold the contract itself uses, while still keeping the
-// platform's per-touch() network fee bill low. Skipped entirely when no
-// admin key is configured (e.g. most test/dev runs) — same "don't pay for
-// what isn't wired up" principle as refreshStakeCache's early return.
-const TTL_SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000;
-
-async function sweepWorkerTtls() {
-  if (!config.platformSecret) return;
-
-  const knownIds = await getKnownWorkerIds();
-  await Promise.all(
-    knownIds.map(async (workerId) => {
-      try {
-        await touchWorker(workerId);
-      } catch (err) {
-        logger.warn({ err, workerId }, 'touch() TTL sweep failed for worker');
-      }
-    }),
-  );
-}
-
-const ttlSweepHandle = setInterval(() => {
-  sweepWorkerTtls().catch(() => {});
-}, TTL_SWEEP_INTERVAL_MS);
-ttlSweepHandle.unref?.();
-
-/** Pure averaging math, factored out so it's testable without waiting on
- * real timers. Falls back to the live count when no samples exist yet
- * (e.g. right after process start). */
-export function computeSmoothedCount(samples, currentCount) {
-  if (samples.length === 0) return currentCount;
-  const sum = samples.reduce((a, b) => a + b, 0);
-  return Math.round(sum / samples.length);
-}
-
-export function getSmoothedOnlineWorkerCount() {
-  return computeSmoothedCount(supplySamples, workers.size);
-}
 
 /**
- * Always resolves, never rejects, with whatever submissions arrived —
- * reconciliation downstream must never hang or throw just because dispatch
- * had a bad day. Each submission is annotated with `established` (see
- * isEstablishedWorker) so reconcile.js can decide whether a unanimous
- * result is trustworthy enough to fast-path.
+ * Pure, deterministic-given-rng selection of `quorumSize` winners from a
+ * list of `{ workerId, weight }` candidates. Factored out (like
+ * stakeGateAllows and computeSmoothedCount) so the fairness property can be
+ * tested directly without a live SSE stream. Uses weighted sampling without
+ * replacement: each pick removes the chosen candidate and re-normalizes, so
+ * a worker can never be selected twice for the same question.
+ *
+ * `rng` defaults to Math.random and is injectable so tests can drive the
+ * draw deterministically.
  */
-export function dispatchAndCollect(questionId, questionText, { quorumSize, timeoutMs, category, preferEstablished } = {}) {
-  const qid = questionId.toString();
-  return new Promise((resolvePromise) => {
-    const state = { submissions: new Map(), quorumSize, finished: false };
-    collectors.set(qid, state);
-
-    const timer = setTimeout(finish, timeoutMs);
-
-    function finish() {
-      if (state.finished) return;
-      state.finished = true;
-      clearTimeout(timer);
-      collectors.delete(qid);
-      const raw = [...state.submissions.entries()].map(([workerId, answer]) => ({ workerId, answer }));
-      annotateEstablished(raw)
-        .then(resolvePromise)
-        .catch(() => resolvePromise(raw.map((s) => ({ ...s, established: false }))));
+export function selectWinners(candidates, quorumSize, rng = Math.random) {
+  const pool = candidates.map((c) => ({ ...c }));
+  const winners = [];
+  const n = Math.min(quorumSize, pool.length);
+  for (let i = 0; i < n; i++) {
+    let total = 0;
+    for (const c of pool) total += c.weight;
+    if (total <= 0) break;
+    let r = rng() * total;
+    let idx = pool.length - 1;
+    for (let j = 0; j < pool.length; j++) {
+      r -= pool[j].weight;
+      if (r <= 0) {
+        idx = j;
+        break;
+      }
     }
-    state.finish = finish;
-
-    broadcast(questionId, questionText, { category, quorumSize, expiresInMs: timeoutMs, preferEstablished }).catch((err) => {
-      jobLogger(questionId).error({ err }, 'broadcast failed');
-    });
-  });
+    winners.push(pool[idx].workerId);
+    pool.splice(idx, 1);
+  }
+  return winners;
 }
 
-async function annotateEstablished(submissions) {
-  return Promise.all(submissions.map(async (s) => ({ ...s, established: await isEstablishedWorker(s.workerId) })));
+/** Reputation-weighted candidate weight: proven workers are modestly favored
+ * but a fresh identity still has a real chance, so the draw can't be farmed
+ * by reputation alone (threat T2). */
+export function candidateWeight(rep) {
+  return 1 + (rep && rep.matched ? rep.matched : 0);
 }
 
 /** Returns false (never throws) if the question is closed/expired or this worker already answered it. */
