@@ -4,7 +4,7 @@ import express from 'express';
 import cors from 'cors';
 
 import { config } from './config.js';
-import { issueChallengeIdempotent, verifyPayment, startFulfillment, getJobStatus } from './oracle.js';
+import { issueChallengeIdempotent, verifyPayment, startFulfillment, getJobStatus, cancelJob } from './oracle.js';
 import {
   onlineWorkerCount,
   checkConnectionRateLimit,
@@ -37,8 +37,11 @@ import { listTransactions, listWorkers, listPayers, getTreasury, getFeeRevenue, 
 import { getAnchorConfig, isAnchorConfigured } from './anchorClient.js';
 import { recordAnchorTransaction, recordAnchorKyc } from './anchorRecords.js';
 import { resolveApiKey } from './apiKeyAuth.js';
+import { parseConsensusRule } from './consensus.js';
+import { getPrivatePool, addPoolWorkers, removePoolWorkers, PoolValidationError } from './privatePools.js';
 import { isBillingConfigured, createCheckoutSession, handleStripeWebhook, getCreditBalanceStroops, reserveCredit, settleReservation } from './billing.js';
 import { logger, httpLogger } from './logger.js';
+import { securityHeadersMiddleware } from './securityHeaders.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -48,6 +51,9 @@ const app = express();
 // further context (questionId, workerId, etc.) to that same request's
 // trace. Placed before every other middleware so nothing is unlogged.
 app.use(httpLogger);
+
+// Security response headers on every response (API and static UI alike).
+app.use(securityHeadersMiddleware());
 
 // Wide open ('*') by default for local dev; set ALLOWED_ORIGINS to a
 // comma-separated list to lock this down for a real deployment. Wide-open
@@ -161,7 +167,10 @@ app.post('/oracle/sandbox', rateLimited('sandbox', byIp), async (req, res) => {
 app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
   const questionId = req.header('X-Question-Id');
   const paymentTx = req.header('X-Payment-Tx');
-  const { question, tier, category, payerAddress, token } = req.body || {};
+  const { question, tier, category, payerAddress, token, consensusMode, tolerance } = req.body || {};
+  // Only checked on the paths that create a question — step 2 of the
+  // classic flow reuses the rule already stashed at step 1.
+  const consensus = parseConsensusRule({ consensusMode, tolerance });
 
   // Third payment method: an `Authorization: Bearer ak_live_...` API key
   // (see apiKeyAuth.js/billing.js) — the wallet-free onramp. Checked first
@@ -176,6 +185,7 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
     if (question.length > config.maxQuestionLength) {
       return res.status(400).json({ error: `body.question must be at most ${config.maxQuestionLength} characters` });
     }
+    if (!consensus.ok) return res.status(400).json({ error: consensus.error });
 
     // Reserve the worst-case (surge-capped) price up front — askMetered()
     // only reveals the real, possibly-lower price it actually charged
@@ -199,7 +209,7 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
     }
 
     try {
-      const result = await askMetered(config.billing.fiatPoolAddress, question, tier, category);
+      const result = await askMetered(config.billing.fiatPoolAddress, question, tier, category, { apiKeyAccountId });
       await settleReservation(apiKeyAccountId, maxStroops, Number(result.amountStroops));
       return res.status(202).json({ ...result, statusUrl: `/oracle/${result.jobId}` });
     } catch (err) {
@@ -224,8 +234,9 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
     if (verifySessionToken(token) !== payerAddress) {
       return res.status(401).json({ error: 'a valid session token for this address is required — see POST /payers/:address/session' });
     }
+    if (!consensus.ok) return res.status(400).json({ error: consensus.error });
     try {
-      const result = await askMetered(payerAddress, question, tier, category);
+      const result = await askMetered(payerAddress, question, tier, category, consensus.rule);
       return res.status(202).json({ ...result, statusUrl: `/oracle/${result.jobId}` });
     } catch (err) {
       // #13 is ContractError::InsufficientBalance — see contracts/oracle-escrow/src/lib.rs.
@@ -250,8 +261,9 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
     if (question.length > config.maxQuestionLength) {
       return res.status(400).json({ error: `body.question must be at most ${config.maxQuestionLength} characters` });
     }
+    if (!consensus.ok) return res.status(400).json({ error: consensus.error });
     try {
-      const challenge = await issueChallengeIdempotent(question, tier, category, req.header('Idempotency-Key'));
+      const challenge = await issueChallengeIdempotent(question, tier, category, req.header('Idempotency-Key'), consensus.rule);
       return res.status(402).json(challenge);
     } catch (err) {
       req.log.error({ err }, 'failed to issue challenge');
@@ -265,12 +277,13 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
       return res.status(verdict.status).json({ questionId, reason: verdict.reason });
     }
 
-    const { jobId } = await startFulfillment(questionId, verdict.pending, verdict.tier, verdict.payerAddress);
+    const { jobId, cancellableUntil } = await startFulfillment(questionId, verdict.pending, verdict.tier, verdict.payerAddress);
     return res.status(202).json({
       jobId,
       questionId,
       question: verdict.pending.question,
       statusUrl: `/oracle/${jobId}`,
+      ...(cancellableUntil ? { cancellableUntil, cancelUrl: `/oracle/${jobId}/cancel` } : {}),
       quorumSize: verdict.tier.quorumSize,
       timeoutMs: verdict.tier.timeoutMs,
     });
@@ -327,6 +340,23 @@ app.get('/oracle/:jobId', async (req, res) => {
   return res.status(httpStatus).json({ jobId: req.params.jobId, ...job });
 });
 
+// Undo window (see undoWindow.js / oracle.js's cancelJob): a paid,
+// non-instant question can be cancelled and refunded while its job is still
+// 'holding', before dispatch. Authenticated as the payer — a session token
+// for the job's payer address in body.token, or, for an API-key-funded
+// question, the same `Authorization: Bearer ak_live_...` key that asked it.
+app.post('/oracle/:jobId/cancel', rateLimited('oracle', byIp), async (req, res) => {
+  try {
+    const apiKeyAccountId = await resolveApiKey(req);
+    const result = await cancelJob(req.params.jobId, { sessionToken: (req.body || {}).token, apiKeyAccountId });
+    if (!result.ok) return res.status(result.status).json({ jobId: req.params.jobId, error: result.error });
+    return res.json({ jobId: req.params.jobId, ...result.job });
+  } catch (err) {
+    req.log.error({ err, jobId: req.params.jobId }, 'cancel failed');
+    return res.status(500).json({ error: 'failed to cancel question' });
+  }
+});
+
 // A payer's own question history — there's no account system, so this is
 // keyed purely by the payer's on-chain address (recorded the moment their
 // payment is verified, see oracle.js::verifyPayment). Job records expire
@@ -348,6 +378,64 @@ app.get('/payers/:address/questions', async (req, res) => {
     totalSpend: stroopsToUsdc(summary.totalSpendStroops),
     successRate: summary.successRate,
   });
+});
+
+// ---------------------------------------------------------------------
+// Private worker pools — a payer's whitelist of worker addresses. When
+// one exists, that payer's questions are only dispatched to (and only
+// accept answers from) those workers; see privatePools.js for storage and
+// oracle.js's fulfillOracleCall() for enforcement. Unlike the other
+// per-address routes, a session token is ALWAYS required, even for a
+// non-address id: a pool changes where a payer's questions go, so there's
+// no test-string convenience to preserve here.
+// ---------------------------------------------------------------------
+
+function requirePoolOwner(req, res, token) {
+  if (!requiresAuth(req.params.address)) {
+    res.status(400).json({ error: 'pool owner must be a valid Stellar address' });
+    return false;
+  }
+  if (verifySessionToken(token) !== req.params.address) {
+    res.status(401).json({ error: 'a valid session token for this address is required — see POST /payers/:address/session' });
+    return false;
+  }
+  return true;
+}
+
+async function handlePoolWrite(req, res, mutate) {
+  try {
+    const workers = await mutate();
+    res.json({ payerAddress: req.params.address, workers, size: workers.length });
+  } catch (err) {
+    if (err instanceof PoolValidationError) return res.status(400).json({ error: err.message });
+    req.log.error({ err }, 'private pool update failed');
+    res.status(500).json({ error: 'failed to update private pool' });
+  }
+}
+
+app.get('/payers/:address/pool', async (req, res) => {
+  if (!requirePoolOwner(req, res, req.query.token)) return;
+  try {
+    const workers = await getPrivatePool(req.params.address);
+    res.json({ payerAddress: req.params.address, workers, size: workers.length });
+  } catch (err) {
+    req.log.error({ err }, 'private pool read failed');
+    res.status(500).json({ error: 'failed to read private pool' });
+  }
+});
+
+// body: { token, workers: [address, ...] }
+app.post('/payers/:address/pool', rateLimited('push', byIp), async (req, res) => {
+  const { token, workers } = req.body || {};
+  if (!requirePoolOwner(req, res, token)) return;
+  await handlePoolWrite(req, res, () => addPoolWorkers(req.params.address, workers));
+});
+
+// Removes one worker. Token goes in the query string, same as the GET,
+// since DELETE bodies aren't reliably passed through by proxies.
+app.delete('/payers/:address/pool/:worker', rateLimited('push', byIp), async (req, res) => {
+  if (!requirePoolOwner(req, res, req.query.token)) return;
+  await handlePoolWrite(req, res, () => removePoolWorkers(req.params.address, [req.params.worker]));
 });
 
 // ---------------------------------------------------------------------

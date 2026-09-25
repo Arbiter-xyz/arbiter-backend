@@ -11,7 +11,11 @@ import { trace, context, propagation, SpanKind, SpanStatusCode } from '@opentele
 const workers = new Map(); // workerId -> { res, categories: Set<string>, connectedAt }
 
 // Per-question quorum collector, also process-local for the same reason.
-const collectors = new Map(); // questionId -> { submissions: Map<workerId, answer>, quorumSize, finished, finish }
+// `quorumSize` is the CURRENT target and is mutable: fixed-quorum questions
+// never change it, escalating ones (see dispatchEscalating) grow it mid-flight.
+// `escalation`, present only on escalating questions, holds the extra state
+// for that mode; fixed-quorum collectors leave it undefined.
+const collectors = new Map(); // questionId -> { submissions: Map<workerId, answer>, quorumSize, finished, finish, escalation? }
 
 const REPUTATION_PREFIX = 'rep:';
 // A single durable list of every workerId that has ever had an outcome
@@ -168,9 +172,25 @@ function writeSse(res, event, data) {
  * that, not just "a bigger quorum." Still fails open: never lets the
  * established-only pool drop below quorumSize's worth of recipients, since
  * a starved quorum is a worse outcome than one with a fresh worker in it.
+ *
+ * `whitelist` (a payer's private pool — see privatePools.js) is the one
+ * filter here that deliberately FAILS CLOSED. Every other filter is a soft
+ * routing preference, so falling back to a wider pool beats stranding the
+ * question. A private pool is a hard requirement the payer explicitly asked
+ * for; falling back to the open pool would quietly defeat the feature and
+ * send their question to exactly the workers they excluded. So it runs
+ * first, and when no whitelisted worker is online this returns [] (the
+ * caller refunds rather than broadcasting). The soft filters below still
+ * fail open, but only as far as the whitelisted set, never past it.
  */
-async function selectTargets(category, { preferEstablished = false, quorumSize = 0 } = {}) {
+async function selectTargets(category, { preferEstablished = false, quorumSize = 0, whitelist = null } = {}) {
   let targets = [...workers.entries()];
+
+  if (whitelist) {
+    const allowed = new Set(whitelist);
+    targets = targets.filter(([id]) => allowed.has(id));
+    if (targets.length === 0) return [];
+  }
 
   if (category) {
     const norm = normalizeCategory(category);

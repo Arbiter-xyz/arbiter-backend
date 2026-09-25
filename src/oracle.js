@@ -1,19 +1,43 @@
 import { nextQuestionId, stashQuestion, getStashedQuestion, dropStashedQuestion } from './pendingQuestions.js';
 import { createJob, updateJob, getJob, claimJob } from './jobs.js';
-import { dispatchAndCollect, recordOutcome, getSmoothedOnlineWorkerCount } from './dispatch.js';
+import { dispatchAndCollect, recordOutcome, getSmoothedOnlineWorkerCount, hasOnlineWhitelistedWorker } from './dispatch.js';
 import { reconcile, draftAnswer } from './reconcile.js';
 import { resolveQuestion, refundQuestion, getQuestionOnChain } from './stellarClient.js';
-import { resolveTier, listTiersForClient, stroopsToUsdc, priceForTier } from './pricing.js';
+import { resolveTier, listTiersForClient, stroopsToUsdc, priceForTier, effectiveEscalatedPriceStroops } from './pricing.js';
 import { incrementStat } from './stats.js';
 import { recordPayerQuestion } from './payerIndex.js';
+import { getPrivatePool } from './privatePools.js';
 import { notifyWorker } from './push.js';
 import { jobLogger } from './logger.js';
 import { store } from './store.js';
 import { config } from './config.js';
+import { undoWindowFor, holdThenDispatch, cancelHeld } from './undoWindow.js';
+import { verifySessionToken } from './workerAuth.js';
+import { restoreCredit } from './billing.js';
 
 const IDEMPOTENCY_PREFIX = 'idempotency:';
+// Who may cancel an API-key-funded job. Kept out of the job record itself,
+// which GET /oracle/:jobId returns verbatim to anyone holding the jobId.
+const JOB_OWNER_PREFIX = 'job-owner:';
 
-export async function issueChallenge(questionText, tierKey, category) {
+/**
+ * `consensusRule` is a validated rule from consensus.js's
+ * parseConsensusRule(), or null for the default exact-match mode. Only a
+ * non-default rule adds fields to the stash and the response, so the
+ * default path's records are unchanged.
+ */
+export function consensusStashFields(consensusRule) {
+  if (!consensusRule) return {};
+  return { consensusMode: consensusRule.mode, consensusTolerance: consensusRule.tolerance };
+}
+
+/** Rebuilds the rule reconcile() takes from a stashed pending question. */
+export function consensusRuleFromPending(pending) {
+  if (!pending?.consensusMode || pending.consensusMode === DEFAULT_CONSENSUS_MODE) return null;
+  return { mode: pending.consensusMode, tolerance: pending.consensusTolerance };
+}
+
+export async function issueChallenge(questionText, tierKey, category, consensusRule = null) {
   const questionId = (await nextQuestionId()).toString();
   // Price is snapshotted NOW, at quote time, from a SMOOTHED (trailing-
   // average) worker-supply signal rather than the instantaneous online
@@ -34,6 +58,7 @@ export async function issueChallenge(questionText, tierKey, category) {
     timeoutMs: priced.timeoutMs,
     category: category || null,
     createdAt: Date.now(),
+    ...consensusStashFields(consensusRule),
   });
 
   return {
@@ -48,6 +73,7 @@ export async function issueChallenge(questionText, tierKey, category) {
     tiers: listTiersForClient(),
     quorumSize: priced.quorumSize,
     timeoutMs: priced.timeoutMs,
+    ...consensusStashFields(consensusRule),
     autoRefundAfterLedgers: config.timeoutLedgers,
     instructions:
       `Call submit(payer, ${questionId}, ${priced.priceStroops.toString()}) on contract ${config.contractId}, ` +
@@ -69,14 +95,14 @@ export async function issueChallenge(questionText, tierKey, category) {
  * questionId itself is already a natural idempotency key there (see
  * startFulfillment's claimJob() usage).
  */
-export async function issueChallengeIdempotent(questionText, tierKey, category, idempotencyKey) {
-  if (!idempotencyKey) return issueChallenge(questionText, tierKey, category);
+export async function issueChallengeIdempotent(questionText, tierKey, category, idempotencyKey, consensusRule = null) {
+  if (!idempotencyKey) return issueChallenge(questionText, tierKey, category, consensusRule);
 
   const cacheKey = IDEMPOTENCY_PREFIX + idempotencyKey;
   const cached = await store.get(cacheKey);
   if (cached) return cached;
 
-  const challenge = await issueChallenge(questionText, tierKey, category);
+  const challenge = await issueChallenge(questionText, tierKey, category, consensusRule);
   await store.set(cacheKey, challenge, config.pendingQuestionTtlMs);
   return challenge;
 }
@@ -126,12 +152,22 @@ export async function verifyPayment(questionId) {
  * recordPayerQuestion — centralized here, the one place both the classic
  * submit()-based flow (verifyPayment) and the prepaid-balance flow
  * (askMetered) converge, instead of duplicated in each caller.
+ *
+ * Non-instant tiers are first held for the undo window (see undoWindow.js)
+ * in status 'holding'; dispatch only starts once the hold elapses without
+ * a cancelJob() claiming the job first. `apiKeyAccountId` marks a job
+ * funded through the API-key path, whose `payerAddress` is the platform's
+ * pooled fiat address — it's what cancelJob() authenticates against there.
  */
-export async function startFulfillment(questionId, pending, tier, payerAddress) {
+export async function startFulfillment(questionId, pending, tier, payerAddress, { apiKeyAccountId } = {}) {
   const claimed = await claimJob(questionId);
   if (!claimed) return { jobId: questionId };
 
+  const holdMs = undoWindowFor(tier);
+  const cancellableUntil = holdMs > 0 ? Date.now() + holdMs : null;
+
   await createJob(questionId, {
+    ...(cancellableUntil ? { status: 'holding', cancellableUntil } : {}),
     question: pending.question,
     tier: tier.key,
     quorumSize: tier.quorumSize,
@@ -139,10 +175,35 @@ export async function startFulfillment(questionId, pending, tier, payerAddress) 
     amountStroops: tier.priceStroops.toString(),
     amount: stroopsToUsdc(tier.priceStroops),
     payer: payerAddress || null,
+    // What rule reconcile() will apply, visible on GET /oracle/:jobId.
+    consensusMode: pending.consensusMode || DEFAULT_CONSENSUS_MODE,
+    ...(pending.consensusTolerance ? { consensusTolerance: pending.consensusTolerance } : {}),
   });
 
+  if (apiKeyAccountId) {
+    await store.set(JOB_OWNER_PREFIX + questionId, { apiKeyAccountId }, config.jobResultTtlMs);
+  }
   if (payerAddress) await recordPayerQuestion(payerAddress, questionId);
 
+  if (!cancellableUntil) {
+    runFulfillment(questionId, pending, tier);
+    return { jobId: questionId };
+  }
+
+  holdThenDispatch(
+    questionId,
+    holdMs,
+    async () => {
+      await updateJob(questionId, { status: 'awaiting_workers', cancellableUntil: null, dispatchedAt: Date.now() });
+      runFulfillment(questionId, pending, tier);
+    },
+    (err) => jobLogger(questionId).error({ err }, 'failed to start dispatch after the undo window'),
+  );
+
+  return { jobId: questionId, cancellableUntil };
+}
+
+function runFulfillment(questionId, pending, tier) {
   fulfillOracleCall(questionId, pending, tier).catch((err) => {
     // fulfillOracleCall is written to always settle the escrow before
     // returning; this catch is a last-resort net so a bug there can't leave
@@ -155,12 +216,100 @@ export async function startFulfillment(questionId, pending, tier, payerAddress) 
       autoRefundAfterLedgers: config.timeoutLedgers,
     }).catch(() => {});
   });
+}
 
-  return { jobId: questionId };
+/**
+ * Cancels a paid question inside its undo window and refunds it through
+ * settleRefunded() — the exact refund()/refund_pending_timeout path every
+ * other refund takes, not a parallel one.
+ *
+ * Who may cancel: whoever paid, proven the same way every other
+ * payer-scoped route proves it.
+ *  - Classic submit() flow and the prepaid/metered flow: a session token
+ *    for the job's `payer` address (POST /payers/:address/session). For the
+ *    classic flow the payer is only known once verifyPayment() reads it off
+ *    the on-chain Question, so this is the one proof that works for both —
+ *    the canceller signs the same throwaway challenge workerAuth.js uses.
+ *  - API-key flow: the same API key that asked. Its on-chain payer is the
+ *    platform's pooled fiat address, so a session token can't identify the
+ *    customer there; the refund returns to the pool and the customer's
+ *    credit is restored here. That credit is restored even if refund()
+ *    itself fails, because a cancelled job is never dispatched and so can
+ *    never be resolve()d — its escrow can only ever go back to the pool,
+ *    via refund() now or refund_timeout() later.
+ *
+ * Returns `{ ok: true, job }` or `{ ok: false, status, error }`. Never
+ * races dispatch: undoWindow.js's atomic decision claim guarantees exactly
+ * one of "cancel" or "dispatch" wins, so a cancel that loses gets a 409
+ * instead of refunding a question workers are already answering.
+ */
+export async function cancelJob(jobId, { sessionToken, apiKeyAccountId } = {}) {
+  const job = await getJob(jobId);
+  if (!job || job.sandbox) return { ok: false, status: 404, error: 'unknown or expired jobId' };
+
+  const owner = await store.get(JOB_OWNER_PREFIX + jobId);
+  const authorized = owner?.apiKeyAccountId
+    ? Boolean(apiKeyAccountId) && apiKeyAccountId === owner.apiKeyAccountId
+    : Boolean(job.payer) && verifySessionToken(sessionToken) === job.payer;
+  if (!authorized) {
+    return {
+      ok: false,
+      status: 401,
+      error: owner?.apiKeyAccountId
+        ? 'the API key that asked this question is required to cancel it'
+        : "a valid session token for this job's payer is required — see POST /payers/:address/session",
+    };
+  }
+
+  if (job.tier === 'instant') {
+    return { ok: false, status: 409, error: 'instant-tier questions have no undo window' };
+  }
+  if (job.status !== 'holding') {
+    return { ok: false, status: 409, error: notCancellableReason(job.status) };
+  }
+
+  const { cancelled } = await cancelHeld(jobId, async () => {
+    await updateJob(jobId, { status: 'cancelling', cancellableUntil: null, cancelledAt: Date.now() });
+    await settleRefunded(
+      jobId,
+      [],
+      {
+        consensus: null,
+        confidence: 0,
+        matchingWorkerIds: [],
+        method: 'cancelled-by-payer',
+        reason: 'cancelled by the payer during the undo window',
+      },
+      { cancelledByPayer: true },
+    );
+    if (owner?.apiKeyAccountId) await restoreCredit(owner.apiKeyAccountId, Number(job.amountStroops));
+  });
+
+  if (!cancelled) return { ok: false, status: 409, error: notCancellableReason('awaiting_workers') };
+  return { ok: true, job: await getJob(jobId) };
+}
+
+function notCancellableReason(status) {
+  if (status === 'settled') return 'this question has already settled';
+  if (status === 'cancelling') return 'this question is already being cancelled';
+  return 'already dispatched to workers — the undo window has closed';
 }
 
 export async function getJobStatus(questionId) {
   return getJob(questionId);
+}
+
+/**
+ * Whether a human-quorum question should get an LLM draft sent to workers
+ * as a prefill suggestion. Pure (settings are a parameter, defaulting to
+ * config) so every combination is testable despite config being frozen at
+ * load — same reason stakeGateAllows() exists as its own function. Never
+ * for `instant`, which already drafts and settles on its own.
+ */
+export function shouldDraftSuggestion(tier, settings = { ...config.draftSuggestions, apiKey: config.anthropicApiKey }) {
+  if (!tier || tier.instant) return false;
+  if (!settings.enabled || !settings.apiKey) return false;
+  return settings.tiers.includes(tier.key);
 }
 
 async function fulfillOracleCall(questionId, pending, tier) {
@@ -168,13 +317,24 @@ async function fulfillOracleCall(questionId, pending, tier) {
     return fulfillInstant(questionId, pending);
   }
 
+  // Started concurrently with dispatch, never awaited here — the suggestion
+  // is additive, so it can't be allowed to delay or fail the broadcast (see
+  // dispatchAndCollect's `suggestion` option for the delivery side).
+  // draftAnswer() never throws and resolves null on any failure.
+  const suggestion = shouldDraftSuggestion(tier)
+    ? draftAnswer(pending.question, questionId, { purpose: 'worker-suggestion' })
+    : undefined;
+
   let submissions = [];
+  // Only set for escalating tiers; see dispatchEscalating's return shape.
+  let escalated = null;
   try {
     submissions = await dispatchAndCollect(questionId, pending.question, {
       quorumSize: tier.quorumSize,
       timeoutMs: tier.timeoutMs,
       category: pending.category,
       preferEstablished: tier.preferEstablished,
+      suggestion,
     });
   } catch (err) {
     // dispatchAndCollect is designed to never reject, but guard anyway — an
@@ -186,7 +346,17 @@ async function fulfillOracleCall(questionId, pending, tier) {
 
   await updateJob(questionId, { status: 'reconciling', totalAnswers: submissions.length });
 
-  const result = await reconcile(pending.question, submissions, questionId);
+  const result = await reconcile(pending.question, submissions, questionId, consensusRuleFromPending(pending));
+
+  // A lone answer has no peers to be reconciled against, so reconcile()'s
+  // "unanimous + established" fast path reports confidence 1 for it. Settling
+  // on one worker must not get to skip the confidence bar by construction:
+  // cap it at the confidence dispatch actually had in that worker, so the
+  // shouldResolve / MIN_CONFIDENCE gate below judges the real number, exactly
+  // as it does for every other path.
+  if (escalated && submissions.length === 1 && escalated.confidence !== null) {
+    result.confidence = Math.min(result.confidence, escalated.confidence);
+  }
 
   const shouldResolve =
     submissions.length > 0 && result.matchingWorkerIds.length > 0 && result.confidence >= config.minConfidence;
@@ -195,6 +365,32 @@ async function fulfillOracleCall(questionId, pending, tier) {
     await settleResolved(questionId, submissions, result);
   } else {
     await settleRefunded(questionId, submissions, result);
+  }
+}
+
+/**
+ * Persists what an escalating question really cost — recruited-worker count,
+ * final quorum target, and the effective price against the ceiling that was
+ * charged — on the job record (surfaced by GET /oracle/:jobId and the admin
+ * console), then lets the caller refund the difference if its billing flow
+ * can (see startFulfillment). `amountStroops` stays the amount actually
+ * charged; `effectiveAmountStroops` is what the recruited quorum was worth.
+ */
+async function recordEscalationCost(questionId, tier, escalated, hooks) {
+  const effective = effectiveEscalatedPriceStroops(tier, escalated.recruitedWorkers);
+  await updateJob(questionId, {
+    recruitedWorkers: escalated.recruitedWorkers,
+    quorumSizeUsed: escalated.finalQuorumSize,
+    dispatchSettledBy: escalated.settledBy,
+    effectiveAmountStroops: effective.toString(),
+    effectiveAmount: stroopsToUsdc(effective),
+  });
+  if (hooks.onEffectiveCost) {
+    try {
+      await hooks.onEffectiveCost(effective);
+    } catch (err) {
+      jobLogger(questionId).error({ err }, 'onEffectiveCost hook failed');
+    }
   }
 }
 
@@ -332,7 +528,7 @@ async function settleResolved(questionId, submissions, result) {
   }
 }
 
-async function settleRefunded(questionId, submissions, result) {
+async function settleRefunded(questionId, submissions, result, extraJobFields = {}) {
   const hash = await refundQuestion(questionId)
     .then((r) => r.hash)
     .catch((err) => {
@@ -362,6 +558,7 @@ async function settleRefunded(questionId, submissions, result) {
     totalAnswers: submissions.length,
     refundTx: hash,
     ...(hash ? {} : { autoRefundAfterLedgers: config.timeoutLedgers }),
+    ...extraJobFields,
   });
 }
 
