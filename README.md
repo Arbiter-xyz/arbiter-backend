@@ -33,6 +33,18 @@ build narrative live in the archived
   logging with request/job correlation, idempotent job creation, and
   bounded retry/timeout on every external call (Claude, Soroban RPC,
   Horizon).
+- **Private worker pools** (`privatePools.js`) — a payer can whitelist
+  worker addresses (`GET`/`POST /payers/:address/pool`,
+  `DELETE /payers/:address/pool/:worker`, session-token gated). Their
+  questions then go only to, and only take answers from, those workers.
+  This **fails closed**: if no whitelisted worker is online, the question
+  is refunded rather than sent to the open pool. Payers without a pool
+  are unaffected.
+- **Configurable consensus rules** (`consensus.js`) — `consensusMode:
+  'numeric-tolerance'` with `tolerance: { percent }` or `{ absolute }` on
+  `POST /oracle` makes numeric answers ("42", "$42.00", "about 42") within
+  tolerance count as agreeing, without a Claude call. The default `'exact'`
+  mode is unchanged. The rule used is shown on `GET /oracle/:jobId`.
 - Cryptographic worker session auth (`workerAuth.js`) — an address-format
   `workerId` must prove control of that key before submitting an answer.
 - A read-only admin/ops console (`/admin/*`, bearer-token gated) —
@@ -48,6 +60,27 @@ build narrative live in the archived
   same `chargeBalance()` path the wallet-based prepaid flow already uses.
   Credit reservations are atomic and webhook delivery is idempotent per
   Stripe event id.
+- **Answer provenance ([docs/provenance.md](docs/provenance.md))**: every
+  settled question commits (sha256 over canonical JSON) to its raw worker
+  submissions and any LLM prompt/response before `resolve()`/`refund()`
+  is sent. The record is public at `GET /oracle/:jobId/provenance`, and
+  `scripts/verify-provenance.js` lets anyone re-derive the consensus and
+  check it against the on-chain payout.
+- **Startup security-posture check (`securityPosture.js`)**: a deployment
+  that looks like production refuses to start without `SESSION_SECRET`,
+  and logs a loud error for wide-open `ALLOWED_ORIGINS` or a non-TLS
+  `REDIS_URL`. Local dev with every default left alone stays silent.
+
+## Client SDKs
+
+First-party clients for the agent-facing API (ask → pay → poll, payer
+session auth, the undo window, and the public reads), each with its own
+README, tests, and changelog:
+
+- **TypeScript / JavaScript**: [`sdk/typescript`](sdk/typescript) (`@arbiter-xyz/sdk`), for Node 18+ and browsers
+- **Python**: [`sdk/python`](sdk/python) (`arbiter-sdk`), for Python 3.9+
+
+Both can be tried against `POST /oracle/sandbox` with no wallet at all.
 
 ## Webhooks
 
@@ -138,3 +171,18 @@ predates this repo's split; see "Round 6" in the archived
 [`arbiter`](https://github.com/rudeus112266/arbiter) monorepo README for
 the full write-up, including two real bugs that live infrastructure
 surfaced and mocked tests never could.)
+
+### Running the full stack locally
+
+To run the contract, this backend, and the app together (deploy the
+contract to testnet, point this backend at it, point the app at this
+backend, then run a real paid question end to end), see
+**[docs/local-full-stack.md](docs/local-full-stack.md)**. It's the single
+cross-repo guide, and it pins contract/app versions known to work with this
+backend.
+
+### Capacity
+
+Load-test tooling (`scripts/loadtest.js`), measured limits, and the current
+bottleneck (serialized on-chain settlement) are in
+[docs/capacity/README.md](docs/capacity/README.md).

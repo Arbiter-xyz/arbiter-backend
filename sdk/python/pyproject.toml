@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "arbiter-sdk"
+version = "0.1.0"
+description = "First-party Python client for the Arbiter human-intelligence oracle API"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+dependencies = ["httpx>=0.25,<1"]
+keywords = ["arbiter", "oracle", "stellar", "soroban", "agents", "http-402"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Typing :: Typed",
+    "Intended Audience :: Developers",
+]
+
+[project.optional-dependencies]
+stellar = ["stellar-sdk>=9"]
+dev = ["pytest>=8", "stellar-sdk>=9"]
+
+[project.urls]
+Source = "https://github.com/Arbiter-xyz/arbiter-backend/tree/main/sdk/python"
+Changelog = "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/sdk/python/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arbiter_sdk"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

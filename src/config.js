@@ -21,6 +21,44 @@ function sessionSecret() {
 }
 const SESSION_SECRET = sessionSecret();
 
+// Per-customer outbound webhook retry policy (#154). Shaped like retry.js's
+// withRetry(fn, { attempts, baseDelayMs, ... }) options so the delivery
+// worker from #56 reuses that exponential-backoff algorithm rather than a
+// second one. These are the bounds a customer's policy is validated against
+// at configuration time — out-of-range values are rejected, never silently
+// clamped at delivery time.
+export const WEBHOOK_RETRY_POLICY_BOUNDS = Object.freeze({
+  minAttempts: 1,
+  maxAttempts: 10,
+  minBaseDelayMs: 100,
+  // Caps the retry window so a customer can't configure an effectively
+  // infinite loop that pins delivery-worker resources indefinitely.
+  maxBaseDelayMs: 60_000,
+});
+
+// Baseline policy #56 ships with when a customer has no policy configured.
+// Matches the existing bounded-retry posture in retry.js.
+export const DEFAULT_WEBHOOK_RETRY_POLICY = Object.freeze({
+  attempts: 2,
+  baseDelayMs: 1_000,
+});
+
+// Validates a customer-supplied retry policy at configuration time. Returns
+// the normalized policy, or throws with a clear message for out-of-range
+// values (negative attempts, absurdly large backoff, non-integers).
+export function validateWebhookRetryPolicy(policy) {
+  if (policy === undefined || policy === null) return { ...DEFAULT_WEBHOOK_RETRY_POLICY };
+  const { attempts, baseDelayMs } = policy;
+  const b = WEBHOOK_RETRY_POLICY_BOUNDS;
+  if (!Number.isInteger(attempts) || attempts < b.minAttempts || attempts > b.maxAttempts) {
+    throw new Error(`webhook retry policy: attempts must be an integer in [${b.minAttempts}, ${b.maxAttempts}], got ${attempts}`);
+  }
+  if (!Number.isInteger(baseDelayMs) || baseDelayMs < b.minBaseDelayMs || baseDelayMs > b.maxBaseDelayMs) {
+    throw new Error(`webhook retry policy: baseDelayMs must be an integer in [${b.minBaseDelayMs}, ${b.maxBaseDelayMs}], got ${baseDelayMs}`);
+  }
+  return { attempts, baseDelayMs };
+}
+
 export const config = Object.freeze({
   port: num(process.env.PORT, 4000),
   horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
@@ -44,8 +82,29 @@ export const config = Object.freeze({
 
   minConfidence: num(process.env.MIN_CONFIDENCE, 0.6),
 
+  // Undo window (see undoWindow.js): how long a paid, non-instant question
+  // is held after payment before it's dispatched to workers, during which
+  // the payer can POST /oracle/:jobId/cancel for a refund. 0 disables it.
+  undoWindowMs: num(process.env.UNDO_WINDOW_MS, 8_000),
+
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
   anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-sonnet-5',
+
+  // Draft-answer suggestions for human-quorum tiers (see oracle.js's
+  // shouldDraftSuggestion): one extra Claude call per dispatched question,
+  // delivered to workers as an unverified prefill. Opt-in, off by default:
+  // it adds real per-question Claude spend, and a visible draft can anchor
+  // workers toward the LLM's answer instead of their own independent one —
+  // a trade-off an operator should choose deliberately, not inherit.
+  draftSuggestions: Object.freeze({
+    enabled: process.env.DRAFT_SUGGESTIONS_ENABLED === 'true',
+    tiers: Object.freeze(
+      (process.env.DRAFT_SUGGESTION_TIERS || 'standard,express,priority')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
+  }),
 
   pendingQuestionTtlMs: num(process.env.PENDING_QUESTION_TTL_MS, 600_000),
   jobResultTtlMs: num(process.env.JOB_RESULT_TTL_MS, 3_600_000),
@@ -61,6 +120,15 @@ export const config = Object.freeze({
   // directly); anything else pretty-prints for local dev readability.
   logFormat: process.env.LOG_FORMAT || 'pretty',
   logLevel: process.env.LOG_LEVEL || 'info',
+
+  // Response security headers (see securityHeaders.js). CSP_CONNECT_SRC is a
+  // comma-separated list of extra origins the frontend may fetch()/stream
+  // from — only needed when the UI is hosted on a different origin than
+  // this API. HSTS_ENABLED=false turns off Strict-Transport-Security.
+  securityHeaders: Object.freeze({
+    connectSrc: (process.env.CSP_CONNECT_SRC || '').split(',').map((s) => s.trim()).filter(Boolean),
+    hsts: process.env.HSTS_ENABLED !== 'false',
+  }),
 
   maxQuestionLength: num(process.env.MAX_QUESTION_LENGTH, 2000),
   maxAnswerLength: num(process.env.MAX_ANSWER_LENGTH, 2000),
@@ -138,6 +206,14 @@ export const config = Object.freeze({
     // How long a worker's session (proven once via a signed challenge
     // transaction) stays valid before they'd need to re-authenticate.
     ttlMs: num(process.env.WORKER_SESSION_TTL_MS, 12 * 60 * 60 * 1000),
+    // Graceful rotation: the set of secrets currently valid for verifying a
+    // session token (current first, then the prior secret while the grace
+    // window is open). Verification must accept a match from any of these;
+    // signing always uses `secret`. Empty/absent previous secret or a 0
+    // grace window yields a single-element list — identical to today.
+    secrets: sessionSecrets,
+    // Length of the rotation grace window in ms (0 = disabled).
+    rotationGraceMs: SESSION_SECRET_ROTATION_GRACE_MS,
   }),
 
   // Single shared operator secret for the /admin/* console — this codebase

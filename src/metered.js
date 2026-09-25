@@ -2,7 +2,7 @@ import { nextQuestionId, stashQuestion } from './pendingQuestions.js';
 import { priceForTier, listTiersForClient, stroopsToUsdc } from './pricing.js';
 import { getSmoothedOnlineWorkerCount } from './dispatch.js';
 import { chargeBalance, getBalanceOnChain } from './stellarClient.js';
-import { startFulfillment } from './oracle.js';
+import { startFulfillment, consensusStashFields } from './oracle.js';
 import { config } from './config.js';
 
 /**
@@ -14,6 +14,10 @@ import { config } from './config.js';
  * (charge() drawing down a balance, vs. the payer calling submit()
  * themselves) — everything downstream (dispatch, reconcile, resolve/
  * refund) is the identical pipeline, unaware of which path funded it.
+ *
+ * `apiKeyAccountId` is set only for the API-key path, where `payerAddress`
+ * is the platform's pooled fiat address rather than the caller's own — it
+ * records who may cancel the job during the undo window (see cancelJob).
  *
  * Authentication is the caller's responsibility: `payerAddress` must have
  * already proven control of that address via the same challenge/response
@@ -38,6 +42,7 @@ export async function askMetered(payerAddress, questionText, tierKey, category, 
     timeoutMs: priced.timeoutMs,
     category: category || null,
     createdAt: Date.now(),
+    ...consensusStashFields(consensusRule),
   };
   await stashQuestion(questionId, pending);
 
@@ -46,6 +51,7 @@ export async function askMetered(payerAddress, questionText, tierKey, category, 
 
   return {
     jobId,
+    ...(cancellableUntil ? { cancellableUntil, cancelUrl: `/oracle/${jobId}/cancel` } : {}),
     questionId,
     tier: priced.key,
     amount: stroopsToUsdc(priced.priceStroops),

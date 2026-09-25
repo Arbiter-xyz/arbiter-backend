@@ -447,6 +447,24 @@ describe('sandbox mode over real HTTP', () => {
     assert.equal(job.sandbox, true);
     assert.equal(job.outcome, 'resolved');
   });
+
+  test('POST /oracle/:jobId/cancel is wired up: unknown jobs 404, sandbox jobs are not cancellable', async () => {
+    const unknown = await fetch(`${base}/oracle/does-not-exist/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: 'x' }),
+    });
+    assert.equal(unknown.status, 404);
+
+    const sandboxRes = await fetch(`${base}/oracle/sandbox`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: 'can I cancel a sandbox job?' }),
+    });
+    const { jobId } = await sandboxRes.json();
+    const cancelRes = await fetch(`${base}/oracle/${jobId}/cancel`, { method: 'POST' });
+    assert.equal(cancelRes.status, 404, 'sandbox jobs have no payment to refund');
+  });
 });
 
 describe('sandbox rate limiting (isolated server so its counter is not shared with other sandbox tests)', () => {
@@ -580,5 +598,126 @@ describe('Idempotency-Key header on POST /oracle over real HTTP', () => {
     // wiring reaches it over HTTP.
     const pollRes = await fetch(`${base}/oracle/${jobId}`);
     assert.ok([200, 202].includes(pollRes.status), `expected 200 or 202, got ${pollRes.status}`);
+  });
+});
+
+describe('private worker pool routes and consensusMode validation over real HTTP', () => {
+  let server;
+  let base;
+
+  before(async () => {
+    server = startServer({ NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015', PUSH_RATE_LIMIT_MAX: '100' });
+    await server.ready;
+    base = `http://localhost:${server.port}`;
+  });
+
+  after(() => server.child.kill());
+
+  async function getSession(keypair) {
+    const challengeRes = await fetch(`${base}/payers/${keypair.publicKey()}/session/challenge`, { method: 'POST' });
+    const { xdr } = await challengeRes.json();
+    const tx = new Transaction(xdr, 'Test SDF Network ; September 2015');
+    tx.sign(keypair);
+    const sessionRes = await fetch(`${base}/payers/${keypair.publicKey()}/session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ signedXdr: tx.toXDR() }),
+    });
+    return (await sessionRes.json()).token;
+  }
+
+  const addWorkers = (payer, token, workers) =>
+    fetch(`${base}/payers/${payer}/pool`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token, workers }),
+    });
+
+  test('the owner can add, list, and remove pool workers', async () => {
+    const payer = Keypair.random();
+    const token = await getSession(payer);
+    const [w1, w2] = [Keypair.random().publicKey(), Keypair.random().publicKey()];
+
+    const addRes = await addWorkers(payer.publicKey(), token, [w1, w2]);
+    assert.equal(addRes.status, 200);
+    assert.deepEqual((await addRes.json()).workers, [w1, w2]);
+
+    const listRes = await fetch(`${base}/payers/${payer.publicKey()}/pool?token=${encodeURIComponent(token)}`);
+    assert.equal(listRes.status, 200);
+    const listed = await listRes.json();
+    assert.deepEqual(listed.workers, [w1, w2]);
+    assert.equal(listed.size, 2);
+
+    const delRes = await fetch(`${base}/payers/${payer.publicKey()}/pool/${w1}?token=${encodeURIComponent(token)}`, { method: 'DELETE' });
+    assert.equal(delRes.status, 200);
+    assert.deepEqual((await delRes.json()).workers, [w2]);
+  });
+
+  test('a different payer\'s session cannot read or modify the pool', async () => {
+    const victim = Keypair.random();
+    const attacker = Keypair.random();
+    const victimToken = await getSession(victim);
+    const attackerToken = await getSession(attacker);
+    const w = Keypair.random().publicKey();
+    await addWorkers(victim.publicKey(), victimToken, [w]);
+
+    const readRes = await fetch(`${base}/payers/${victim.publicKey()}/pool?token=${encodeURIComponent(attackerToken)}`);
+    assert.equal(readRes.status, 401);
+    const addRes = await addWorkers(victim.publicKey(), attackerToken, [Keypair.random().publicKey()]);
+    assert.equal(addRes.status, 401);
+    const delRes = await fetch(`${base}/payers/${victim.publicKey()}/pool/${w}?token=${encodeURIComponent(attackerToken)}`, { method: 'DELETE' });
+    assert.equal(delRes.status, 401);
+
+    const check = await fetch(`${base}/payers/${victim.publicKey()}/pool?token=${encodeURIComponent(victimToken)}`);
+    assert.deepEqual((await check.json()).workers, [w], 'pool unchanged by the rejected calls');
+  });
+
+  test('missing or garbage tokens are rejected with 401', async () => {
+    const payer = Keypair.random().publicKey();
+    assert.equal((await fetch(`${base}/payers/${payer}/pool`)).status, 401);
+    assert.equal((await addWorkers(payer, undefined, [Keypair.random().publicKey()])).status, 401);
+    assert.equal((await addWorkers(payer, 'not.a-token', [Keypair.random().publicKey()])).status, 401);
+  });
+
+  test('a non-address pool owner is rejected (no test-string convenience for pools)', async () => {
+    const res = await fetch(`${base}/payers/demo-payer/pool`);
+    assert.equal(res.status, 400);
+  });
+
+  test('invalid worker addresses are rejected with 400', async () => {
+    const payer = Keypair.random();
+    const token = await getSession(payer);
+    assert.equal((await addWorkers(payer.publicKey(), token, ['demo-worker-1'])).status, 400);
+    assert.equal((await addWorkers(payer.publicKey(), token, [])).status, 400);
+    assert.equal((await addWorkers(payer.publicKey(), token, 'GABC')).status, 400);
+    const delRes = await fetch(`${base}/payers/${payer.publicKey()}/pool/not-an-address?token=${encodeURIComponent(token)}`, { method: 'DELETE' });
+    assert.equal(delRes.status, 400);
+  });
+
+  test('POST /oracle rejects an unknown consensusMode or a malformed tolerance with 400', async () => {
+    for (const body of [
+      { question: 'How many?', consensusMode: 'majority' },
+      { question: 'How many?', consensusMode: 'numeric-tolerance', tolerance: { percent: 500 } },
+      { question: 'How many?', tolerance: { absolute: 1 } },
+    ]) {
+      const res = await fetch(`${base}/oracle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      assert.equal(res.status, 400, JSON.stringify(body));
+    }
+  });
+
+  test('POST /oracle with a valid numeric-tolerance rule gets the normal 402, echoing the rule', async () => {
+    const res = await fetch(`${base}/oracle`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: 'How many?', consensusMode: 'numeric-tolerance', tolerance: { percent: 1 } }),
+    });
+    assert.equal(res.status, 402);
+    const body = await res.json();
+    assert.equal(body.consensusMode, 'numeric-tolerance');
+    assert.deepEqual(body.consensusTolerance, { percent: 1 });
   });
 });

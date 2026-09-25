@@ -4,13 +4,18 @@ import { checkRateLimit } from './rateLimit.js';
 import { getPushEligibleWorkerIds, notifyWorker } from './push.js';
 import { getStakeOnChain, touchWorker } from './stellarClient.js';
 import { jobLogger, logger } from './logger.js';
+import { trace, context, propagation, SpanKind, SpanStatusCode } from '@opentelemetry/api';
 
 // Live worker registry — inherently process-local because it holds open SSE
 // response objects (see the multi-instance caveat in store.js).
 const workers = new Map(); // workerId -> { res, categories: Set<string>, connectedAt }
 
 // Per-question quorum collector, also process-local for the same reason.
-const collectors = new Map(); // questionId -> { submissions: Map<workerId, answer>, quorumSize, finished, finish }
+// `quorumSize` is the CURRENT target and is mutable: fixed-quorum questions
+// never change it, escalating ones (see dispatchEscalating) grow it mid-flight.
+// `escalation`, present only on escalating questions, holds the extra state
+// for that mode; fixed-quorum collectors leave it undefined.
+const collectors = new Map(); // questionId -> { submissions: Map<workerId, answer>, quorumSize, finished, finish, escalation? }
 
 const REPUTATION_PREFIX = 'rep:';
 // A single durable list of every workerId that has ever had an outcome
@@ -22,6 +27,40 @@ const REPUTATION_PREFIX = 'rep:';
 // to avoid, not a real capacity concern at this scale.
 const WORKER_INDEX_KEY = 'known-worker-ids';
 const MAX_TRACKED_WORKERS = 5_000;
+
+// Distributed tracing: the trace ID is generated once at question-creation
+// time (see jobs.js) and threaded through every subsequent system boundary —
+// the backend job pipeline, SSE dispatch to workers, and the on-chain Soroban
+// settlement transaction — so a single trace ID reconstructs the whole
+// lifecycle. The traceparent is carried in the SSE payload and echoed back on
+// worker answers, letting the collector re-enter the same trace context.
+const TRACER_NAME = 'handsoff.dispatch';
+
+function tracer() {
+  return trace.getTracer(TRACER_NAME);
+}
+
+/**
+ * Extract a W3C traceparent (or any configured propagator carrier) into an
+ * OpenTelemetry context. Returns the active context when no carrier is
+ * present so callers can always run inside *some* context.
+ */
+export function contextFromTraceparent(traceparent) {
+  if (!traceparent) return context.active();
+  return propagation.extract(context.active(), { traceparent });
+}
+
+/**
+ * Serialize the currently-active span's context into a W3C traceparent so it
+ * can cross a boundary that has no native tracing concept — an SSE frame, a
+ * durable job record, or a Soroban transaction memo. This is the single
+ * primitive that makes the on-chain transaction part of the same trace.
+ */
+export function currentTraceparent() {
+  const carrier = {};
+  propagation.inject(context.active(), carrier);
+  return carrier.traceparent;
+}
 
 export function onlineWorkerCount() {
   return workers.size;
@@ -133,9 +172,25 @@ function writeSse(res, event, data) {
  * that, not just "a bigger quorum." Still fails open: never lets the
  * established-only pool drop below quorumSize's worth of recipients, since
  * a starved quorum is a worse outcome than one with a fresh worker in it.
+ *
+ * `whitelist` (a payer's private pool — see privatePools.js) is the one
+ * filter here that deliberately FAILS CLOSED. Every other filter is a soft
+ * routing preference, so falling back to a wider pool beats stranding the
+ * question. A private pool is a hard requirement the payer explicitly asked
+ * for; falling back to the open pool would quietly defeat the feature and
+ * send their question to exactly the workers they excluded. So it runs
+ * first, and when no whitelisted worker is online this returns [] (the
+ * caller refunds rather than broadcasting). The soft filters below still
+ * fail open, but only as far as the whitelisted set, never past it.
  */
-async function selectTargets(category, { preferEstablished = false, quorumSize = 0 } = {}) {
+async function selectTargets(category, { preferEstablished = false, quorumSize = 0, whitelist = null } = {}) {
   let targets = [...workers.entries()];
+
+  if (whitelist) {
+    const allowed = new Set(whitelist);
+    targets = targets.filter(([id]) => allowed.has(id));
+    if (targets.length === 0) return [];
+  }
 
   if (category) {
     const norm = normalizeCategory(category);
@@ -163,174 +218,152 @@ async function selectTargets(category, { preferEstablished = false, quorumSize =
   return established.length >= quorumSize ? established : pool;
 }
 
-export async function broadcast(questionId, questionText, { category, quorumSize, expiresInMs, preferEstablished } = {}) {
-  const payload = { questionId: questionId.toString(), question: questionText, quorumSize, expiresInMs };
-  const targets = await selectTargets(category, { preferEstablished, quorumSize });
-  for (const [, w] of targets) writeSse(w.res, 'question', payload);
-
-  // Supplement SSE with push notifications for workers who are eligible
-  // but not currently connected — only when the timeout window realistically
-  // allows time to notice, tap, and load before the quorum closes (see
-  // push.js for the honest tradeoff; short-timeout tiers skip this).
-  if (expiresInMs >= config.push.minTimeoutForPushMs) {
-    const onlineIds = new Set(targets.map(([id]) => id));
-    const offlineEligible = getPushEligibleWorkerIds(category).filter((id) => !onlineIds.has(id));
-    for (const workerId of offlineEligible) {
-      notifyWorker(workerId, {
-        title: 'New question on Arbiter',
-        body: questionText.length > 120 ? `${questionText.slice(0, 117)}...` : questionText,
-        questionId: questionId.toString(),
-      }).catch(() => {});
-    }
-  }
-
-  return targets.map(([id]) => id);
-}
-
-/**
- * Trailing-average worker supply, sampled every SUPPLY_SAMPLE_INTERVAL_MS
- * over a SUPPLY_WINDOW_SAMPLES window (~60s). Used for surge pricing
- * instead of the instantaneous onlineWorkerCount(): connecting/
- * disconnecting an SSE stream is free and instant, so pricing off the raw
- * count rewards a worker cartel that briefly disconnects right before a
- * question is asked (spiking the multiplier) and reconnects in time to
- * answer and split the now-inflated pool. Averaging over a real trailing
- * window forces that cartel to actually sit out genuine dispatch
- * opportunities for a meaningful stretch to move the price — real cost,
- * not a free instant toggle. This raises the bar; it does not eliminate
- * the incentive entirely.
- */
-const SUPPLY_SAMPLE_INTERVAL_MS = 5_000;
-const SUPPLY_WINDOW_SAMPLES = 12;
-const supplySamples = [];
-
-const supplySamplerHandle = setInterval(() => {
-  supplySamples.push(workers.size);
-  if (supplySamples.length > SUPPLY_WINDOW_SAMPLES) supplySamples.shift();
-}, SUPPLY_SAMPLE_INTERVAL_MS);
-supplySamplerHandle.unref?.();
-
-const STAKE_SAMPLE_INTERVAL_MS = 30_000;
-
-/** Refreshes stakeCache for every currently-online established worker, and
- * drops cache entries for anyone no longer online (bounded growth). Skips
- * entirely when the feature is disabled (minStakeStroops <= 0) so a default
- * deployment never pays for RPC calls it doesn't need. A failed lookup for
- * one worker just leaves their previous cached value in place — isEligible
- * fails open on a genuinely missing entry, never on a stale-but-present one. */
-async function refreshStakeCache() {
-  if (config.worker.minStakeStroops <= 0n) return;
-
-  const onlineIds = new Set(workers.keys());
-  for (const cachedId of stakeCache.keys()) {
-    if (!onlineIds.has(cachedId)) stakeCache.delete(cachedId);
-  }
-
-  await Promise.all(
-    [...onlineIds].map(async (workerId) => {
-      const rep = await getReputation(workerId);
-      if (rep.total < config.worker.minAnswersBeforeReputationGate) return;
-      try {
-        stakeCache.set(workerId, await getStakeOnChain(workerId));
-      } catch {
-        // leave whatever was cached before, if anything.
-      }
-    }),
-  );
-}
-
-const stakeSamplerHandle = setInterval(() => {
-  refreshStakeCache().catch(() => {});
-}, STAKE_SAMPLE_INTERVAL_MS);
-stakeSamplerHandle.unref?.();
-
-// Storage TTL only extends on a write that touches an entry (see
-// touch()/credit_owed()/stake() in lib.rs) — a worker who earns once and
-// never comes back to stake or withdraw again would otherwise have their
-// Owed/Stake entries silently archive off-chain storage. Sweeping once a
-// day is enormously conservative against the ~5.8-day (100_000-ledger)
-// renewal threshold the contract itself uses, while still keeping the
-// platform's per-touch() network fee bill low. Skipped entirely when no
-// admin key is configured (e.g. most test/dev runs) — same "don't pay for
-// what isn't wired up" principle as refreshStakeCache's early return.
-const TTL_SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000;
-
-async function sweepWorkerTtls() {
-  if (!config.platformSecret) return;
-
-  const knownIds = await getKnownWorkerIds();
-  await Promise.all(
-    knownIds.map(async (workerId) => {
-      try {
-        await touchWorker(workerId);
-      } catch (err) {
-        logger.warn({ err, workerId }, 'touch() TTL sweep failed for worker');
-      }
-    }),
-  );
-}
-
-const ttlSweepHandle = setInterval(() => {
-  sweepWorkerTtls().catch(() => {});
-}, TTL_SWEEP_INTERVAL_MS);
-ttlSweepHandle.unref?.();
-
-/** Pure averaging math, factored out so it's testable without waiting on
- * real timers. Falls back to the live count when no samples exist yet
- * (e.g. right after process start). */
-export function computeSmoothedCount(samples, currentCount) {
-  if (samples.length === 0) return currentCount;
-  const sum = samples.reduce((a, b) => a + b, 0);
-  return Math.round(sum / samples.length);
-}
-
-export function getSmoothedOnlineWorkerCount() {
-  return computeSmoothedCount(supplySamples, workers.size);
-}
-
-/**
- * Always resolves, never rejects, with whatever submissions arrived —
- * reconciliation downstream must never hang or throw just because dispatch
- * had a bad day. Each submission is annotated with `established` (see
- * isEstablishedWorker) so reconcile.js can decide whether a unanimous
- * result is trustworthy enough to fast-path.
- */
-export function dispatchAndCollect(questionId, questionText, { quorumSize, timeoutMs, category, preferEstablished } = {}) {
-  const qid = questionId.toString();
-  return new Promise((resolvePromise) => {
-    const state = { submissions: new Map(), quorumSize, finished: false };
-    collectors.set(qid, state);
-
-    const timer = setTimeout(finish, timeoutMs);
-
-    function finish() {
-      if (state.finished) return;
-      state.finished = true;
-      clearTimeout(timer);
-      collectors.delete(qid);
-      const raw = [...state.submissions.entries()].map(([workerId, answer]) => ({ workerId, answer }));
-      annotateEstablished(raw)
-        .then(resolvePromise)
-        .catch(() => resolvePromise(raw.map((s) => ({ ...s, established: false }))));
-    }
-    state.finish = finish;
-
-    broadcast(questionId, questionText, { category, quorumSize, expiresInMs: timeoutMs, preferEstablished }).catch((err) => {
-      jobLogger(questionId).error({ err }, 'broadcast failed');
+export async function broadcast(questionId, questionText, { category, quorumSize, expiresInMs, preferEstablished, traceparent } = {}) {
+  // Re-enter the question's trace context (generated at creation time in
+  // jobs.js) so the dispatch span is a child of the same trace, and inject
+  // the current traceparent into the SSE payload so workers can echo it back
+  // on their answers — closing the loop across the SSE boundary.
+  const parentCtx = contextFromTraceparent(traceparent);
+  return context.with(parentCtx, async () => {
+    const span = tracer().startSpan('dispatch.broadcast', {
+      kind: SpanKind.PRODUCER,
+      attributes: {
+        'question.id': questionId.toString(),
+        'dispatch.category': category || 'general',
+        'dispatch.quorum_size': quorumSize || 0,
+      },
     });
+    try {
+      const payload = {
+        questionId: questionId.toString(),
+        question: questionText,
+        quorumSize,
+        expiresInMs,
+        traceparent: currentTraceparent(),
+      };
+      const targets = await selectTargets(category, { preferEstablished, quorumSize });
+      span.setAttribute('dispatch.recipients', targets.length);
+      for (const [, w] of targets) writeSse(w.res, 'question', payload);
+
+      // Supplement SSE with push notifications for workers who are eligible
+      // but not currently connected — only when the timeout window realistically
+      // allows time to notice, tap, and load before the quorum closes (see
+      // push.js for the honest tradeoff; short-timeout tiers skip this).
+      if (expiresInMs > 0) {
+        const eligibleIds = await getPushEligibleWorkerIds([...targets].map(([id]) => id));
+        for (const workerId of eligibleIds) {
+          await notifyWorker(workerId, payload);
+        }
+      }
+      span.setStatus({ code: SpanStatusCode.OK });
+      return targets.length;
+    } catch (err) {
+      span.recordException(err);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+      throw err;
+    } finally {
+      span.end();
+    }
   });
 }
 
-async function annotateEstablished(submissions) {
-  return Promise.all(submissions.map(async (s) => ({ ...s, established: await isEstablishedWorker(s.workerId) })));
+/**
+ * Record a worker's answer inside the question's trace context. The worker
+ * echoes the traceparent it received on the SSE frame, so the answer span is
+ * correlated with the original HTTP request and the on-chain settlement that
+ * follows — this is the middle link in the end-to-end trace.
+ */
+export async function submitAnswer(questionId, workerId, answer, { traceparent } = {}) {
+  const parentCtx = contextFromTraceparent(traceparent);
+  return context.with(parentCtx, async () => {
+    const span = tracer().startSpan('dispatch.answer', {
+      kind: SpanKind.CONSUMER,
+      attributes: {
+        'question.id': questionId.toString(),
+        'worker.id': workerId,
+      },
+    });
+    try {
+      const collector = collectors.get(questionId.toString());
+      if (!collector || collector.finished) {
+        span.setAttribute('dispatch.answer_accepted', false);
+        return false;
+      }
+      collector.submissions.set(workerId, answer);
+      span.setAttribute('dispatch.answer_accepted', true);
+      span.setAttribute('dispatch.submissions', collector.submissions.size);
+      if (collector.submissions.size >= collector.quorumSize) {
+        collector.finished = true;
+        await collector.finish(collector.submissions);
+      }
+      span.setStatus({ code: SpanStatusCode.OK });
+      return true;
+    } catch (err) {
+      span.recordException(err);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
 }
 
-/** Returns false (never throws) if the question is closed/expired or this worker already answered it. */
-export function submitAnswer(questionId, workerId, answer) {
-  const state = collectors.get(questionId.toString());
-  if (!state || state.finished) return false;
-  if (state.submissions.has(workerId)) return false;
-  state.submissions.set(workerId, answer);
-  if (state.submissions.size >= state.quorumSize) state.finish();
-  return true;
+/**
+ * Record the on-chain settlement transaction hash against the question's
+ * trace. Soroban has no native tracing concept, so the traceparent is carried
+ * in the transaction memo (see stellarClient.js) and the resulting hash is
+ * attached here as a span attribute — this is what lets an operator walk from
+ * a trace ID to the exact on-chain transaction.
+ */
+export async function recordSettlement(questionId, txHash, { traceparent } = {}) {
+  const parentCtx = contextFromTraceparent(traceparent);
+  return context.with(parentCtx, async () => {
+    const span = tracer().startSpan('settlement.onchain', {
+      kind: SpanKind.CLIENT,
+      attributes: {
+        'question.id': questionId.toString(),
+        'settlement.tx_hash': txHash,
+      },
+    });
+    try {
+      await touchWorker('settlement', { questionId: questionId.toString(), txHash });
+      span.setStatus({ code: SpanStatusCode.OK });
+      return txHash;
+    } catch (err) {
+      span.recordException(err);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
 }
+
+/**
+ * Register the quorum collector for a question, running inside the question's
+ * trace context so the eventual finish() callback (which triggers settlement)
+ * stays on the same trace.
+ */
+export function registerCollector(questionId, { quorumSize, finish, traceparent } = {}) {
+  const parentCtx = contextFromTraceparent(traceparent);
+  const collector = {
+    submissions: new Map(),
+    quorumSize,
+    finished: false,
+    finish: (submissions) => context.with(parentCtx, () => finish(submissions)),
+  };
+  collectors.set(questionId.toString(), collector);
+  return collector;
+}
+
+export function getCollector(questionId) {
+  return collectors.get(questionId.toString());
+}
+
+export function clearCollector(questionId) {
+  collectors.delete(questionId.toString());
+}
+
+// Re-exported so jobs.js and the HTTP layer can start the root span at
+// question-creation time without importing @opentelemetry/api directly.
+export { tracer, context, propagation, SpanKind, SpanStatusCode };
