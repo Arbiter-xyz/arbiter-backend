@@ -85,6 +85,26 @@ export const config = Object.freeze({
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
   anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-sonnet-5',
 
+  // Fleet-wide (not per-IP) hard cost cap on real Claude API spend. Per-IP
+  // rate limits (SANDBOX_RATE_LIMIT_MAX, ORACLE_RATE_LIMIT_MAX) bound a
+  // single source, but a distributed attacker across many IPs can still
+  // multiply real Anthropic spend arbitrarily. This rolling budget is
+  // tracked in Redis (see costBudget.js) so it holds across every backend
+  // instance, not just per-process. When exhausted, sandbox falls back to
+  // canned/deterministic answers and the Instant tier fails closed to a
+  // refund — never a hung or broken request. 0 disables the cap (preserves
+  // today's behavior for local dev / tests).
+  claudeCostBudget: Object.freeze({
+    // Max real Claude API spend allowed per rolling window, in USD.
+    maxUsd: num(process.env.CLAUDE_COST_BUDGET_USD, 0),
+    // Length of the rolling window the budget is measured over.
+    windowMs: num(process.env.CLAUDE_COST_BUDGET_WINDOW_MS, 3_600_000),
+    // Conservative per-call cost estimate (USD) reserved before each real
+    // Claude call, so concurrent in-flight calls can't collectively blow
+    // past the cap before any of them report actual usage.
+    estimatedCostPerCallUsd: num(process.env.CLAUDE_COST_PER_CALL_USD, 0.01),
+  }),
+
   pendingQuestionTtlMs: num(process.env.PENDING_QUESTION_TTL_MS, 600_000),
   jobResultTtlMs: num(process.env.JOB_RESULT_TTL_MS, 3_600_000),
 
@@ -99,6 +119,15 @@ export const config = Object.freeze({
   // directly); anything else pretty-prints for local dev readability.
   logFormat: process.env.LOG_FORMAT || 'pretty',
   logLevel: process.env.LOG_LEVEL || 'info',
+
+  // Response security headers (see securityHeaders.js). CSP_CONNECT_SRC is a
+  // comma-separated list of extra origins the frontend may fetch()/stream
+  // from — only needed when the UI is hosted on a different origin than
+  // this API. HSTS_ENABLED=false turns off Strict-Transport-Security.
+  securityHeaders: Object.freeze({
+    connectSrc: (process.env.CSP_CONNECT_SRC || '').split(',').map((s) => s.trim()).filter(Boolean),
+    hsts: process.env.HSTS_ENABLED !== 'false',
+  }),
 
   maxQuestionLength: num(process.env.MAX_QUESTION_LENGTH, 2000),
   maxAnswerLength: num(process.env.MAX_ANSWER_LENGTH, 2000),
@@ -172,6 +201,14 @@ export const config = Object.freeze({
     // How long a worker's session (proven once via a signed challenge
     // transaction) stays valid before they'd need to re-authenticate.
     ttlMs: num(process.env.WORKER_SESSION_TTL_MS, 12 * 60 * 60 * 1000),
+    // Graceful rotation: the set of secrets currently valid for verifying a
+    // session token (current first, then the prior secret while the grace
+    // window is open). Verification must accept a match from any of these;
+    // signing always uses `secret`. Empty/absent previous secret or a 0
+    // grace window yields a single-element list — identical to today.
+    secrets: sessionSecrets,
+    // Length of the rotation grace window in ms (0 = disabled).
+    rotationGraceMs: SESSION_SECRET_ROTATION_GRACE_MS,
   }),
 
   // Single shared operator secret for the /admin/* console — this codebase

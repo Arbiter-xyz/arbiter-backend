@@ -46,6 +46,36 @@ export const PRICING_TIERS = Object.freeze({
     // first." See dispatch.js's selectTargets for the fail-open behavior.
     preferEstablished: true,
   }),
+  // Self-driving quorum: asks one worker first and only recruits more when
+  // that answer isn't confident enough (see dispatch.js's decideEscalation).
+  // The final quorum size isn't known at quote time, so this is quoted and
+  // charged at a CEILING — the price of the fully-escalated quorum
+  // (escalation.maxQuorum workers, same per-worker rate as `priority`).
+  // quorumSize is that ceiling on purpose: surgeMultiplier() scales off it,
+  // so worker-supply scarcity is judged against the worst-case recruit.
+  // What happens to the difference once the real size is known:
+  //   - metered / API-key flow: the unused portion is refunded to the
+  //     customer's credit (billing.js settleReservation, via
+  //     effectiveEscalatedPriceStroops below).
+  //   - classic on-chain submit() flow: the escrowed amount is fixed at
+  //     payment time and the contract can't shrink it, so the platform keeps
+  //     the delta — same as today's surge ceiling. The job record shows both
+  //     numbers (amountStroops charged vs effectiveAmountStroops used).
+  auto: Object.freeze({
+    key: 'auto',
+    label: 'Auto — starts with one worker, recruits more only if unsure (charged at the maximum, unused portion refunded on API-key/prepaid billing)',
+    priceStroops: 6_000_000n,
+    quorumSize: 5,
+    timeoutMs: 45_000,
+    escalation: Object.freeze({
+      initialQuorum: 1,
+      maxQuorum: 5,
+      // Minimum confidence in a lone worker's answer to settle on it alone.
+      confidenceThreshold: 0.8,
+      // How long to wait on the current recruits before recruiting more.
+      stepTimeoutMs: 10_000,
+    }),
+  }),
 });
 
 export const DEFAULT_TIER_KEY = 'standard';
@@ -75,6 +105,9 @@ export function listTiersForClient() {
     amountStroops: t.priceStroops.toString(),
     quorumSize: t.quorumSize,
     timeoutMs: t.timeoutMs,
+    ...(t.escalation
+      ? { escalating: true, initialQuorum: t.escalation.initialQuorum, maxQuorum: t.escalation.maxQuorum }
+      : {}),
   }));
 }
 

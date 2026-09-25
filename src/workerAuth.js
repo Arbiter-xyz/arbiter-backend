@@ -91,17 +91,53 @@ function issueSessionToken(address) {
   return { token: `${payload}.${mac}`, expiresAt: exp };
 }
 
+/**
+ * Returns the set of secrets a session token may currently be verified
+ * against: the active SESSION_SECRET, plus the previous one while a
+ * rotation grace window is still open. This is what makes rotating
+ * SESSION_SECRET graceful — tokens minted under the old secret keep
+ * working until the window elapses, instead of every live worker/payer
+ * session dying the instant the secret changes.
+ *
+ * The previous secret is only honored when both it and a positive grace
+ * window are configured, and only until `rotatedAt + graceMs`. Once that
+ * deadline passes the old secret is dropped entirely, so a leaked key
+ * stops being useful after a bounded, operator-controlled period.
+ */
+function acceptedSessionSecrets(now = Date.now()) {
+  const secrets = [config.session.secret];
+  const previous = config.session.previousSecret;
+  const graceMs = config.session.rotationGraceMs;
+  const rotatedAt = config.session.rotatedAt;
+
+  if (previous && previous !== config.session.secret && graceMs > 0) {
+    const deadline = (typeof rotatedAt === 'number' ? rotatedAt : 0) + graceMs;
+    if (now <= deadline) secrets.push(previous);
+  }
+
+  return secrets;
+}
+
+/** Constant-time MAC comparison so this can't leak timing information
+ * about the secret. */
+function macMatches(payload, mac, secret) {
+  const expectedMac = createHmac('sha256', secret).update(payload).digest('base64url');
+  const macBuf = Buffer.from(mac);
+  const expectedBuf = Buffer.from(expectedMac);
+  return macBuf.length === expectedBuf.length && timingSafeEqual(macBuf, expectedBuf);
+}
+
 /** Returns the authenticated address if `token` is a valid, unexpired
- * session, or null otherwise. Constant-time MAC comparison so this can't
- * leak timing information about the secret. */
+ * session, or null otherwise. Accepts a MAC produced by the current
+ * SESSION_SECRET or, during the rotation grace window, the previous one;
+ * the payload/expiry checks are identical either way, so tamper and
+ * replay resistance are unchanged. */
 export function verifySessionToken(token) {
   if (typeof token !== 'string' || !token.includes('.')) return null;
   const [payload, mac] = token.split('.');
-  const expectedMac = createHmac('sha256', config.session.secret).update(payload).digest('base64url');
 
-  const macBuf = Buffer.from(mac);
-  const expectedBuf = Buffer.from(expectedMac);
-  if (macBuf.length !== expectedBuf.length || !timingSafeEqual(macBuf, expectedBuf)) return null;
+  const validMac = acceptedSessionSecrets().some((secret) => macMatches(payload, mac, secret));
+  if (!validMac) return null;
 
   try {
     const { address, exp } = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
