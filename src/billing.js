@@ -44,6 +44,50 @@ async function createAccount() {
   return { accountId, rawKey };
 }
 
+/**
+ * Invoice/PO-based provisioning for enterprise customers who can't use a
+ * credit card (issue #106).
+ *
+ * An enterprise customer paying by purchase order or wire transfer has no
+ * card at all, so the entire createCheckoutSession()-driven onboarding flow
+ * (and its Stripe-specific isBillingConfigured() gate) simply doesn't apply
+ * to them. This is the admin-operator equivalent of manually provisioning
+ * credit: it calls createAccount() directly — skipping
+ * createCheckoutSession() and any Stripe dependency — and separately credits
+ * the account's balance via store.incrBy() on the `credit:{accountId}` key,
+ * the same primitive handleStripeWebhook() already uses, just triggered by
+ * an operator confirming a wire/PO landed instead of a Stripe webhook
+ * firing.
+ *
+ * The raw API key is returned directly in the response (there is no checkout
+ * redirect to embed it in), mirroring createCheckoutSession()'s one-time
+ * reveal: it is shown exactly once and never persisted or logged in
+ * plaintext — only its hash is stored (see createAccount()). Losing it means
+ * starting over; key recovery/rotation is a deliberate v1 gap, not an
+ * oversight.
+ *
+ * Structured accounts-receivable tracking (invoice number, due date, payment
+ * status, overdue reminders, PO validation) is explicitly out of scope —
+ * this is the minimal "an admin can credit an account without Stripe"
+ * primitive, with structured AR treated as a real follow-up.
+ */
+export async function provisionInvoiceAccount(amountStroops) {
+  if (!Number.isFinite(amountStroops) || amountStroops <= 0) {
+    throw new Error('amountStroops must be a positive number');
+  }
+
+  const { accountId, rawKey } = await createAccount();
+  // Same primitive handleStripeWebhook() uses to fund a card-paid account;
+  // a manually-provisioned account's POST /oracle usage therefore behaves
+  // identically downstream (same reserveCredit()/settleReservation() path,
+  // no special-casing).
+  await store.incrBy(`credit:${accountId}`, amountStroops);
+
+  // rawKey is returned exactly once here and never logged or persisted in
+  // plaintext — only its hash lives in the apikey: index (see createAccount()).
+  return { accountId, apiKey: rawKey, creditStroops: amountStroops };
+}
+
 export async function getCreditBalanceStroops(accountId) {
   return (await store.get(`credit:${accountId}`)) || 0;
 }
@@ -102,6 +146,35 @@ export function isAllowedRedirectUrl(url) {
   }
 }
 
+/**
+ * Apple Pay / Google Pay quick-checkout (issue #105).
+ *
+ * Stripe Checkout auto-detects and offers Apple Pay / Google Pay on
+ * supporting devices/browsers whenever the account has those payment
+ * methods enabled — no `payment_method_types` array is needed here, and
+ * passing one would actually *narrow* the methods offered. The only
+ * code-side requirement is that the Checkout Session's redirect URLs
+ * (success_url/cancel_url) live on a domain that has been registered with
+ * Stripe for Apple Pay domain verification; that domain is exactly the
+ * origin isAllowedRedirectUrl() already restricts to config.allowedOrigins,
+ * so the existing allowlist is the single source of truth for both the
+ * redirect-safety check and Apple Pay's domain-association requirement.
+ *
+ * This helper exists so the domain-verification requirement is explicit
+ * and testable rather than an implicit assumption: it returns the origin
+ * Stripe will associate with the session, or null when the URL is not on
+ * an allowed origin (in which case createCheckoutSession() would already
+ * have rejected it).
+ */
+export function getApplePayVerificationOrigin(url) {
+  if (!isAllowedRedirectUrl(url)) return null;
+  try {
+    return new URL(url).origin;
+  } catch {
+    return null;
+  }
+}
+
 export async function createCheckoutSession(amountUsd, successUrl, cancelUrl) {
   if (!Number.isFinite(amountUsd) || amountUsd < config.billing.minTopupUsd) {
     throw new Error(`amountUsd must be a number >= ${config.billing.minTopupUsd}`);
@@ -132,32 +205,57 @@ export async function createCheckoutSession(amountUsd, successUrl, cancelUrl) {
 }
 
 /**
- * Verifies the Stripe signature (constructEvent throws on a bad/missing
- * one — the route handler turns that into a 400) and, for a completed
- * checkout, credits the account. Idempotent per Stripe event id via
- * store.setNX, since Stripe retries webhook delivery on anything but a 2xx
- * response — without this, a retried delivery would double-credit the same
- * payment.
+ * The single flat subscription tier (issue #101). Prorated upgrades/
+ * downgrades between tiers are explicitly out of scope — one tier, one
+ * recurring price, one included-volume grant per billing cycle.
+ *
+ * `includedVolumeStroops` is the credit granted on each `invoice.paid`.
+ * `rollover` is the documented policy for unused included volume at the
+ * cycle boundary: false means use-it-or-lose-it (the balance is reset to
+ * the tier's included volume on renewal, not incremented), true would
+ * carry the remainder forward. Defaulting to false mirrors the
+ * "0 preserves today's behavior" framing config.js uses for
+ * minStakeStroops — the conservative, non-compounding choice is the
+ * explicit default, not an accident of implementation order.
  */
-export async function handleStripeWebhook(rawBody, signature) {
-  const event = getStripe().webhooks.constructEvent(rawBody, signature, config.billing.stripeWebhookSecret);
-  if (event.type !== 'checkout.session.completed') return;
+export const SUBSCRIPTION_TIER = {
+  name: 'api-pro',
+  priceUsd: 99,
+  includedVolumeStroops: 1_000_000_000,
+  rollover: false,
+};
 
-  const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
-  const isNew = await store.setNX(`stripe-event:${event.id}`, 1, THIRTY_DAYS_MS);
-  if (!isNew) return;
-
-  const session = event.data.object;
-  const accountId = session.metadata?.accountId;
-  if (!accountId) {
-    logger.error({ eventId: event.id }, 'stripe checkout.session.completed missing accountId metadata');
-    return;
+/**
+ * Creates a fresh account (and its one API key) and a Stripe Checkout
+ * Session in `mode: 'subscription'` to fund it. Mirrors
+ * createCheckoutSession()'s one-time-reveal pattern for the raw key and
+ * its allowed-origin check on the redirect URLs; the difference is the
+ * Stripe primitive — a recurring price instead of a one-shot payment, so
+ * credit arrives via `invoice.paid` (see handleStripeWebhook()).
+ */
+export async function createSubscriptionCheckoutSession(successUrl, cancelUrl) {
+  if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
+    throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
   }
 
-  // amount_total is USD cents (integer, no float involved). stroopsPerCent
-  // is exact (10_000_000n / 100n = 100_000n) at USDC's 7-decimal
-  // convention, so this conversion never loses a fraction of a cent.
-  const stroopsPerCent = config.billing.usdToStroops / 100n;
-  const amountStroops = BigInt(session.amount_total) * stroopsPerCent;
-  await store.incrBy(`credit:${accountId}`, Number(amountStroops));
+  const { accountId, rawKey } = await createAccount();
+  const session = await getStripe().checkout.sessions.create({
+    mode: 'subscription',
+    line_items: [
+      {
+        price_data: {
+          currency: 'usd',
+          product_data: { name: `Arbiter API ${SUBSCRIPTION_TIER.name}` },
+          unit_amount: Math.round(SUBSCRIPTION_TIER.priceUsd * 100),
+          recurring: { interval: 'month' },
+        },
+        quantity: 1,
+      },
+    ],
+    metadata: { accountId },
+    success_url: `${successUrl}?apiKey=${rawKey}`,
+    cancel_url: cancelUrl,
+  });
+
+  return { checkoutUrl: session.url };
 }

@@ -66,6 +66,99 @@ export function summarizePayerQuestions(ids, jobs) {
 }
 
 /**
+ * Loyalty tiers, keyed off the same aggregate summarizePayerQuestions()
+ * already produces. Structurally mirrors pricing.js's surgeMultiplier():
+ * a pure function of an aggregate input, so it's unit-testable in
+ * isolation without any store or chain access.
+ *
+ * Thresholds are lifetime spend in stroops (7-decimal USDC, matching
+ * amountStroops everywhere else). `bonusStroops` is the one-time credit
+ * granted when a payer first reaches that tier — see
+ * evaluateLoyaltyTier() for the idempotency that keeps it one-time.
+ */
+export const LOYALTY_TIERS = [
+  { name: 'bronze', minSpendStroops: 10_000_000n, bonusStroops: 500_000n },
+  { name: 'silver', minSpendStroops: 100_000_000n, bonusStroops: 5_000_000n },
+  { name: 'gold', minSpendStroops: 1_000_000_000n, bonusStroops: 50_000_000n },
+];
+
+/**
+ * Pure tier evaluation: takes a payer's spend summary (the object returned
+ * by summarizePayerQuestions()) and returns the highest tier whose
+ * threshold the payer's lifetime spend has reached, plus the bonus credit
+ * that tier carries. Returns null when no threshold is met.
+ *
+ * Deliberately reads only `totalSpendStroops` — the durable aggregate — so
+ * callers aren't tempted to re-scan the bounded tracked list for lifetime
+ * totals (see MAX_TRACKED_PER_PAYER).
+ */
+export function evaluateLoyaltyTier(summary) {
+  const spend = BigInt(summary?.totalSpendStroops || 0);
+  let matched = null;
+  for (const tier of LOYALTY_TIERS) {
+    if (spend >= tier.minSpendStroops) matched = tier;
+  }
+  if (!matched) return null;
+  return {
+    tier: matched.name,
+    minSpendStroops: matched.minSpendStroops.toString(),
+    bonusStroops: matched.bonusStroops.toString(),
+    bonus: stroopsToUsdc(matched.bonusStroops),
+  };
+}
+
+/**
+ * Idempotent threshold tracking: a payer's highest already-credited tier is
+ * persisted under `loyalty-tier:{payerAddress}`, so re-evaluating the same
+ * summary never re-credits a crossing. Returns the tier to credit (with
+ * `bonusStroops` as a BigInt) only when the payer has newly reached a
+ * higher tier, otherwise null.
+ *
+ * The caller is responsible for actually applying the credit via the
+ * billing.js incrBy ledger — this function only decides whether a credit
+ * is owed, keeping the store read/write local and the decision pure-ish.
+ */
+export async function claimLoyaltyTier(payerAddress, summary) {
+  const evaluated = evaluateLoyaltyTier(summary);
+  if (!evaluated) return null;
+
+  const key = 'loyalty-tier:' + payerAddress;
+  const credited = await store.get(key);
+  const creditedIndex = LOYALTY_TIERS.findIndex((t) => t.name === credited);
+  const evaluatedIndex = LOYALTY_TIERS.findIndex((t) => t.name === evaluated.tier);
+  if (evaluatedIndex <= creditedIndex) return null; // already credited at this tier or higher
+
+  await store.set(key, evaluated.tier);
+  return { ...evaluated, bonusStroops: BigInt(evaluated.bonusStroops) };
+}
+
+/**
+ * Admin view: which payers are in which loyalty tier, following the same
+ * composition pattern as admin.js's listPayers() — enumerate the durable
+ * payer index, summarize each payer's tracked questions, and attach the
+ * pure tier evaluation. Payers below every threshold report tier: null.
+ */
+export async function listPayerLoyaltyTiers() {
+  const addresses = await getKnownPayerAddresses();
+  const rows = await Promise.all(
+    addresses.map(async (payerAddress) => {
+      const ids = await getPayerQuestionIds(payerAddress);
+      const jobs = await Promise.all(ids.map((id) => store.get('job:' + id)));
+      const summary = summarizePayerQuestions(ids, jobs);
+      const tier = evaluateLoyaltyTier(summary);
+      return {
+        payerAddress,
+        totalSpendStroops: summary.totalSpendStroops.toString(),
+        totalSpend: stroopsToUsdc(summary.totalSpendStroops),
+        tier: tier ? tier.tier : null,
+        bonusStroops: tier ? tier.bonusStroops : null,
+      };
+    })
+  );
+  return rows;
+}
+
+/**
  * Spend dashboards (arbiter-app) chart spend by category and over time.
  * Every input is already on the job record, but bucketing it here saves each
  * consumer from re-deriving the same aggregation client-side.
