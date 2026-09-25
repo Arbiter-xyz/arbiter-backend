@@ -65,3 +65,8 @@ predates this repo's split; see "Round 6" in the archived
 [`arbiter`](https://github.com/rudeus112266/arbiter) monorepo README for
 the full write-up, including two real bugs that live infrastructure
 surfaced and mocked tests never could.)
+
+## Handsoff notes
+
+<!-- handsoff-issue-4 -->
+- #4: Graceful drain for in-flight SSE quorum-collection windows on deploy/restart

@@ -24,3 +24,35 @@ jobs:
       - run: npm test
       - name: Dependency audit (fails only on high/critical)
         run: npm audit --omit=dev --audit-level=high
+
+  # Proves the Redis-backed store path (not the in-memory fallback) is correct
+  # under real multi-process concurrent load. A real Redis service container is
+  # required so claimJob/session/job-state races are shaped by genuine network
+  # latency across separate OS processes, not single-process Promise interleaving.
+  redis-concurrency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Verify Redis is reachable
+        run: |
+          node -e "const net=require('net');const s=net.connect(6379,'127.0.0.1',()=>{s.end();process.exit(0)});s.on('error',e=>{console.error(e);process.exit(1)})"
+      - name: Multi-process Redis concurrency tests
+        run: npm run test:redis-concurrency
