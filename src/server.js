@@ -44,6 +44,7 @@ import { registerWebhook, listWebhooks, deleteWebhook, WebhookError } from './we
 import { logger, httpLogger } from './logger.js';
 import { getProvenance } from './provenance.js';
 import { enforceSecurityPosture } from './securityPosture.js';
+import { screenAnswer } from './answerFilter.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -771,6 +772,12 @@ app.post('/app/answer', rateLimited('answer', byIp), (req, res) => {
   }
   if (requiresAuth(workerId) && verifySessionToken(token) !== workerId) {
     return res.status(401).json({ error: 'a valid session token for this address is required — see POST /workers/:address/session' });
+  }
+  // Checked again inside submitAnswer (the authoritative gate); screening
+  // here too just gives the worker a specific reason instead of a 409.
+  const screened = screenAnswer(answer);
+  if (!screened.ok) {
+    return res.status(422).json({ ok: false, error: `answer rejected by content filter: ${screened.reason}` });
   }
   const accepted = submitAnswer(questionId, workerId, answer);
   if (!accepted) {

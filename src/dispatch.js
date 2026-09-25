@@ -1,6 +1,7 @@
 import { store } from './store.js';
 import { config } from './config.js';
 import { checkRateLimit } from './rateLimit.js';
+import { screenAnswer } from './answerFilter.js';
 import { getPushEligibleWorkerIds, notifyWorker } from './push.js';
 import { getStakeOnChain, touchWorker } from './stellarClient.js';
 import { jobLogger, logger } from './logger.js';
@@ -287,6 +288,14 @@ export async function submitAnswer(questionId, workerId, answer, { traceparent }
       const collector = collectors.get(questionId.toString());
       if (!collector || collector.finished) {
         span.setAttribute('dispatch.answer_accepted', false);
+        return false;
+      }
+      // Screen before recording: a filtered answer must never count
+      // toward quorum or consensus.
+      const screened = screenAnswer(answer);
+      if (!screened.ok) {
+        span.setAttribute('dispatch.answer_accepted', false);
+        span.setAttribute('dispatch.answer_filtered', screened.reason);
         return false;
       }
       collector.submissions.set(workerId, answer);
