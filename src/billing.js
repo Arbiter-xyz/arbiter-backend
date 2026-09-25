@@ -44,6 +44,50 @@ async function createAccount() {
   return { accountId, rawKey };
 }
 
+/**
+ * Invoice/PO-based provisioning for enterprise customers who can't use a
+ * credit card (issue #106).
+ *
+ * An enterprise customer paying by purchase order or wire transfer has no
+ * card at all, so the entire createCheckoutSession()-driven onboarding flow
+ * (and its Stripe-specific isBillingConfigured() gate) simply doesn't apply
+ * to them. This is the admin-operator equivalent of manually provisioning
+ * credit: it calls createAccount() directly — skipping
+ * createCheckoutSession() and any Stripe dependency — and separately credits
+ * the account's balance via store.incrBy() on the `credit:{accountId}` key,
+ * the same primitive handleStripeWebhook() already uses, just triggered by
+ * an operator confirming a wire/PO landed instead of a Stripe webhook
+ * firing.
+ *
+ * The raw API key is returned directly in the response (there is no checkout
+ * redirect to embed it in), mirroring createCheckoutSession()'s one-time
+ * reveal: it is shown exactly once and never persisted or logged in
+ * plaintext — only its hash is stored (see createAccount()). Losing it means
+ * starting over; key recovery/rotation is a deliberate v1 gap, not an
+ * oversight.
+ *
+ * Structured accounts-receivable tracking (invoice number, due date, payment
+ * status, overdue reminders, PO validation) is explicitly out of scope —
+ * this is the minimal "an admin can credit an account without Stripe"
+ * primitive, with structured AR treated as a real follow-up.
+ */
+export async function provisionInvoiceAccount(amountStroops) {
+  if (!Number.isFinite(amountStroops) || amountStroops <= 0) {
+    throw new Error('amountStroops must be a positive number');
+  }
+
+  const { accountId, rawKey } = await createAccount();
+  // Same primitive handleStripeWebhook() uses to fund a card-paid account;
+  // a manually-provisioned account's POST /oracle usage therefore behaves
+  // identically downstream (same reserveCredit()/settleReservation() path,
+  // no special-casing).
+  await store.incrBy(`credit:${accountId}`, amountStroops);
+
+  // rawKey is returned exactly once here and never logged or persisted in
+  // plaintext — only its hash lives in the apikey: index (see createAccount()).
+  return { accountId, apiKey: rawKey, creditStroops: amountStroops };
+}
+
 export async function getCreditBalanceStroops(accountId) {
   return (await store.get(`credit:${accountId}`)) || 0;
 }
@@ -187,8 +231,7 @@ export const SUBSCRIPTION_TIER = {
  * createCheckoutSession()'s one-time-reveal pattern for the raw key and
  * its allowed-origin check on the redirect URLs; the difference is the
  * Stripe primitive — a recurring price instead of a one-shot payment, so
- * credit arrives via `invoice.paid` (see handleStripeWebhook) rather than
- * `checkout.session.completed`.
+ * credit arrives via `invoice.paid` (see handleStripeWebhook()).
  */
 export async function createSubscriptionCheckoutSession(successUrl, cancelUrl) {
   if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
@@ -215,54 +258,4 @@ export async function createSubscriptionCheckoutSession(successUrl, cancelUrl) {
   });
 
   return { checkoutUrl: session.url };
-}
-
-/**
- * Verifies the Stripe signature (constructEvent throws on a bad/missing
- * one — the route handler turns that into a 400) and, for a completed
- * checkout, credits the account. Idempotent per Stripe event id via
- * store.setNX, since Stripe retries webhook delivery on anything but a 2xx
- * response — without this, a retried delivery would double-credit.
- */
-export async function handleStripeWebhook(rawBody, signature) {
-  const event = getStripe().webhooks.constructEvent(
-    rawBody,
-    signature,
-    config.billing.stripeWebhookSecret,
-  );
-
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-    const accountId = session.metadata?.accountId;
-    if (!accountId) {
-      logger.warn('stripe webhook: checkout.session.completed without accountId metadata', { eventId: event.id });
-      return;
-    }
-    const amountStroops = Math.round((session.amount_total || 0) * config.billing.stroopsPerUsdCent);
-    const firstDelivery = await store.setNX(`stripe:event:${event.id}`, { accountId, amountStroops });
-    if (!firstDelivery) return;
-    await store.incrBy(`credit:${accountId}`, amountStroops);
-    logger.info('stripe webhook: credited account', { accountId, amountStroops });
-    return;
-  }
-
-  if (event.type === 'invoice.paid') {
-    const invoice = event.data.object;
-    const accountId = invoice.subscription_details?.metadata?.accountId || invoice.metadata?.accountId;
-    if (!accountId) {
-      logger.warn('stripe webhook: invoice.paid without accountId metadata', { eventId: event.id });
-      return;
-    }
-    const firstDelivery = await store.setNX(`stripe:event:${event.id}`, { accountId });
-    if (!firstDelivery) return;
-    // rollover: false — reset to the tier's included volume rather than
-    // incrementing, so unused volume does not compound across cycles.
-    if (SUBSCRIPTION_TIER.rollover) {
-      await store.incrBy(`credit:${accountId}`, SUBSCRIPTION_TIER.includedVolumeStroops);
-    } else {
-      await store.set(`credit:${accountId}`, SUBSCRIPTION_TIER.includedVolumeStroops);
-    }
-    logger.info('stripe webhook: subscription cycle credited', { accountId });
-    return;
-  }
 }

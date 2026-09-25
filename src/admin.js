@@ -7,6 +7,7 @@ import { getHorizon } from './sponsor.js';
 import { config } from './config.js';
 import { stroopsToUsdc } from './pricing.js';
 import { evaluateLoyaltyTier } from './loyalty.js';
+import { createAccount, store } from './billing.js';
 
 const PLATFORM_FEE_BPS = 2000n; // mirrors contracts/oracle-escrow/src/lib.rs's PLATFORM_FEE_BPS
 const BPS_DENOM = 10_000n;
@@ -73,6 +74,31 @@ export async function listPayers() {
       };
     }),
   );
+}
+
+/** Admin-only provisioning for enterprise customers who can't use a credit
+ * card (issue #106): creates an account directly via createAccount(),
+ * skipping createCheckoutSession() and any Stripe dependency entirely, then
+ * credits its balance via store.incrBy() on the same credit:{accountId} key
+ * handleStripeWebhook() uses — triggered here by an operator confirming a
+ * wire/PO landed out-of-band rather than by a Stripe webhook firing.
+ *
+ * The raw API key is returned exactly once, in this response, mirroring
+ * createCheckoutSession()'s one-time-reveal treatment (there it's embedded
+ * in the checkout redirect URL; here there's no redirect to embed it in, so
+ * it's returned directly). It is never persisted or logged in plaintext —
+ * key recovery remains a deliberate v1 gap, same as the Stripe flow. */
+export async function provisionAccount({ creditUsdc = 0 } = {}) {
+  const account = await createAccount();
+  const creditStroops = BigInt(Math.round(Number(creditUsdc) * 10_000_000));
+  if (creditStroops > 0n) {
+    await store.incrBy(`credit:${account.accountId}`, creditStroops);
+  }
+  return {
+    accountId: account.accountId,
+    apiKey: account.apiKey,
+    credited: stroopsToUsdc(creditStroops),
+  };
 }
 
 async function loadUsdcBalances(address) {
