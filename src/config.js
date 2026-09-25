@@ -47,6 +47,26 @@ export const config = Object.freeze({
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
   anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-sonnet-5',
 
+  // Fleet-wide (not per-IP) hard cost cap on real Claude API spend. Per-IP
+  // rate limits (SANDBOX_RATE_LIMIT_MAX, ORACLE_RATE_LIMIT_MAX) bound a
+  // single source, but a distributed attacker across many IPs can still
+  // multiply real Anthropic spend arbitrarily. This rolling budget is
+  // tracked in Redis (see costBudget.js) so it holds across every backend
+  // instance, not just per-process. When exhausted, sandbox falls back to
+  // canned/deterministic answers and the Instant tier fails closed to a
+  // refund — never a hung or broken request. 0 disables the cap (preserves
+  // today's behavior for local dev / tests).
+  claudeCostBudget: Object.freeze({
+    // Max real Claude API spend allowed per rolling window, in USD.
+    maxUsd: num(process.env.CLAUDE_COST_BUDGET_USD, 0),
+    // Length of the rolling window the budget is measured over.
+    windowMs: num(process.env.CLAUDE_COST_BUDGET_WINDOW_MS, 3_600_000),
+    // Conservative per-call cost estimate (USD) reserved before each real
+    // Claude call, so concurrent in-flight calls can't collectively blow
+    // past the cap before any of them report actual usage.
+    estimatedCostPerCallUsd: num(process.env.CLAUDE_COST_PER_CALL_USD, 0.01),
+  }),
+
   pendingQuestionTtlMs: num(process.env.PENDING_QUESTION_TTL_MS, 600_000),
   jobResultTtlMs: num(process.env.JOB_RESULT_TTL_MS, 3_600_000),
 
@@ -166,11 +186,7 @@ export const config = Object.freeze({
     fiatPoolSecret: process.env.FIAT_POOL_SECRET || '',
     fiatPoolAddress: process.env.FIAT_POOL_ADDRESS || '',
     // 1 USD = 1 USDC face value, at USDC's existing 7-decimal stroop
-    // convention (see pricing.js's stroopsToUsdc) — the simplest possible
-    // conversion for v1. Stripe's own processing fee is absorbed by the
-    // platform, not passed through to the credited balance; revisit if
-    // margin matters before volume does.
-    usdToStroops: 10_000_000n,
-    minTopupUsd: num(process.env.MIN_TOPUP_USD, 10),
+    // convention (see pricing.js's usdToStroops).
+    usdPerUsdc: num(process.env.BILLING_USD_PER_USDC, 1),
   }),
 });
