@@ -4,6 +4,7 @@ import { store } from './store.js';
 import { config } from './config.js';
 import { hashApiKey } from './apiKeyAuth.js';
 import { logger } from './logger.js';
+import { fiatPoolBalanceStroops, billingReservationCount, billingSettlementCount } from './metrics.js';
 
 /**
  * The non-crypto onramp: a fiat customer pays via Stripe and is issued an
@@ -59,7 +60,10 @@ export async function getCreditBalanceStroops(accountId) {
  * balance covers, without needing to predict the exact price in advance.
  */
 export async function reserveCredit(accountId, maxStroops) {
-  return store.decrIfAtLeast(`credit:${accountId}`, maxStroops);
+  const ok = await store.decrIfAtLeast(`credit:${accountId}`, maxStroops);
+  if (ok) billingReservationCount.inc({ outcome: 'reserved' });
+  else billingReservationCount.inc({ outcome: 'insufficient' });
+  return ok;
 }
 
 /** Credits back the unused portion of a reservation. Pass actualStroops=0
@@ -68,6 +72,7 @@ export async function reserveCredit(accountId, maxStroops) {
 export async function settleReservation(accountId, reservedStroops, actualStroops) {
   const refund = reservedStroops - actualStroops;
   if (refund > 0) await store.incrBy(`credit:${accountId}`, refund);
+  billingSettlementCount.inc({ outcome: actualStroops > 0 ? 'charged' : 'refunded' });
 }
 
 /** Creates a fresh account (and its one API key) and a Stripe Checkout
@@ -160,4 +165,29 @@ export async function handleStripeWebhook(rawBody, signature) {
   const stroopsPerCent = config.billing.usdToStroops / 100n;
   const amountStroops = BigInt(session.amount_total) * stroopsPerCent;
   await store.incrBy(`credit:${accountId}`, Number(amountStroops));
+}
+
+/**
+ * Reads the pooled fiat balance for the /metrics endpoint (issue #162).
+ * Returns null when billing isn't configured so the metrics route can skip
+ * the gauge entirely rather than reporting a misleading zero. The balance
+ * itself is read from the same store key the on-chain pool accounting
+ * already maintains; this is a read-only accessor, not a new source of
+ * truth.
+ */
+export async function getFiatPoolBalanceStroops() {
+  if (!isBillingConfigured()) return null;
+  const balance = await store.get(`pool:${config.billing.fiatPoolAddress}`);
+  return balance || 0;
+}
+
+/**
+ * Refreshes the fiat-pool-balance gauge. Called by the /metrics handler
+ * before scraping so the gauge reflects the current pool rather than a
+ * stale value from process start. No-op when billing is unconfigured.
+ */
+export async function refreshFiatPoolBalanceMetric() {
+  const balance = await getFiatPoolBalanceStroops();
+  if (balance === null) return;
+  fiatPoolBalanceStroops.set(balance);
 }
