@@ -1,0 +1,85 @@
+{
+  "target": "http://localhost:4999",
+  "scenario": "challenge",
+  "stageSeconds": 10,
+  "maxErrorRate": 0.05,
+  "maxP95Ms": 500,
+  "finishedAt": "2026-09-24T12:20:32.390Z",
+  "results": [
+    {
+      "level": 1,
+      "verdict": "ok",
+      "requests": 5864,
+      "rps": 586.4,
+      "p50": 2,
+      "p95": 2,
+      "p99": 6,
+      "max": 46,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "402": 5864
+      }
+    },
+    {
+      "level": 10,
+      "verdict": "ok",
+      "requests": 12741,
+      "rps": 1273.4,
+      "p50": 6,
+      "p95": 15,
+      "p99": 20,
+      "max": 33,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "402": 12741
+      }
+    },
+    {
+      "level": 50,
+      "verdict": "ok",
+      "requests": 13133,
+      "rps": 1309.4,
+      "p50": 36,
+      "p95": 61,
+      "p99": 81,
+      "max": 543,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "402": 13133
+      }
+    },
+    {
+      "level": 100,
+      "verdict": "ok",
+      "requests": 13577,
+      "rps": 1347.4,
+      "p50": 68,
+      "p95": 111,
+      "p99": 146,
+      "max": 2769,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "402": 13577
+      }
+    },
+    {
+      "level": 200,
+      "verdict": "ok",
+      "requests": 12894,
+      "rps": 1270,
+      "p50": 88,
+      "p95": 164,
+      "p99": 2127,
+      "max": 9995,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "402": 12894
+      }
+    }
+  ]
+}

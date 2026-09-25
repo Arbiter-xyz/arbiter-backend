@@ -1,0 +1,100 @@
+{
+  "target": "http://localhost:4999",
+  "scenario": "read",
+  "stageSeconds": 10,
+  "maxErrorRate": 0.05,
+  "maxP95Ms": 500,
+  "finishedAt": "2026-09-24T12:19:33.200Z",
+  "results": [
+    {
+      "level": 1,
+      "verdict": "ok",
+      "requests": 8663,
+      "rps": 866.3,
+      "p50": 1,
+      "p95": 2,
+      "p99": 4,
+      "max": 33,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 8663
+      }
+    },
+    {
+      "level": 10,
+      "verdict": "ok",
+      "requests": 18318,
+      "rps": 1831.1,
+      "p50": 4,
+      "p95": 11,
+      "p99": 15,
+      "max": 25,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 18318
+      }
+    },
+    {
+      "level": 50,
+      "verdict": "ok",
+      "requests": 18133,
+      "rps": 1809.2,
+      "p50": 26,
+      "p95": 44,
+      "p99": 58,
+      "max": 124,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 18133
+      }
+    },
+    {
+      "level": 100,
+      "verdict": "ok",
+      "requests": 18963,
+      "rps": 1886.7,
+      "p50": 49,
+      "p95": 75,
+      "p99": 105,
+      "max": 2157,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 18963
+      }
+    },
+    {
+      "level": 200,
+      "verdict": "ok",
+      "requests": 18937,
+      "rps": 1872.6,
+      "p50": 65,
+      "p95": 99,
+      "p99": 950,
+      "max": 8105,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 18937
+      }
+    },
+    {
+      "level": 400,
+      "verdict": "ok",
+      "requests": 18720,
+      "rps": 1828.5,
+      "p50": 96,
+      "p95": 165,
+      "p99": 6979,
+      "max": 10101,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 18720
+      }
+    }
+  ]
+}

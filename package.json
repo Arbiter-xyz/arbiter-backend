@@ -8,8 +8,10 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "check": "node --check src/*.js",
-    "test": "node --test --test-timeout=30000"
+    "check": "node --check src/*.js scripts/*.js",
+    "test": "node --test --test-timeout=30000",
+    "loadtest": "node scripts/loadtest.js",
+    "verify-provenance": "node scripts/verify-provenance.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.0",

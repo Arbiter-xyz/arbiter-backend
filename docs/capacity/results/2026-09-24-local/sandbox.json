@@ -1,0 +1,121 @@
+{
+  "target": "http://localhost:4999",
+  "scenario": "sandbox",
+  "stageSeconds": 20,
+  "maxErrorRate": 0.05,
+  "maxP95Ms": 500,
+  "maxJobP95Ms": 5000,
+  "finishedAt": "2026-09-24T12:31:00.032Z",
+  "results": [
+    {
+      "level": 100,
+      "verdict": "ok",
+      "requests": 10191,
+      "rps": 490.8,
+      "p50": 3,
+      "p95": 30,
+      "p99": 188,
+      "max": 548,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 2548,
+        "202": 7643
+      },
+      "jobs": {
+        "completed": 2548,
+        "perSecond": 127.4,
+        "p50": 771,
+        "p95": 911
+      }
+    },
+    {
+      "level": 200,
+      "verdict": "ok",
+      "requests": 20340,
+      "rps": 978,
+      "p50": 5,
+      "p95": 47,
+      "p99": 98,
+      "max": 228,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 5085,
+        "202": 15255
+      },
+      "jobs": {
+        "completed": 5085,
+        "perSecond": 254.3,
+        "p50": 789,
+        "p95": 880
+      }
+    },
+    {
+      "level": 300,
+      "verdict": "ok",
+      "requests": 25489,
+      "rps": 1223.6,
+      "p50": 40,
+      "p95": 113,
+      "p99": 390,
+      "max": 1793,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 6409,
+        "202": 19080
+      },
+      "jobs": {
+        "completed": 6409,
+        "perSecond": 320.4,
+        "p50": 927,
+        "p95": 1123
+      }
+    },
+    {
+      "level": 400,
+      "verdict": "ok",
+      "requests": 22827,
+      "rps": 1031.4,
+      "p50": 108,
+      "p95": 307,
+      "p99": 3144,
+      "max": 8181,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 5992,
+        "202": 16835
+      },
+      "jobs": {
+        "completed": 5992,
+        "perSecond": 299.6,
+        "p50": 1180,
+        "p95": 2655
+      }
+    },
+    {
+      "level": 600,
+      "verdict": "BROKEN (p95)",
+      "requests": 19058,
+      "rps": 795.6,
+      "p50": 127,
+      "p95": 672,
+      "p99": 11903,
+      "max": 20906,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 5226,
+        "202": 13832
+      },
+      "jobs": {
+        "completed": 5226,
+        "perSecond": 261.3,
+        "p50": 1258,
+        "p95": 11522
+      }
+    }
+  ]
+}

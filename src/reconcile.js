@@ -68,19 +68,7 @@ export function exactMatchVote(submissions) {
   return [...groups.values()];
 }
 
-export function exactMatchVote(submissions) {
-  let winner = null;
-  for (const group of groupByNormalizedAnswer(submissions)) {
-    if (!winner || group.workerIds.length > winner.workerIds.length) winner = group;
-  }
-
-  return {
-    consensus: winner.representative,
-    confidence: winner.workerIds.length / submissions.length,
-    matchingWorkerIds: winner.workerIds,
-    allAgree: winner.workerIds.length === submissions.length,
-  };
-}
+export { exactMatchVote } from './vote.js';
 
 /**
  * Cluster raw submissions by semantic similarity, then vote on clusters
@@ -163,20 +151,16 @@ function getClient() {
   return anthropicClient;
 }
 
-async function reconcileWithClaude(question, submissions, rule) {
-  const client = getClient();
-  if (!client) throw new Error('ANTHROPIC_API_KEY not configured');
-
+/**
+ * Builds the exact Messages API request body used for reconciliation. Pure
+ * and exported so provenance.js (and any third-party verifier) can rebuild
+ * it from the committed submissions and confirm, byte for byte, that the
+ * prompt Claude actually saw contained exactly those submissions.
+ */
+export function buildReconcileRequest(question, submissions, model = config.anthropicModel) {
   const submissionsText = submissions.map((s) => `Worker ${s.workerId}: "${s.answer}"`).join('\n');
-  // Only non-default rules add anything to the prompt, so the default
-  // mode's Claude call is unchanged.
-  const ruleText =
-    rule?.mode === 'numeric-tolerance'
-      ? ` The asker requested numeric matching: treat numeric answers ${describeTolerance(rule.tolerance)} as matches.`
-      : '';
-
-  const message = await client.messages.create({
-    model: config.anthropicModel,
+  return {
+    model,
     max_tokens: 512,
     tool_choice: { type: 'tool', name: 'report_consensus' },
     tools: [REPORT_CONSENSUS_TOOL],
@@ -192,13 +176,27 @@ async function reconcileWithClaude(question, submissions, rule) {
           ruleText,
       },
     ],
-  });
+  };
+}
+
+/** The parts of a Messages API response worth preserving for provenance —
+ * enough to re-read the tool call, without SDK-internal fields. */
+function captureResponse(message) {
+  return { id: message.id, model: message.model, stop_reason: message.stop_reason, content: message.content };
+}
+
+async function reconcileWithClaude(question, submissions) {
+  const client = getClient();
+  if (!client) throw new Error('ANTHROPIC_API_KEY not configured');
+
+  const request = buildReconcileRequest(question, submissions);
+  const message = await client.messages.create(request);
 
   const toolUse = message.content.find((b) => b.type === 'tool_use' && b.name === 'report_consensus');
   if (!toolUse) throw new Error('Claude did not return a report_consensus tool call');
 
   const { consensus, confidence, matching_worker_ids: matchingWorkerIds } = toolUse.input;
-  return { consensus, confidence, matchingWorkerIds, method: 'claude' };
+  return { consensus, confidence, matchingWorkerIds, method: 'claude', llm: { request, response: captureResponse(message) } };
 }
 
 const REPORT_DRAFT_TOOL = {
@@ -218,6 +216,18 @@ const REPORT_DRAFT_TOOL = {
     required: ['answer', 'confidence'],
   },
 };
+
+/** Same idea as buildReconcileRequest(): the exact instant-tier request
+ * body, rebuildable by a verifier from the committed question alone. */
+export function buildDraftRequest(question, model = config.anthropicModel) {
+  return {
+    model,
+    max_tokens: 512,
+    tool_choice: { type: 'tool', name: 'report_draft' },
+    tools: [REPORT_DRAFT_TOOL],
+    messages: [{ role: 'user', content: `Question: "${question}"\n\nGive your best direct answer.` }],
+  };
+}
 
 /**
  * The `instant` tier's entire fulfillment path — no worker submissions
@@ -239,19 +249,20 @@ export async function draftAnswer(question, questionId, { purpose = 'instant-tie
   }
 
   try {
-    const message = await client.messages.create({
-      model: config.anthropicModel,
-      max_tokens: 512,
-      tool_choice: { type: 'tool', name: 'report_draft' },
-      tools: [REPORT_DRAFT_TOOL],
-      messages: [{ role: 'user', content: `Question: "${question}"\n\nGive your best direct answer.` }],
-    });
+    const request = buildDraftRequest(question);
+    const message = await client.messages.create(request);
 
     const toolUse = message.content.find((b) => b.type === 'tool_use' && b.name === 'report_draft');
     if (!toolUse) return null;
 
     const { answer, confidence } = toolUse.input;
-    return { consensus: answer, confidence, matchingWorkerIds: [], method: 'llm-draft' };
+    return {
+      consensus: answer,
+      confidence,
+      matchingWorkerIds: [],
+      method: 'llm-draft',
+      llm: { request, response: captureResponse(message) },
+    };
   } catch (err) {
     logger.error({ err, questionId, purpose }, `${purpose} draft answer failed`);
     return null;

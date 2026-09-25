@@ -1,0 +1,221 @@
+{
+  "target": "http://localhost:4999",
+  "scenario": "sse",
+  "stageSeconds": 20,
+  "maxErrorRate": 0.05,
+  "maxP95Ms": 500,
+  "maxJobP95Ms": 5000,
+  "finishedAt": "2026-09-24T12:28:54.562Z",
+  "results": [
+    {
+      "level": 100,
+      "verdict": "ok",
+      "openStreams": 100,
+      "serverReportedOnlineWorkers": 100,
+      "connect": {
+        "attempted": 100,
+        "requests": 100,
+        "p50": 94,
+        "p95": 223,
+        "p99": 231,
+        "max": 233,
+        "errorRate": 0,
+        "rateLimited": 0,
+        "statuses": {
+          "200": 100
+        }
+      },
+      "requests": 193,
+      "rps": 9.6,
+      "p50": 2,
+      "p95": 6,
+      "p99": 19,
+      "max": 48,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 193
+      }
+    },
+    {
+      "level": 1000,
+      "verdict": "ok",
+      "openStreams": 1000,
+      "serverReportedOnlineWorkers": 1000,
+      "connect": {
+        "attempted": 900,
+        "requests": 900,
+        "p50": 31,
+        "p95": 48,
+        "p99": 53,
+        "max": 57,
+        "errorRate": 0,
+        "rateLimited": 0,
+        "statuses": {
+          "200": 900
+        }
+      },
+      "requests": 195,
+      "rps": 9.7,
+      "p50": 2,
+      "p95": 4,
+      "p99": 6,
+      "max": 7,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 195
+      }
+    },
+    {
+      "level": 4000,
+      "verdict": "ok",
+      "openStreams": 4000,
+      "serverReportedOnlineWorkers": 4000,
+      "connect": {
+        "attempted": 3000,
+        "requests": 3000,
+        "p50": 29,
+        "p95": 77,
+        "p99": 95,
+        "max": 107,
+        "errorRate": 0,
+        "rateLimited": 0,
+        "statuses": {
+          "200": 3000
+        }
+      },
+      "requests": 196,
+      "rps": 9.8,
+      "p50": 2,
+      "p95": 4,
+      "p99": 4,
+      "max": 5,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 196
+      }
+    },
+    {
+      "level": 8000,
+      "verdict": "ok",
+      "openStreams": 8000,
+      "serverReportedOnlineWorkers": 8000,
+      "connect": {
+        "attempted": 4000,
+        "requests": 4000,
+        "p50": 20,
+        "p95": 41,
+        "p99": 59,
+        "max": 79,
+        "errorRate": 0,
+        "rateLimited": 0,
+        "statuses": {
+          "200": 4000
+        }
+      },
+      "requests": 195,
+      "rps": 9.7,
+      "p50": 2,
+      "p95": 5,
+      "p99": 9,
+      "max": 10,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 195
+      }
+    },
+    {
+      "level": 12000,
+      "verdict": "ok",
+      "openStreams": 12000,
+      "serverReportedOnlineWorkers": 12000,
+      "connect": {
+        "attempted": 4000,
+        "requests": 4000,
+        "p50": 46,
+        "p95": 123,
+        "p99": 170,
+        "max": 236,
+        "errorRate": 0,
+        "rateLimited": 0,
+        "statuses": {
+          "200": 4000
+        }
+      },
+      "requests": 195,
+      "rps": 9.7,
+      "p50": 2,
+      "p95": 5,
+      "p99": 10,
+      "max": 11,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 195
+      }
+    },
+    {
+      "level": 16000,
+      "verdict": "ok",
+      "openStreams": 16000,
+      "serverReportedOnlineWorkers": 16000,
+      "connect": {
+        "attempted": 4000,
+        "requests": 4000,
+        "p50": 74,
+        "p95": 183,
+        "p99": 212,
+        "max": 238,
+        "errorRate": 0,
+        "rateLimited": 0,
+        "statuses": {
+          "200": 4000
+        }
+      },
+      "requests": 194,
+      "rps": 9.7,
+      "p50": 2,
+      "p95": 8,
+      "p99": 14,
+      "max": 22,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 194
+      }
+    },
+    {
+      "level": 20000,
+      "verdict": "ok",
+      "openStreams": 20000,
+      "serverReportedOnlineWorkers": 20000,
+      "connect": {
+        "attempted": 4000,
+        "requests": 4000,
+        "p50": 101,
+        "p95": 486,
+        "p99": 790,
+        "max": 1922,
+        "errorRate": 0,
+        "rateLimited": 0,
+        "statuses": {
+          "200": 4000
+        }
+      },
+      "requests": 196,
+      "rps": 9.8,
+      "p50": 2,
+      "p95": 5,
+      "p99": 10,
+      "max": 23,
+      "errorRate": 0,
+      "rateLimited": 0,
+      "statuses": {
+        "200": 196
+      }
+    }
+  ]
+}
