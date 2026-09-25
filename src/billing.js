@@ -161,3 +161,66 @@ export async function handleStripeWebhook(rawBody, signature) {
   const amountStroops = BigInt(session.amount_total) * stroopsPerCent;
   await store.incrBy(`credit:${accountId}`, Number(amountStroops));
 }
+
+/**
+ * Per-customer usage analytics. Unlike stats.js's incrementStat() counters
+ * (global, platform-wide, sandbox-excluded), these are keyed per account so
+ * a customer can see their own per-endpoint/per-tier call patterns via
+ * GET /billing/usage. Keyed usage:{accountId}:{endpoint}:{tier}:{day} so a
+ * rolling window can be read back without scanning the whole keyspace.
+ *
+ * Sandbox traffic is excluded by the caller (server.js), consistent with
+ * how stats.js already excludes it from platform-wide numbers.
+ */
+const USAGE_WINDOW_DAYS = 30;
+
+function usageDay(ts = Date.now()) {
+  return new Date(ts).toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+}
+
+/** Records one API call for an account. Called from the resolveApiKey()-
+ * gated request flow in server.js's POST /oracle, alongside the existing
+ * incrementStat() calls. */
+export async function recordUsage(accountId, endpoint, tier, ts = Date.now()) {
+  if (!accountId || !endpoint || !tier) return;
+  await store.incrBy(`usage:${accountId}:${endpoint}:${tier}:${usageDay(ts)}`, 1);
+}
+
+/**
+ * Reads back the last USAGE_WINDOW_DAYS days of usage for an account,
+ * aggregated per endpoint and per tier. Returns { windowDays, total,
+ * byEndpoint, byTier, byDay } — byEndpoint/byTier are the breakdown the
+ * acceptance criteria require; byDay is included so a caller can render a
+ * trend without a second round-trip.
+ *
+ * Note: on in-memory-only deployments this only reflects usage since the
+ * last restart; Redis-backed deployments retain real history (same caveat
+ * README already states for multi-instance behavior).
+ */
+export async function getUsage(accountId, windowDays = USAGE_WINDOW_DAYS) {
+  const byEndpoint = {};
+  const byTier = {};
+  const byDay = {};
+  let total = 0;
+
+  const now = Date.now();
+  for (let i = 0; i < windowDays; i++) {
+    const day = usageDay(now - i * 24 * 60 * 60 * 1000);
+    const keys = await store.list(`usage:${accountId}:`);
+    for (const key of keys) {
+      const parts = key.split(':');
+      // usage:{accountId}:{endpoint}:{tier}:{day}
+      if (parts.length !== 5 || parts[4] !== day) continue;
+      const endpoint = parts[2];
+      const tier = parts[3];
+      const count = (await store.get(key)) || 0;
+      if (!count) continue;
+      total += count;
+      byEndpoint[endpoint] = (byEndpoint[endpoint] || 0) + count;
+      byTier[tier] = (byTier[tier] || 0) + count;
+      byDay[day] = (byDay[day] || 0) + count;
+    }
+  }
+
+  return { windowDays, total, byEndpoint, byTier, byDay };
+}

@@ -9,6 +9,12 @@
  * matched the human-reconciled consensus. These counters are keyed the same
  * way as resolved/refunded so they aggregate with the same machinery, and are
  * purely observability — they never touch settlement, timing, or cost.
+ *
+ * Issue #152 adds per-customer usage counters keyed by
+ * `usage:{accountId}:{endpoint}:{tier}:{day}` so API customers can see their
+ * own per-endpoint/per-tier call patterns via GET /billing/usage. These are
+ * written from the same resolveApiKey()-gated request flow as the platform
+ * counters and, like the platform counters, exclude sandbox traffic.
  */
 
 export function emptyStats() {
@@ -55,4 +61,61 @@ export function publicStats(stats) {
       agreementRate: counted > 0 ? stats.shadowMatched / counted : null,
     },
   };
+}
+
+/**
+ * Builds the per-customer usage counter key. Mirrors the shape used by the
+ * platform counters: one key per (account, endpoint, tier, day) so a rolling
+ * window can be read back without scanning unrelated keys.
+ */
+export function usageKey(accountId, endpoint, tier, day) {
+  return `usage:${accountId}:${endpoint}:${tier}:${day}`;
+}
+
+/**
+ * Records a single API call against the per-customer usage counters. Sandbox
+ * traffic is excluded here for the same reason stats.js excludes it from the
+ * platform-wide numbers: it isn't real customer usage. Returns the key that
+ * was incremented (or null when the call was skipped) so callers can log or
+ * test the write without re-deriving the key.
+ */
+export async function recordUsage(store, { accountId, endpoint, tier, sandbox, day } = {}) {
+  if (sandbox) return null;
+  if (!accountId || !endpoint || !tier) return null;
+  const key = usageKey(accountId, endpoint, tier, day || new Date().toISOString().slice(0, 10));
+  await store.incrBy(key, 1);
+  return key;
+}
+
+/**
+ * Reads back a per-endpoint/per-tier breakdown for one account over a recent
+ * window of days. `days` is the rolling window (default 30) and `now` is
+ * injectable so tests don't depend on the wall clock. Returns
+ * `{ accountId, days, total, endpoints: { [endpoint]: { total, tiers: {...} } } }`.
+ */
+export async function getUsage(store, accountId, { days = 30, now = new Date() } = {}) {
+  const endpoints = {};
+  let total = 0;
+  for (let i = 0; i < days; i += 1) {
+    const day = new Date(now.getTime() - i * 86400000).toISOString().slice(0, 10);
+    const prefix = `usage:${accountId}:`;
+    const keys = await store.listKeys(`${prefix}*:${day}`);
+    for (const key of keys) {
+      const rest = key.slice(prefix.length);
+      const sep = rest.lastIndexOf(':');
+      if (sep < 0) continue;
+      const endpointTier = rest.slice(0, sep);
+      const tierSep = endpointTier.lastIndexOf(':');
+      if (tierSep < 0) continue;
+      const endpoint = endpointTier.slice(0, tierSep);
+      const tier = endpointTier.slice(tierSep + 1);
+      const count = Number(await store.get(key)) || 0;
+      if (!count) continue;
+      if (!endpoints[endpoint]) endpoints[endpoint] = { total: 0, tiers: {} };
+      endpoints[endpoint].tiers[tier] = (endpoints[endpoint].tiers[tier] || 0) + count;
+      endpoints[endpoint].total += count;
+      total += count;
+    }
+  }
+  return { accountId, days, total, endpoints };
 }
