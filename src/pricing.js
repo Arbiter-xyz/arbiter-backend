@@ -46,6 +46,36 @@ export const PRICING_TIERS = Object.freeze({
     // first." See dispatch.js's selectTargets for the fail-open behavior.
     preferEstablished: true,
   }),
+  // Self-driving quorum: asks one worker first and only recruits more when
+  // that answer isn't confident enough (see dispatch.js's decideEscalation).
+  // The final quorum size isn't known at quote time, so this is quoted and
+  // charged at a CEILING — the price of the fully-escalated quorum
+  // (escalation.maxQuorum workers, same per-worker rate as `priority`).
+  // quorumSize is that ceiling on purpose: surgeMultiplier() scales off it,
+  // so worker-supply scarcity is judged against the worst-case recruit.
+  // What happens to the difference once the real size is known:
+  //   - metered / API-key flow: the unused portion is refunded to the
+  //     customer's credit (billing.js settleReservation, via
+  //     effectiveEscalatedPriceStroops below).
+  //   - classic on-chain submit() flow: the escrowed amount is fixed at
+  //     payment time and the contract can't shrink it, so the platform keeps
+  //     the delta — same as today's surge ceiling. The job record shows both
+  //     numbers (amountStroops charged vs effectiveAmountStroops used).
+  auto: Object.freeze({
+    key: 'auto',
+    label: 'Auto — starts with one worker, recruits more only if unsure (charged at the maximum, unused portion refunded on API-key/prepaid billing)',
+    priceStroops: 6_000_000n,
+    quorumSize: 5,
+    timeoutMs: 45_000,
+    escalation: Object.freeze({
+      initialQuorum: 1,
+      maxQuorum: 5,
+      // Minimum confidence in a lone worker's answer to settle on it alone.
+      confidenceThreshold: 0.8,
+      // How long to wait on the current recruits before recruiting more.
+      stepTimeoutMs: 10_000,
+    }),
+  }),
 });
 
 export const DEFAULT_TIER_KEY = 'standard';
@@ -75,6 +105,9 @@ export function listTiersForClient() {
     amountStroops: t.priceStroops.toString(),
     quorumSize: t.quorumSize,
     timeoutMs: t.timeoutMs,
+    ...(t.escalation
+      ? { escalating: true, initialQuorum: t.escalation.initialQuorum, maxQuorum: t.escalation.maxQuorum }
+      : {}),
   }));
 }
 
@@ -114,4 +147,69 @@ export function priceForTier(tierKey, onlineWorkers) {
   const multiplier = surgeMultiplier(tier, onlineWorkers);
   const priceStroops = BigInt(Math.round(Number(tier.priceStroops) * multiplier));
   return { ...tier, priceStroops, surgeMultiplier: multiplier };
+}
+
+/**
+ * Shadow-mode AI baseline (issue #13). The `instant` tier already produces an
+ * LLM draft with no human quorum; for questions dispatched on a real quorum
+ * tier (standard/express/priority) we additionally generate that same instant
+ * draft *in shadow* — off the settlement path — and later compare it against
+ * the human-reconciled consensus. This turns "we think the LLM draft is
+ * usually right" into a published, verifiable agreement rate, and is the
+ * measurement prerequisite for any future AI-assisted routing.
+ *
+ * This is purely observability: it must never affect settlement, timing, or
+ * cost of the real dispatch. The helpers below are deliberately pure and
+ * side-effect-free so callers can run them alongside the existing quorum
+ * without touching the dispatch path.
+ */
+
+// Tiers that carry a real human quorum and therefore qualify for a shadow
+// draft. `instant` is excluded — it *is* the draft, not a shadow of one.
+export function shouldShadowDraft(tierKey) {
+  const tier = resolveTier(tierKey);
+  return !tier.instant && tier.quorumSize > 0;
+}
+
+// Normalizes an answer for comparison so trivial formatting differences
+// (case, surrounding whitespace, collapsed internal whitespace) don't count
+// as disagreement. Kept intentionally conservative — anything beyond this
+// would be guessing at semantic equivalence, which is out of scope here.
+export function normalizeDraftAnswer(answer) {
+  if (answer === null || answer === undefined) return '';
+  return String(answer).trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+/**
+ * Compares a shadow instant-tier draft against the human-reconciled consensus
+ * outcome for the same question. Returns a record keyed the same way stats.js
+ * tracks its `resolved`/`refunded` counters, so the shadow counters can be
+ * aggregated with the same machinery. `matched` is only meaningful when the
+ * question actually settled to a consensus answer; a refunded/no-consensus
+ * question is recorded as `refunded` and excluded from the agreement rate.
+ */
+export function recordShadowAgreement({ draftAnswer, consensusAnswer, outcome }) {
+  if (outcome !== 'resolved') {
+    return { outcome: 'refunded', matched: false, counted: false };
+  }
+  const matched = normalizeDraftAnswer(draftAnswer) === normalizeDraftAnswer(consensusAnswer);
+  return { outcome: 'resolved', matched, counted: true };
+}
+
+/**
+ * Aggregates shadow-agreement counters into the published rate. Mirrors the
+ * shape stats.js exposes for resolved/refunded so it can be surfaced the same
+ * way (e.g. via /stats or an admin endpoint). `agreementRate` is null until
+ * there's at least one counted (resolved) comparison, so callers don't publish
+ * a misleading 0% before any data exists.
+ */
+export function shadowAgreementRate({ matched = 0, mismatched = 0, refunded = 0 } = {}) {
+  const counted = matched + mismatched;
+  return {
+    matched,
+    mismatched,
+    refunded,
+    counted,
+    agreementRate: counted > 0 ? matched / counted : null,
+  };
 }

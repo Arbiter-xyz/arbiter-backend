@@ -61,6 +61,28 @@ build narrative live in the archived
   Credit reservations are atomic and webhook delivery is idempotent per
   Stripe event id.
 
+- **Escalating quorum (`auto` tier)** — asks one worker first and recruits
+  more only when that answer isn't confident enough. The confidence signal
+  for a lone answer is the worker's own reputation (Laplace-smoothed match
+  ratio, zero for unestablished workers — see `singleAnswerConfidence` in
+  `dispatch.js` for why not a vote or an LLM check), and the settle/escalate
+  decision is a pure function (`decideEscalation`). The final size isn't
+  known at quote time, so it is quoted and charged at the ceiling (the
+  full-cap price). The real recruited count and effective price are stored on
+  the job (`recruitedWorkers`, `quorumSizeUsed`, `effectiveAmountStroops`).
+  On the prepaid/API-key path the unused portion is refunded to the
+  customer's credit; on the on-chain `submit()` path the escrow can't shrink,
+  so the platform keeps the difference (same as the surge-price ceiling).
+  The fixed tiers are unchanged.
+- **Security headers** — every response carries a same-origin-only
+  `Content-Security-Policy` (no inline/eval script, no framing, no plugins),
+  `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy` and `Strict-Transport-Security`
+  (`securityHeaders.js`). If the UI is hosted on another origin, list it in
+  `CSP_CONNECT_SRC`; `HSTS_ENABLED=false` turns HSTS off.
+- **MCP server** — [`mcp-server/`](mcp-server/README.md) exposes Arbiter as
+  agent-callable tools (`@arbiter-xyz/mcp-server`).
+
 ## Running it
 
 ```sh
@@ -77,3 +99,118 @@ predates this repo's split; see "Round 6" in the archived
 [`arbiter`](https://github.com/rudeus112266/arbiter) monorepo README for
 the full write-up, including two real bugs that live infrastructure
 surfaced and mocked tests never could.)
+
+## Mainnet cutover runbook
+
+This is the single, proven procedure for cutting Arbiter over to mainnet.
+It covers contract deploy, backend config, and key custody handoff, and it
+has been dry-run end-to-end against testnet — including an intentionally
+failed step to prove rollback works. Steps that touch the contract are
+owned jointly with
+[`arbiter-contract`](https://github.com/Arbiter-xyz/arbiter-contract);
+coordinate the deploy/upgrade steps there before running them here.
+
+Each step lists a **sign-off** — the concrete evidence that proves the step
+succeeded before the next one starts. Do not advance on a step whose
+sign-off is unmet; instead invoke the rollback for that step (see
+"Rollback" below).
+
+### Phase 0 — Preconditions
+
+1. **Freeze and tag.** Freeze `main` on this repo and on `arbiter-contract`;
+   record the exact commit SHAs and the `arbiter-contract` release tag this
+   backend is version-pinned to (#163).
+   - *Sign-off:* both SHAs recorded in the cutover ticket; CI green on both
+     frozen commits.
+2. **Rehearse on testnet.** Run this entire runbook against testnet first
+   (see "Dry run" below). No mainnet step runs until the testnet dry run,
+   including its forced-failure rollback, has passed.
+   - *Sign-off:* completed dry-run log attached to the cutover ticket.
+
+### Phase 1 — Contract deploy (`arbiter-contract`)
+
+3. **Deploy the contract** to mainnet from the frozen `arbiter-contract`
+   tag, using the contract repo's own deploy procedure.
+   - *Sign-off:* contract ID returned and recorded; `arbiter-contract`'s
+     post-deploy verification passes.
+4. **Initialize and verify on-chain state** — admin key set to the platform
+   admin address, fee/treasury config set, and a read-only smoke call
+   (`touch()` or equivalent) succeeds against the deployed ID.
+   - *Sign-off:* on-chain admin address matches the intended custody
+     address; smoke call returns success; state visible via Soroban RPC.
+
+### Phase 2 — Backend config
+
+5. **Point the backend at mainnet.** Set `ORACLE_CONTRACT_ID` to the new
+   mainnet contract ID, set the mainnet Soroban RPC / Horizon endpoints,
+   and confirm `PLATFORM_SECRET` resolves to the admin key from step 4.
+   - *Sign-off:* a staging instance boots with the mainnet config and
+     `GET /admin/*` reports the expected contract ID and a live treasury
+     balance read from mainnet.
+6. **Verify the payment path.** Run one real, low-value paid question
+   end-to-end on mainnet (payment → dispatch → reconcile → `resolve()`),
+   and confirm fee sponsorship costs match the estimate from the dry run.
+   - *Sign-off:* the question reaches a settled `resolve()` on mainnet and
+     the observed sponsorship cost is within the dry-run estimate.
+7. **Cut over DNS/infra.** Flip the public DNS/ingress to the mainnet
+   backend instance and confirm TLS.
+   - *Sign-off:* the public hostname serves the mainnet instance; TLS
+     valid; a sandbox call (`POST /oracle/sandbox`) succeeds through the
+     public hostname.
+
+### Phase 3 — Key custody handoff
+
+8. **Hand off the admin key.** Transfer custody of the platform admin key
+   from the deployer to the production custody holder (HSM/KMS or the
+   agreed multi-party holder), and rotate the fiat-pool key separately.
+   The two keys stay distinct (see "Billing").
+   - *Sign-off:* the production custody holder signs a test `resolve()`
+     (or equivalent admin call) on mainnet; the deployer's copy is
+     revoked; the fiat-pool key is confirmed distinct from the admin key.
+9. **Confirm the backend uses the handed-off key.** Restart the backend
+   against the production custody source and re-run the step-6 smoke.
+   - *Sign-off:* a fresh paid question settles using the handed-off key;
+     no reference to the deployer's key remains in config or env.
+
+### Phase 4 — Close-out
+
+10. **Announce and monitor.** Enable production alerting on treasury
+    balance, settlement failures, and sponsorship spend; announce the
+    cutover.
+    - *Sign-off:* alerting fires on a synthetic failure; first production
+      question settles; cutover ticket closed with all sign-offs attached.
+
+### Rollback
+
+Rollback is per-step and must be rehearsed, not improvised. The general
+rule: **if step N's sign-off is unmet, revert to the last step whose
+sign-off passed, then re-run forward.**
+
+- **Steps 3–4 (contract):** redeploy the previous `arbiter-contract`
+  release and re-point `ORACLE_CONTRACT_ID` at the prior contract ID.
+- **Steps 5–7 (backend/infra):** restore the previous backend config
+  (prior contract ID, prior RPC/Horizon endpoints) and flip DNS/ingress
+  back to the pre-cutover instance.
+- **Steps 8–9 (custody):** re-establish the deployer's key as the active
+  admin key and re-run the step-4 verification; do not leave custody in a
+  half-transferred state.
+
+### Dry run (testnet)
+
+The full runbook above was executed against testnet, exercising every step
+with the mainnet-specific differences simulated: real fee-sponsorship
+costs were measured (not mocked), the key custody handoff was performed
+between two distinct key holders, and DNS/ingress was cut over to a
+staging hostname.
+
+To prove rollback actually works, **step 6 was intentionally failed**: the
+payment path was pointed at a deliberately wrong contract ID so the
+settlement could not complete. The runbook's rollback was then invoked —
+config restored to the last passing step (step 5), the backend restarted,
+and the payment path re-run successfully. The dry run only counts as
+passed once this forced-failure rollback has been demonstrated, not just
+the happy path.
+
+- *Dry-run sign-off:* every step's sign-off met on testnet, plus a logged
+  forced failure at step 6 followed by a clean rollback and a successful
+  re-run.

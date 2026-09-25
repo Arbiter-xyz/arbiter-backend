@@ -43,7 +43,7 @@ export async function askMetered(payerAddress, questionText, tierKey, category, 
   await stashQuestion(questionId, pending);
 
   const tier = { ...priced };
-  const { jobId } = await startFulfillment(questionId, pending, tier, payerAddress);
+  const { jobId } = await startFulfillment(questionId, pending, tier, payerAddress, hooks);
 
   return {
     jobId,
