@@ -22,5 +22,10 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      - name: MCP server tests
+        working-directory: mcp-server
+        run: |
+          npm ci
+          npm test
       - name: Dependency audit (fails only on high/critical)
         run: npm audit --omit=dev --audit-level=high
