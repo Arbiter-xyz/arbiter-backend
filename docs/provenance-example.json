@@ -1,0 +1,48 @@
+{
+  "jobId": "1042",
+  "algorithm": "sha256",
+  "canonicalization": "RFC 8785 (JCS)",
+  "hash": "840486a5e134c38200c6bc4083ffda19a629a7aa6153bf16a9633193b4cde849",
+  "record": {
+    "v": 1,
+    "questionId": "1042",
+    "question": "What is the capital of Australia?",
+    "tier": "standard",
+    "submissions": [
+      {
+        "workerId": "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR",
+        "answer": "Canberra",
+        "established": true
+      },
+      {
+        "workerId": "GCATS5YOVB6ROX2WUNKGNQ2MP3GMXDMKSG2O4N5CLX3A6W4PZGZZI55U",
+        "answer": "canberra.",
+        "established": false
+      },
+      {
+        "workerId": "GDWUSKGGFDI4FRXK5EBTRECZSVQSSWJHHJOGH6JWG3AUMFFMQ435DIAG",
+        "answer": "Sydney",
+        "established": true
+      }
+    ],
+    "reconciliation": {
+      "method": "exact-match-fallback",
+      "llm": null,
+      "llmError": "ANTHROPIC_API_KEY not configured"
+    },
+    "result": {
+      "consensus": "Canberra",
+      "confidence": 0.6666666666666666,
+      "matchingWorkerIds": [
+        "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR",
+        "GCATS5YOVB6ROX2WUNKGNQ2MP3GMXDMKSG2O4N5CLX3A6W4PZGZZI55U"
+      ]
+    },
+    "decision": {
+      "minConfidence": 0.6,
+      "action": "resolve"
+    },
+    "committedAt": "2026-09-24T12:00:00.000Z"
+  },
+  "settlement": null
+}

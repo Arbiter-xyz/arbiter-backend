@@ -41,9 +41,19 @@ import { parseConsensusRule } from './consensus.js';
 import { getPrivatePool, addPoolWorkers, removePoolWorkers, PoolValidationError } from './privatePools.js';
 import { isBillingConfigured, createCheckoutSession, handleStripeWebhook, getCreditBalanceStroops, reserveCredit, settleReservation } from './billing.js';
 import { logger, httpLogger } from './logger.js';
-import { securityHeadersMiddleware } from './securityHeaders.js';
+import { getProvenance } from './provenance.js';
+import { enforceSecurityPosture } from './securityPosture.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Refuse to boot a real deployment that left a severe insecure default in
+// place, and log loudly about the rest — see securityPosture.js. Local dev
+// with every default untouched passes silently.
+if (!enforceSecurityPosture(process.env, logger)) {
+  console.error('[security-posture] refusing to start: fix the setting(s) named above.');
+  await new Promise((resolve) => logger.flush(resolve));
+  process.exit(1);
+}
 
 const app = express();
 // One structured log line per request (method/path/status/duration/request
@@ -340,21 +350,22 @@ app.get('/oracle/:jobId', async (req, res) => {
   return res.status(httpStatus).json({ jobId: req.params.jobId, ...job });
 });
 
-// Undo window (see undoWindow.js / oracle.js's cancelJob): a paid,
-// non-instant question can be cancelled and refunded while its job is still
-// 'holding', before dispatch. Authenticated as the payer — a session token
-// for the job's payer address in body.token, or, for an API-key-funded
-// question, the same `Authorization: Bearer ak_live_...` key that asked it.
-app.post('/oracle/:jobId/cancel', rateLimited('oracle', byIp), async (req, res) => {
-  try {
-    const apiKeyAccountId = await resolveApiKey(req);
-    const result = await cancelJob(req.params.jobId, { sessionToken: (req.body || {}).token, apiKeyAccountId });
-    if (!result.ok) return res.status(result.status).json({ jobId: req.params.jobId, error: result.error });
-    return res.json({ jobId: req.params.jobId, ...result.job });
-  } catch (err) {
-    req.log.error({ err, jobId: req.params.jobId }, 'cancel failed');
-    return res.status(500).json({ error: 'failed to cancel question' });
-  }
+// Public, unauthenticated, same as GET /oracle/:jobId: the full committed
+// reconciliation inputs for a settled question (raw worker submissions, the
+// exact LLM request/response when one was used), the sha256 commitment, and
+// the settlement tx hashes. See provenance.js for the format, and
+// scripts/verify-provenance.js to re-derive the consensus independently.
+app.get('/oracle/:jobId/provenance', async (req, res) => {
+  const entry = await getProvenance(req.params.jobId);
+  if (!entry) return res.status(404).json({ error: 'no provenance recorded for this jobId (not settled yet, or settled before provenance existed)' });
+  return res.json({
+    jobId: req.params.jobId,
+    algorithm: 'sha256',
+    canonicalization: 'RFC 8785 (JCS)',
+    hash: entry.hash,
+    record: entry.record,
+    settlement: entry.settlement,
+  });
 });
 
 // A payer's own question history — there's no account system, so this is
