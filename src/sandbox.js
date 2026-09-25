@@ -3,6 +3,7 @@ import { resolveTier } from './pricing.js';
 import { exactMatchVote, draftAnswer } from './reconcile.js';
 import { config } from './config.js';
 import { jobLogger } from './logger.js';
+import { tryConsumeClaudeBudget } from './claudeBudget.js';
 
 /**
  * Sandbox mode: ask a question with zero real payment and get a realistic,
@@ -30,8 +31,10 @@ import { jobLogger } from './logger.js';
  * exercise specific edge-case response shapes on demand, not to get "a real
  * answer." Cost exposure from a free, unauthenticated endpoint calling a
  * paid API is bounded by the existing per-IP sandbox rate limit
- * (SANDBOX_RATE_LIMIT_MAX), same protection every other rate-limited route
- * here already relies on.
+ * (SANDBOX_RATE_LIMIT_MAX) AND by the fleet-wide rolling Claude budget
+ * (claudeBudget.js) — when that budget is exhausted, this path cleanly
+ * falls back to the canned response instead of calling Claude, so a
+ * distributed attacker can't multiply real spend across many IPs.
  * Every response is unambiguously tagged `sandbox: true` and fake tx
  * hashes are prefixed "SANDBOX-" so nothing here can be mistaken for a
  * real settlement.
@@ -127,30 +130,37 @@ async function runSandboxFulfillment(questionId, questionText, mode) {
   await sleep(350);
 
   if (mode === 'resolved' && config.anthropicApiKey) {
-    const draft = await draftAnswer(questionText, questionId);
-    if (draft) {
-      // Honest about what actually produced this answer — no fake
-      // "3 workers agreed" shape when it was really one Claude call.
-      // totalAnswers: 0 / matchingWorkers: [] matches how oracle.js's real
-      // Instant tier reports the same llm-draft method for the same reason.
-      await updateJob(questionId, { status: 'reconciling', totalAnswers: 0 });
-      await sleep(350);
-      await updateJob(questionId, {
-        status: 'settled',
-        outcome: 'resolved',
-        answer: draft.consensus,
-        confidence: draft.confidence,
-        reconciliationMethod: draft.method,
-        totalAnswers: 0,
-        matchingWorkers: [],
-        payoutTx: fakeTxHash('payout'),
-        payoutModel: 'sandbox — no real funds moved',
-      });
-      return;
+    // Fleet-wide hard cost cap: reserve budget before spending real money.
+    // If the rolling budget is exhausted (e.g. distributed abuse across
+    // many IPs), skip Claude entirely and fall through to the canned path
+    // below — a clean, deterministic response, never a hung request.
+    const allowed = await tryConsumeClaudeBudget('sandbox');
+    if (allowed) {
+      const draft = await draftAnswer(questionText, questionId);
+      if (draft) {
+        // Honest about what actually produced this answer — no fake
+        // "3 workers agreed" shape when it was really one Claude call.
+        // totalAnswers: 0 / matchingWorkers: [] matches how oracle.js's real
+        // Instant tier reports the same llm-draft method for the same reason.
+        await updateJob(questionId, { status: 'reconciling', totalAnswers: 0 });
+        await sleep(350);
+        await updateJob(questionId, {
+          status: 'settled',
+          outcome: 'resolved',
+          answer: draft.consensus,
+          confidence: draft.confidence,
+          reconciliationMethod: draft.method,
+          totalAnswers: 0,
+          matchingWorkers: [],
+          payoutTx: fakeTxHash('payout'),
+          payoutModel: 'sandbox — no real funds moved',
+        });
+        return;
+      }
+      // draftAnswer() returned null (no key after all, or Claude errored) —
+      // fall through to the deterministic canned path below rather than
+      // surfacing a broken demo.
     }
-    // draftAnswer() returned null (no key after all, or Claude errored) —
-    // fall through to the deterministic canned path below rather than
-    // surfacing a broken demo.
   }
 
   const submissions = cannedSubmissions(questionText, mode);
@@ -194,10 +204,7 @@ async function runSandboxFulfillment(questionId, questionText, mode) {
       reason:
         result.method === 'no-answers'
           ? 'no workers answered in time (simulated)'
-          : `confidence ${result.confidence.toFixed(2)} below MIN_CONFIDENCE threshold (simulated)`,
-      confidence: result.confidence,
-      reconciliationMethod: result.method,
-      totalAnswers: submissions.length,
+          : `confidence ${result.confidence.toFixed(2)} below threshold (simulated)`,
       refundTx: fakeTxHash('refund'),
     });
   }

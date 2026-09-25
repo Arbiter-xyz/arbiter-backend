@@ -115,3 +115,36 @@ export function priceForTier(tierKey, onlineWorkers) {
   const priceStroops = BigInt(Math.round(Number(tier.priceStroops) * multiplier));
   return { ...tier, priceStroops, surgeMultiplier: multiplier };
 }
+
+/**
+ * Splits an escrowed amount into per-worker payout shares plus the platform
+ * fee, guaranteeing the fund-accounting invariant that the sum of all
+ * payouts plus the platform fee plus any rounding dust exactly equals the
+ * escrowed amount — never more. This is the single source of truth the
+ * property-based fuzzing suite (test/pricing.property.test.js) asserts
+ * against: payoutShare * workerCount + platformFee + dust === escrowed.
+ *
+ * The platform fee is taken first (floored, so it can never round up past
+ * the escrow), then the remainder is split evenly across workers with the
+ * integer-division remainder recorded as dust rather than silently dropped
+ * or, worse, over-paid. workerCount <= 0 yields a zero share and routes the
+ * whole remainder to dust so callers can't divide by zero or mint value.
+ */
+export function splitPayout(escrowedStroops, workerCount, platformFeeBps = 0) {
+  const escrowed = BigInt(escrowedStroops);
+  if (escrowed < 0n) throw new RangeError('escrowedStroops must be non-negative');
+  const bps = BigInt(platformFeeBps);
+  if (bps < 0n || bps > 10_000n) throw new RangeError('platformFeeBps must be within [0, 10000]');
+
+  const platformFee = (escrowed * bps) / 10_000n;
+  const distributable = escrowed - platformFee;
+
+  const workers = BigInt(workerCount);
+  if (workers <= 0n) {
+    return { payoutShare: 0n, workerCount: 0n, platformFee, dust: distributable };
+  }
+
+  const payoutShare = distributable / workers;
+  const dust = distributable - payoutShare * workers;
+  return { payoutShare, workerCount: workers, platformFee, dust };
+}

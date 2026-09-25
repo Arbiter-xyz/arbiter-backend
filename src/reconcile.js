@@ -32,6 +32,39 @@ export function exactMatchVote(submissions) {
   };
 }
 
+/**
+ * Splits an escrowed amount into per-worker payout shares plus the platform
+ * fee, guaranteeing the fund-accounting invariant that the sum of all
+ * payouts plus the platform fee never exceeds (and, up to integer dust,
+ * exactly equals) the escrowed amount. This is the single source of truth
+ * for payout math so the property-based suite can fuzz it directly.
+ *
+ * `payoutShare` is the per-worker amount (floored to whole units), `dust`
+ * is the leftover that cannot be evenly divided, and `platformFee` is the
+ * fee taken off the top. The invariant asserted by the fuzz suite is:
+ *   payoutShare * workerCount + platformFee + dust === escrowedAmount
+ * for every generated input, including extreme worker counts and boundary
+ * fee rates.
+ */
+export function splitEscrow(escrowedAmount, workerCount, platformFeeRate = 0) {
+  if (!Number.isFinite(escrowedAmount) || escrowedAmount < 0) {
+    throw new RangeError('escrowedAmount must be a finite non-negative number');
+  }
+  if (!Number.isInteger(workerCount) || workerCount <= 0) {
+    throw new RangeError('workerCount must be a positive integer');
+  }
+  if (!Number.isFinite(platformFeeRate) || platformFeeRate < 0 || platformFeeRate > 1) {
+    throw new RangeError('platformFeeRate must be a finite number in [0, 1]');
+  }
+
+  const platformFee = Math.floor(escrowedAmount * platformFeeRate);
+  const distributable = escrowedAmount - platformFee;
+  const payoutShare = Math.floor(distributable / workerCount);
+  const dust = distributable - payoutShare * workerCount;
+
+  return { payoutShare, platformFee, dust, workerCount };
+}
+
 const REPORT_CONSENSUS_TOOL = {
   name: 'report_consensus',
   description:
