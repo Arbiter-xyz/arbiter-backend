@@ -203,7 +203,15 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
     }
 
     try {
-      const result = await askMetered(config.billing.fiatPoolAddress, question, tier, category);
+      // Escalating-quorum tiers are charged at their ceiling; once dispatch
+      // learns the real recruited count, hand the unused part back the same
+      // way the surge reservation is settled above. Fixed tiers never call it.
+      let resolveCharged;
+      const charged = new Promise((resolve) => { resolveCharged = resolve; });
+      const result = await askMetered(config.billing.fiatPoolAddress, question, tier, category, {
+        onEffectiveCost: async (effectiveStroops) => settleReservation(apiKeyAccountId, await charged, Number(effectiveStroops)),
+      });
+      resolveCharged(Number(result.amountStroops));
       await settleReservation(apiKeyAccountId, maxStroops, Number(result.amountStroops));
       return res.status(202).json({ ...result, statusUrl: `/oracle/${result.jobId}` });
     } catch (err) {
