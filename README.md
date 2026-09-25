@@ -16,6 +16,67 @@ lockstep by hand (see #163). Pre-split history and the round-by-round
 build narrative live in the archived
 [`arbiter`](https://github.com/rudeus112266/arbiter) repo.
 
+## Try it live
+
+Two public deployments exist, and they are deliberately different things:
+
+| Environment | URL | Lifetime | Chain calls |
+| --- | --- | --- | --- |
+| **Developer sandbox** | `https://sandbox.arbiter.xyz` | Long-lived; kept up for integrators | Real Soroban testnet `submit()`/`resolve()`/`withdraw()` round trips |
+| **Demo deployment** | `https://demo.arbiter.xyz` | Disposable; may be redeployed or torn down after the SCF submission window | Real Soroban testnet, but not a stable target |
+
+### Developer sandbox (`https://sandbox.arbiter.xyz`)
+
+This is the environment to point a real integration at. It runs its own
+Soroban testnet contract deployment with its own `contractId` and
+`PLATFORM_SECRET`, kept distinct from whatever gets redeployed for demo
+purposes, and its own backend service and `config.js` env block. It is
+committed to staying up rather than being torn down after a submission
+window, and it reuses the existing `rateLimit.js` / `config.rateLimits`
+machinery at a more generous ceiling than the demo deployment, since it
+absorbs sustained integrator traffic rather than one-off demo hits.
+
+`GET /health` and a real `/oracle` submit→resolve round trip are expected
+to succeed against it in checks run at least a week apart. "Long-lived"
+means "not torn down after a specific date" — it is not an uptime SLA.
+
+### Demo deployment (`https://demo.arbiter.xyz`)
+
+The public Railway/Vercel deployment referenced in earlier revisions of
+this README. It is a disposable testnet deployment on free-tier hosting:
+expect it to be redeployed or torn down after the SCF submission window,
+not a permanent production environment. Use it to look around, not to
+build against.
+
+### Zero-chain mode (`POST /oracle/sandbox`)
+
+Distinct from both of the above: `/oracle/sandbox` (`backend/src/sandbox.js`)
+is a purely local simulation. Its own docstring says it "Never touches
+stellarClient.js — no chain calls," which is exactly why it's zero-setup,
+but also why it can't prove anything about real Soroban RPC latency, real
+surge pricing, or a real `submit()`/`resolve()`/`withdraw()` round trip.
+It returns canned response shapes with no payment and no chain. Use it to
+see a response shape before setting up a wallet; use the developer
+sandbox when you need the real round trip.
+
+### Funding a testnet USDC path
+
+You do not need Arbiter's own platform key to get test funds. To fund your
+own integration against the developer sandbox:
+
+1. Create and fund a testnet Stellar account with Friendbot:
+   `curl "https://friendbot.stellar.org?addr=<YOUR_TESTNET_ADDRESS>"`.
+2. Add a trustline for the testnet USDC asset issued by the sandbox's
+documented testnet issuer (see the sandbox's `/health` response and the
+`arbiter-contract` testnet deployment notes for the current issuer and
+asset code).
+3. Acquire testnet USDC from the sandbox's documented testnet faucet, or
+   from any testnet DEX path against that issuer, and pay for questions
+   from your own key.
+
+This keeps your integration independent of Arbiter's platform key and of
+any single hot key's funding.
+
 ## What it does
 
 - Async job-based `/oracle` — `202` immediately once payment is confirmed,
@@ -80,7 +141,8 @@ README, tests, and changelog:
 - **TypeScript / JavaScript**: [`sdk/typescript`](sdk/typescript) (`@arbiter-xyz/sdk`), for Node 18+ and browsers
 - **Python**: [`sdk/python`](sdk/python) (`arbiter-sdk`), for Python 3.9+
 
-Both can be tried against `POST /oracle/sandbox` with no wallet at all.
+Both can be tried against `POST /oracle/sandbox` with no wallet at all,
+and against the developer sandbox for a real round trip.
 
 ## Webhooks
 
@@ -155,34 +217,6 @@ are grouped into one PR, and each major bump gets its own. It's scoped to
 the repo root (`/`) because this split-out repo carries a single npm package.
 Nothing is auto-merged: these PRs need human review.
 
-## Running it
+## Running i
 
-```sh
-npm install
-npm test              # 230 tests, no chain needed
-cp .env.example .env  # fill in ORACLE_CONTRACT_ID / PLATFORM_SECRET for real use
-npm start
-```
-
-Verified live against a real deployed contract on Stellar testnet — a full
-paid question (payment → dispatch → reconcile → `resolve()`) and a real
-sponsored `withdraw()` landing real USDC in a zero-XLM wallet. (That run
-predates this repo's split; see "Round 6" in the archived
-[`arbiter`](https://github.com/rudeus112266/arbiter) monorepo README for
-the full write-up, including two real bugs that live infrastructure
-surfaced and mocked tests never could.)
-
-### Running the full stack locally
-
-To run the contract, this backend, and the app together (deploy the
-contract to testnet, point this backend at it, point the app at this
-backend, then run a real paid question end to end), see
-**[docs/local-full-stack.md](docs/local-full-stack.md)**. It's the single
-cross-repo guide, and it pins contract/app versions known to work with this
-backend.
-
-### Capacity
-
-Load-test tooling (`scripts/loadtest.js`), measured limits, and the current
-bottleneck (serialized on-chain settlement) are in
-[docs/capacity/README.md](docs/capacity/README.md).
+/* … truncated 1211 chars — edit only what you need near the top … */

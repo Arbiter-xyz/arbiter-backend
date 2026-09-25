@@ -6,6 +6,7 @@ import { getStakeOnChain, getOwedOnChain } from './stellarClient.js';
 import { getHorizon } from './sponsor.js';
 import { config } from './config.js';
 import { stroopsToUsdc } from './pricing.js';
+import { unsuspendAccount } from './billing.js';
 
 const PLATFORM_FEE_BPS = 2000n; // mirrors contracts/oracle-escrow/src/lib.rs's PLATFORM_FEE_BPS
 const BPS_DENOM = 10_000n;
@@ -158,4 +159,12 @@ export async function listAnchorKyc() {
     }),
   );
   return rows.filter(Boolean);
+}
+
+/** Operator override for the anomaly auto-suspend (issue #153): clears the
+ * suspension flag on an account so a wrongly-suspended key resumes
+ * resolving. Gated behind requireAdmin at the route layer, same as every
+ * other /admin/* handler. */
+export async function unsuspendKey(accountId) {
+  return unsuspendAccount(accountId);
 }

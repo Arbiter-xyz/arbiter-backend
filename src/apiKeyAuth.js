@@ -19,12 +19,20 @@ export function hashApiKey(rawKey) {
 }
 
 /** Returns the accountId a raw key resolves to, or null if the header is
- * missing, malformed, or the key doesn't exist. Never throws. */
+ * missing, malformed, the key doesn't exist, or the account is suspended.
+ * Never throws. Fails closed on suspension the same way requireAdmin /
+ * isBillingConfigured do elsewhere in this codebase — a suspended key is
+ * rejected here, before the request ever reaches reserveCredit(). */
 export async function resolveApiKey(req) {
   const header = req.get('authorization') || '';
   const [scheme, rawKey] = header.split(' ');
   if (scheme !== 'Bearer' || !rawKey || !rawKey.startsWith(KEY_PREFIX)) return null;
 
   const record = await store.get(`apikey:${hashApiKey(rawKey)}`);
-  return record ? record.accountId : null;
+  if (!record) return null;
+
+  const account = await store.get(`account:${record.accountId}`);
+  if (account && account.suspended) return null;
+
+  return record.accountId;
 }
