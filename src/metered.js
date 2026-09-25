@@ -2,7 +2,7 @@ import { nextQuestionId, stashQuestion } from './pendingQuestions.js';
 import { priceForTier, listTiersForClient, stroopsToUsdc } from './pricing.js';
 import { getSmoothedOnlineWorkerCount } from './dispatch.js';
 import { chargeBalance, getBalanceOnChain } from './stellarClient.js';
-import { startFulfillment } from './oracle.js';
+import { startFulfillment, consensusStashFields } from './oracle.js';
 import { config } from './config.js';
 
 /**
@@ -15,13 +15,17 @@ import { config } from './config.js';
  * themselves) — everything downstream (dispatch, reconcile, resolve/
  * refund) is the identical pipeline, unaware of which path funded it.
  *
+ * `apiKeyAccountId` is set only for the API-key path, where `payerAddress`
+ * is the platform's pooled fiat address rather than the caller's own — it
+ * records who may cancel the job during the undo window (see cancelJob).
+ *
  * Authentication is the caller's responsibility: `payerAddress` must have
  * already proven control of that address via the same challenge/response
  * session flow workerAuth.js uses for worker identity (see server.js's
  * route wiring) — without that, anyone could charge against a balance they
  * don't own just by naming someone else's address.
  */
-export async function askMetered(payerAddress, questionText, tierKey, category) {
+export async function askMetered(payerAddress, questionText, tierKey, category, { apiKeyAccountId } = {}) {
   const questionId = (await nextQuestionId()).toString();
   const priced = priceForTier(tierKey, getSmoothedOnlineWorkerCount());
 
@@ -38,14 +42,16 @@ export async function askMetered(payerAddress, questionText, tierKey, category) 
     timeoutMs: priced.timeoutMs,
     category: category || null,
     createdAt: Date.now(),
+    ...consensusStashFields(consensusRule),
   };
   await stashQuestion(questionId, pending);
 
   const tier = { ...priced };
-  const { jobId } = await startFulfillment(questionId, pending, tier, payerAddress);
+  const { jobId, cancellableUntil } = await startFulfillment(questionId, pending, tier, payerAddress, { apiKeyAccountId });
 
   return {
     jobId,
+    ...(cancellableUntil ? { cancellableUntil, cancelUrl: `/oracle/${jobId}/cancel` } : {}),
     questionId,
     tier: priced.key,
     amount: stroopsToUsdc(priced.priceStroops),

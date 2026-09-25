@@ -13,6 +13,10 @@ const PREFIX = 'job:';
 const JOB_INDEX_KEY = 'known-job-ids';
 const MAX_TRACKED_JOBS = 5_000;
 
+// Terminal states never need reconciliation again. Everything else is
+// "in-flight" and must be checked against on-chain truth on startup.
+const TERMINAL_STATUSES = new Set(['settled']);
+
 async function indexJob(jobId) {
   const known = (await store.get(JOB_INDEX_KEY)) || [];
   if (known.includes(jobId)) return;
@@ -31,9 +35,18 @@ export async function getKnownJobIds() {
  * returns 202 immediately once payment is confirmed, and the caller polls
  * GET /oracle/:jobId (or listens on its SSE stream) for the result.
  *
- * States: awaiting_workers -> reconciling -> settled
+ * States: [holding ->] awaiting_workers -> reconciling -> settled
+ * `holding` is the undo window (see undoWindow.js) — paid, not yet
+ * dispatched, cancellable until `cancellableUntil`; a cancelled job goes
+ * holding -> cancelling -> settled instead.
  * `settled` always carries an `outcome` of 'resolved' or 'refunded' — same
  * fail-closed guarantee as before, just observed asynchronously.
+ *
+ * Crash-safety: the on-chain question status is the single source of truth.
+ * A job may be persisted as non-terminal even after resolve()/refund()
+ * succeeded on-chain (the process died before the record was updated), so
+ * settlement is only ever driven by reading on-chain state — never by
+ * replaying a persisted "intent". See reconcileJobs() below.
  */
 
 /**
@@ -72,4 +85,97 @@ export async function updateJob(jobId, patch) {
 
 export async function getJob(jobId) {
   return store.get(PREFIX + jobId);
+}
+
+/**
+ * Marks a job terminal exactly once. Returns true only for the caller that
+ * actually transitioned the job out of a non-terminal state, so a settlement
+ * path can use this as its idempotency guard: if it returns false, another
+ * path (or a previous run) already recorded the terminal outcome and no
+ * on-chain call should be made.
+ */
+export async function markSettled(jobId, outcome, extra = {}) {
+  const key = PREFIX + jobId;
+  const current = (await store.get(key)) || {};
+  if (TERMINAL_STATUSES.has(current.status)) return false;
+  const next = {
+    ...current,
+    ...extra,
+    status: 'settled',
+    outcome,
+    settledAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  await store.set(key, next, config.jobResultTtlMs);
+  return true;
+}
+
+/**
+ * Startup recovery. Walks every non-terminal job and reconciles it against
+ * live on-chain question status before any settlement work resumes.
+ *
+ * `readOnChainStatus(questionId)` must return the authoritative on-chain
+ * status for the question (e.g. 'open' | 'resolved' | 'refunded'). It is the
+ * ONLY input that decides whether a settlement call is needed — a job that
+ * was mid-fulfillOracleCall when the process died is indistinguishable from
+ * one that never started, so both are simply re-driven from on-chain truth.
+ *
+ * `settle(job, onChainStatus)` performs the (idempotent) settlement for a
+ * job whose on-chain status is already terminal. It must itself check
+ * on-chain status before calling resolve()/refund() so a crash between the
+ * on-chain call and markSettled() cannot cause a duplicate call on the next
+ * restart.
+ *
+ * Returns a summary for logging/tests.
+ */
+export async function reconcileJobs({ readOnChainStatus, settle, resume } = {}) {
+  const jobIds = await getKnownJobIds();
+  const summary = { scanned: 0, settled: 0, resumed: 0, skipped: 0, failed: 0 };
+
+  for (const jobId of jobIds) {
+    const job = await getJob(jobId);
+    if (!job) continue;
+    summary.scanned += 1;
+
+    if (TERMINAL_STATUSES.has(job.status)) {
+      summary.skipped += 1;
+      continue;
+    }
+
+    try {
+      const onChainStatus = await readOnChainStatus(job.questionId);
+
+      if (onChainStatus === 'resolved' || onChainStatus === 'refunded') {
+        // On-chain truth says this question is already settled. Record the
+        // terminal outcome locally without ever calling resolve()/refund()
+        // again — this is the no-double-settle guarantee.
+        const changed = await markSettled(jobId, onChainStatus, {
+          recovered: true,
+        });
+        if (changed) summary.settled += 1;
+        else summary.skipped += 1;
+        continue;
+      }
+
+      // Still open on-chain: the job never reached a terminal on-chain state
+      // (including the mid-fulfillOracleCall case). Hand it back to the
+      // normal settlement pipeline, which re-checks on-chain status before
+      // acting, so resuming is safe and idempotent.
+      if (typeof resume === 'function') {
+        await resume(job);
+        summary.resumed += 1;
+      } else if (typeof settle === 'function') {
+        await settle(job, onChainStatus);
+        summary.resumed += 1;
+      } else {
+        summary.skipped += 1;
+      }
+    } catch (err) {
+      // A single unreconcilable job must not abort startup recovery for the
+      // rest; it stays non-terminal and will be retried on the next restart.
+      summary.failed += 1;
+    }
+  }
+
+  return summary;
 }

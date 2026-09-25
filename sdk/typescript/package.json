@@ -1,0 +1,50 @@
+{
+  "name": "@arbiter-xyz/sdk",
+  "version": "0.1.0",
+  "description": "First-party TypeScript client for the Arbiter human-intelligence oracle API",
+  "license": "Apache-2.0",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Arbiter-xyz/arbiter-backend.git",
+    "directory": "sdk/typescript"
+  },
+  "keywords": ["arbiter", "oracle", "stellar", "soroban", "agents", "http-402"],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./stellar": {
+      "types": "./dist/stellar.d.ts",
+      "import": "./dist/stellar.js"
+    }
+  },
+  "files": ["dist", "README.md", "CHANGELOG.md"],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test --experimental-strip-types --no-warnings=ExperimentalWarning tests/*.spec.ts",
+    "example:sandbox": "node --experimental-strip-types --no-warnings=ExperimentalWarning examples/sandbox.ts",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "peerDependencies": {
+    "@stellar/stellar-sdk": ">=12"
+  },
+  "peerDependenciesMeta": {
+    "@stellar/stellar-sdk": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@stellar/stellar-sdk": "^16.2.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  }
+}

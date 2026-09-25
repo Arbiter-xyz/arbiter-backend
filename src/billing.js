@@ -83,6 +83,16 @@ export async function settleReservation(accountId, reservedStroops, actualStroop
  * completes checkout. Restricted to the same allowlist CORS already
  * enforces (config.allowedOrigins) — a redirect target has to be
  * somewhere this backend already trusts to run frontend code at all. */
+/**
+ * Puts credit back on an API-key account — used when the customer cancels a
+ * question inside the undo window (see oracle.js's cancelJob). The on-chain
+ * refund goes to the pooled fiat balance, not to the customer, so without
+ * this the pool would be made whole while the customer stayed charged.
+ */
+export async function restoreCredit(accountId, stroops) {
+  if (stroops > 0) await store.incrBy(`credit:${accountId}`, stroops);
+}
+
 export function isAllowedRedirectUrl(url) {
   if (config.allowedOrigins.includes('*')) return true; // wide-open dev mode, same default as CORS
   try {
