@@ -148,6 +148,54 @@ and `GET /admin/transactions` return it. `GET /payers/:address/questions`
 also returns `spendByCategory` and `spendByDay` (UTC days) buckets for spend
 dashboards.
 
+## Teams
+
+A team is a named group of Stellar addresses that share one view of their
+question history and spend. It adds no new credential: every call
+authenticates as a member with `address` plus a session `token` from
+`POST /payers/:address/session`, in the JSON body or the query string.
+
+```http
+POST   /teams                                {"name": "Acme research"}
+GET    /teams                                teams you belong to
+GET    /teams/:teamId
+PATCH  /teams/:teamId                        {"name": "..."}            (admin)
+DELETE /teams/:teamId                                                   (owner)
+POST   /teams/:teamId/members                {"members": ["G..."], "role": "member"}
+PATCH  /teams/:teamId/members/:member        {"role": "admin"}          (owner)
+DELETE /teams/:teamId/members/:member        remove a member, or leave
+GET    /teams/:teamId/questions              combined history + spendByMember
+```
+
+Each team has exactly one `owner`, plus any number of `admin`s and
+`member`s. Admins add and remove plain members. Only the owner manages
+admins. Setting another member's role to `owner` transfers ownership, and
+the previous owner becomes an admin. The owner can't leave or be removed
+until ownership is transferred. People who aren't members get a `404` for a
+team. Limits: 100 members per team, 20 teams per address.
+
+## Maintenance windows
+
+Operators can pause dispatch for holidays or planned maintenance:
+
+```http
+POST   /admin/maintenance-windows   {"startsAt": "2026-12-24T00:00:00Z", "endsAt": "2026-12-27T00:00:00Z", "reason": "holiday"}
+GET    /admin/maintenance-windows
+DELETE /admin/maintenance-windows/:id    (deleting an active window ends the pause now)
+GET    /maintenance                      public: current pause + upcoming windows
+```
+
+While a window is active, requests to `POST /oracle` that would create a
+question get `503` with `Retry-After` and `resumesAt`, before anyone is
+charged. Questions aren't queued through a pause, because the contract's
+`refund_timeout()` would make a paid question refundable long before a
+holiday ends. So a question that was already paid for when the window opened
+is refunded (`reconciliationMethod: "dispatch-paused"`) instead of being
+dispatched. This covers step 2 of the classic flow and jobs still in their
+undo-window hold. Questions that were already dispatched finish normally.
+Sandbox requests are unaffected. Windows that overlap or touch are merged
+into a single pause.
+
 ## Dependency updates
 
 `.github/dependabot.yml` runs a weekly npm update job. Minor and patch bumps
