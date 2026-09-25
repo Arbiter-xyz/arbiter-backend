@@ -17,6 +17,16 @@ const MAX_TRACKED_JOBS = 5_000;
 // "in-flight" and must be checked against on-chain truth on startup.
 const TERMINAL_STATUSES = new Set(['settled']);
 
+// Synthetic monitoring (issue #111): a scheduled job runs the real paid
+// /oracle flow end to end against a live deployment on an interval, reusing
+// demo-agent/ask.js's existing submit()/dispatch/reconcile/resolve() path
+// rather than reimplementing it. Synthetic jobs are tagged here so a failed
+// run (timeout, refund, error) is distinguishable in logs from a successful
+// one and from real customer activity, and so /stats can exclude them the
+// same way sandbox settlements already are.
+const SYNTHETIC_INDEX_KEY = 'synthetic-job-ids';
+const MAX_TRACKED_SYNTHETIC_JOBS = 1_000;
+
 async function indexJob(jobId) {
   const known = (await store.get(JOB_INDEX_KEY)) || [];
   if (known.includes(jobId)) return;
@@ -25,6 +35,37 @@ async function indexJob(jobId) {
 
 export async function getKnownJobIds() {
   return (await store.get(JOB_INDEX_KEY)) || [];
+}
+
+/**
+ * Marks a job as synthetic (a scheduled monitor run, not a real customer
+ * question) and records it in a separate index so /stats can exclude it.
+ * Called by the synthetic runner right after createJob(), before dispatch,
+ * so the tag is present for the entire lifetime of the job and every log
+ * line emitted for it can carry `synthetic: true`.
+ */
+export async function markSynthetic(jobId) {
+  await updateJob(jobId, { synthetic: true });
+  const known = (await store.get(SYNTHETIC_INDEX_KEY)) || [];
+  if (!known.includes(jobId)) {
+    await store.set(
+      SYNTHETIC_INDEX_KEY,
+      [jobId, ...known].slice(0, MAX_TRACKED_SYNTHETIC_JOBS),
+    );
+  }
+}
+
+export async function getSyntheticJobIds() {
+  return (await store.get(SYNTHETIC_INDEX_KEY)) || [];
+}
+
+/**
+ * True when a job record is a synthetic monitor run. Used by /stats to keep
+ * synthetic settlements out of the public counters, consistent with how
+ * sandbox traffic is already excluded (see stats.js).
+ */
+export function isSyntheticJob(job) {
+  return Boolean(job && job.synthetic);
 }
 
 /**
