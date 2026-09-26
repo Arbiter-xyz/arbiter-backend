@@ -139,6 +139,46 @@ export function surgeMultiplier(tier, onlineWorkers) {
   return Math.round(raw * 100) / 100;
 }
 
+/**
+ * Volume discount tiers (issue #107). Surge pricing above is about *when*
+ * you ask (worker supply); this is about *who* is asking — a customer-specific
+ * multiplier derived from an account's lifetime usage volume, so a payer who
+ * has asked ten thousand questions doesn't pay the identical sticker price as
+ * one asking their first. Deliberately a pure function of (volume) so it's
+ * trivially testable and has no hidden state, mirroring surgeMultiplier().
+ *
+ * Thresholds are cumulative lifetime question counts; the multiplier is the
+ * discount applied to the surge-adjusted price. A fresh/low-volume account
+ * (volume below the first threshold) gets exactly 1 — zero discount is the
+ * explicit default, not an accidental one. Discounts are prospective only:
+ * the multiplier is computed from the volume *before* the current question is
+ * counted, so crossing a threshold mid-stream never retroactively re-prices
+ * questions already charged.
+ */
+export const VOLUME_DISCOUNT_TIERS = Object.freeze([
+  Object.freeze({ minVolume: 0, multiplier: 1 }),
+  Object.freeze({ minVolume: 1_000, multiplier: 0.9 }),
+  Object.freeze({ minVolume: 10_000, multiplier: 0.8 }),
+  Object.freeze({ minVolume: 100_000, multiplier: 0.7 }),
+]);
+
+// The floor of the discount schedule — the best multiplier any volume earns.
+// Exported so callers reserving funds ahead of the real price (server.js's
+// apiKeyAccountId branch, before askMetered() computes the discounted price)
+// can compute a safe ceiling, the same way MAX_SURGE_MULTIPLIER caps the
+// worst-case surge reservation.
+export const MIN_VOLUME_DISCOUNT_MULTIPLIER = VOLUME_DISCOUNT_TIERS[VOLUME_DISCOUNT_TIERS.length - 1].multiplier;
+
+export function volumeDiscountMultiplier(volume) {
+  const v = Number(volume);
+  if (!Number.isFinite(v) || v <= 0) return 1;
+  let multiplier = 1;
+  for (const tier of VOLUME_DISCOUNT_TIERS) {
+    if (v >= tier.minVolume) multiplier = tier.multiplier;
+  }
+  return multiplier;
+}
+
 /** Snapshots a tier's live, surge-adjusted price. Callers must persist the
  * returned priceStroops (not just the tier key) alongside the question, so
  * later payment verification checks against the price actually quoted. */
@@ -147,6 +187,21 @@ export function priceForTier(tierKey, onlineWorkers) {
   const multiplier = surgeMultiplier(tier, onlineWorkers);
   const priceStroops = BigInt(Math.round(Number(tier.priceStroops) * multiplier));
   return { ...tier, priceStroops, surgeMultiplier: multiplier };
+}
+
+/**
+ * Snapshots a tier's live, surge-adjusted price with a customer-specific
+ * volume discount applied (issue #107). The discount multiplies the
+ * surge-adjusted price, so a high-volume account's reservation/settlement
+ * reflects the discounted price rather than the sticker price. A fresh or
+ * low-volume account (volume below the first threshold) gets the exact same
+ * price as priceForTier() — zero discount is the explicit default.
+ */
+export function priceForTierWithVolumeDiscount(tierKey, onlineWorkers, volume) {
+  const priced = priceForTier(tierKey, onlineWorkers);
+  const discountMultiplier = volumeDiscountMultiplier(volume);
+  const priceStroops = BigInt(Math.round(Number(priced.priceStroops) * discountMultiplier));
+  return { ...priced, priceStroops, discountMultiplier };
 }
 
 /**
@@ -171,45 +226,6 @@ export function shouldShadowDraft(tierKey) {
   return !tier.instant && tier.quorumSize > 0;
 }
 
-// Normalizes an answer for comparison so trivial formatting differences
-// (case, surrounding whitespace, collapsed internal whitespace) don't count
-// as disagreement. Kept intentionally conservative — anything beyond this
-// would be guessing at semantic equivalence, which is out of scope here.
-export function normalizeDraftAnswer(answer) {
-  if (answer === null || answer === undefined) return '';
-  return String(answer).trim().replace(/\s+/g, ' ').toLowerCase();
-}
+// Normalizes an answer for co
 
-/**
- * Compares a shadow instant-tier draft against the human-reconciled consensus
- * outcome for the same question. Returns a record keyed the same way stats.js
- * tracks its `resolved`/`refunded` counters, so the shadow counters can be
- * aggregated with the same machinery. `matched` is only meaningful when the
- * question actually settled to a consensus answer; a refunded/no-consensus
- * question is recorded as `refunded` and excluded from the agreement rate.
- */
-export function recordShadowAgreement({ draftAnswer, consensusAnswer, outcome }) {
-  if (outcome !== 'resolved') {
-    return { outcome: 'refunded', matched: false, counted: false };
-  }
-  const matched = normalizeDraftAnswer(draftAnswer) === normalizeDraftAnswer(consensusAnswer);
-  return { outcome: 'resolved', matched, counted: true };
-}
-
-/**
- * Aggregates shadow-agreement counters into the published rate. Mirrors the
- * shape stats.js exposes for resolved/refunded so it can be surfaced the same
- * way (e.g. via /stats or an admin endpoint). `agreementRate` is null until
- * there's at least one counted (resolved) comparison, so callers don't publish
- * a misleading 0% before any data exists.
- */
-export function shadowAgreementRate({ matched = 0, mismatched = 0, refunded = 0 } = {}) {
-  const counted = matched + mismatched;
-  return {
-    matched,
-    mismatched,
-    refunded,
-    counted,
-    agreementRate: counted > 0 ? matched / counted : null,
-  };
-}
+/* … truncated 1885 chars — edit only what you need near the top … */
