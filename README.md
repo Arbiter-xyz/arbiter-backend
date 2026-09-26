@@ -186,3 +186,8 @@ backend.
 Load-test tooling (`scripts/loadtest.js`), measured limits, and the current
 bottleneck (serialized on-chain settlement) are in
 [docs/capacity/README.md](docs/capacity/README.md).
+
+## Handsoff notes
+
+<!-- handsoff-issue-108 -->
+- #108: A public status page reporting real uptime/incident history
