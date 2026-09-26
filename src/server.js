@@ -44,6 +44,13 @@ import { registerWebhook, listWebhooks, deleteWebhook, WebhookError } from './we
 import { logger, httpLogger } from './logger.js';
 import { getProvenance } from './provenance.js';
 import { enforceSecurityPosture } from './securityPosture.js';
+import { metricsMiddleware, metricsHandler, buildInfo } from './metrics.js';
+import { startHealthProbes } from './healthProbes.js';
+import { createFaultInjector, mountFaultRoutes } from './faultInjection.js';
+import { runRecoverySweep, defaultRecoveryDeps, startRecoverySweeper } from './disasterRecovery.js';
+import { store } from './store.js';
+import { getKnownJobIds, getJob } from './jobs.js';
+import { getLatestLedgerSequence } from './stellarClient.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -62,6 +69,19 @@ const app = express();
 // further context (questionId, workerId, etc.) to that same request's
 // trace. Placed before every other middleware so nothing is unlogged.
 app.use(httpLogger);
+
+// Request count/latency by matched route for GET /metrics (see metrics.js
+// and ops/observability/). Before every route so nothing is uncounted —
+// including requests failed by the fault injector just below.
+app.use(metricsMiddleware);
+
+// Alert drill only (scripts/alert-drill.js); securityPosture.js refuses to
+// start a production deployment with this on.
+const faultInjector = config.faultInjection ? createFaultInjector() : null;
+if (faultInjector) {
+  logger.warn('ARBITER_FAULT_INJECTION=true: /admin/faults can inject HTTP errors and latency');
+  app.use(faultInjector.middleware);
+}
 
 // Security response headers on every response (API and static UI alike).
 app.use(securityHeadersMiddleware());
@@ -105,6 +125,8 @@ function rateLimited(bucket, keyFn) {
   };
 }
 const byIp = (req) => req.ip;
+
+app.get('/metrics', metricsHandler({ token: config.metrics.token }));
 
 app.get('/health', (req, res) => {
   res.json({ ok: true, onlineWorkers: onlineWorkerCount(), contractId: config.contractId });
@@ -859,6 +881,27 @@ app.post('/anchor/report', rateLimited('push', byIp), async (req, res) => {
   }
 });
 
+if (faultInjector) mountFaultRoutes(app, faultInjector, requireAdmin);
+
+// Runs the chain-driven recovery sweep on demand (disasterRecovery.js;
+// docs/runbooks/disaster-recovery.md). `?dryRun=true` classifies every
+// on-chain Pending question without refunding anything.
+app.post('/admin/recovery/sweep', requireAdmin, async (req, res) => {
+  const dryRun = req.query.dryRun === 'true';
+  try {
+    const report = await runRecoverySweep({
+      store,
+      deps: await defaultRecoveryDeps(),
+      options: { ...config.recovery, dryRun },
+    });
+    if (!report) return res.status(409).json({ error: 'another recovery sweep is already running' });
+    res.json(report);
+  } catch (err) {
+    req.log.error({ err }, 'recovery sweep failed');
+    res.status(502).json({ error: `recovery sweep failed: ${err.message}` });
+  }
+});
+
 // Serve the built worker UI from the same Express app.
 app.use(express.static(path.join(__dirname, '../../app/dist')));
 
@@ -867,4 +910,23 @@ app.listen(config.port, () => {
     { port: config.port, contractId: config.contractId || null, network: config.networkPassphrase, allowedOrigins: config.allowedOrigins },
     `Arbiter backend listening on :${config.port}`,
   );
+
+  buildInfo.set({ version: process.env.npm_package_version || 'unknown', network: config.networkPassphrase }, 1);
+  startHealthProbes({
+    store,
+    getLatestLedgerSequence,
+    getKnownJobIds,
+    getJob,
+    getOnlineWorkerCount: onlineWorkerCount,
+    intervalMs: config.metrics.probeIntervalMs,
+    jobScanIntervalMs: config.metrics.jobScanIntervalMs,
+  });
+
+  // After a total state loss this is what gets stranded payers refunded:
+  // the first sweep runs immediately on boot, against an empty store.
+  if (config.recovery.enabled && config.contractId && config.platformSecret) {
+    startRecoverySweeper({ store, intervalMs: config.recovery.intervalMs, options: config.recovery });
+  } else {
+    logger.warn('recovery sweep disabled (RECOVERY_SWEEP_ENABLED=false, or ORACLE_CONTRACT_ID/PLATFORM_SECRET unset)');
+  }
 });

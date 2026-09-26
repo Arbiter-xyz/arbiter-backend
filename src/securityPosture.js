@@ -116,6 +116,16 @@ export function evaluateSecurityPosture(env) {
     });
   }
 
+  if (env.ARBITER_FAULT_INJECTION === 'true') {
+    findings.push({
+      setting: 'ARBITER_FAULT_INJECTION',
+      severity: 'fatal',
+      message:
+        'ARBITER_FAULT_INJECTION=true lets an admin-token holder make this API return errors or hang on demand. ' +
+        'It exists only for the alert drill (scripts/alert-drill.js) against a non-production deployment. Unset it.',
+    });
+  }
+
   if (env.REDIS_URL) {
     const redis = parseUrl(env.REDIS_URL);
     if (redis && redis.protocol !== 'rediss:') {

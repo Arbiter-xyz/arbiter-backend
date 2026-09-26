@@ -1,0 +1,295 @@
+# Unit tests for alerts.yml, run by CI with:
+#   promtool test rules ops/observability/prometheus/alerts.test.yml
+#
+# Each test injects an anomaly on instance api-1 and asserts the alert is
+# still pending before its `for:` window and firing after it. Alongside it
+# are look-alike HEALTHY series on other instances (low traffic, a sweep that
+# already cleared, a ledger that keeps moving...) which must NOT fire, so a
+# rule that fires on everything fails here just like one that never fires.
+
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: backend down
+    interval: 1m
+    input_series:
+      - series: 'up{job="arbiter-backend", instance="api-1"}'
+        values: '1 1 0x10'
+      - series: 'up{job="arbiter-backend", instance="api-2"}'
+        values: '1x12'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ArbiterBackendDown
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: ArbiterBackendDown
+        exp_alerts:
+          - exp_labels: { severity: critical, job: arbiter-backend, instance: api-1 }
+            exp_annotations:
+              summary: "arbiter-backend api-1 is not answering scrapes"
+              runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterbackenddown"
+
+  - name: 5xx error rate
+    interval: 1m
+    input_series:
+      # api-1: 1 rps of 200s, then 0.5 rps of 503s from minute 11 (33% errors).
+      - series: 'arbiter_http_requests_total{instance="api-1", route="/oracle/:jobId", status="200"}'
+        values: '0+60x30'
+      - series: 'arbiter_http_requests_total{instance="api-1", route="/oracle/:jobId", status="503"}'
+        values: '0x10 30+30x20'
+      # api-2: healthy, 1 error a minute against 1 rps (~1.6%).
+      - series: 'arbiter_http_requests_total{instance="api-2", route="/oracle/:jobId", status="200"}'
+        values: '0+60x30'
+      - series: 'arbiter_http_requests_total{instance="api-2", route="/oracle/:jobId", status="500"}'
+        values: '0+1x30'
+      # api-3: every request fails, but it's one request a minute — below
+      # the traffic floor, so not a page.
+      - series: 'arbiter_http_requests_total{instance="api-3", route="/oracle/:jobId", status="500"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: ArbiterHighErrorRate
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: ArbiterHighErrorRate
+        exp_alerts:
+          - exp_labels: { severity: critical, instance: api-1 }
+            exp_annotations:
+              summary: "arbiter-backend api-1 is failing more than 5% of requests with a 5xx"
+              runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterhigherrorrate"
+
+  - name: p95 latency
+    interval: 1m
+    input_series:
+      # api-1: every request takes between 2s and 5s.
+      - series: 'arbiter_http_request_duration_seconds_bucket{instance="api-1", le="1"}'
+        values: '0x30'
+      - series: 'arbiter_http_request_duration_seconds_bucket{instance="api-1", le="2"}'
+        values: '0x30'
+      - series: 'arbiter_http_request_duration_seconds_bucket{instance="api-1", le="5"}'
+        values: '0+60x30'
+      - series: 'arbiter_http_request_duration_seconds_bucket{instance="api-1", le="+Inf"}'
+        values: '0+60x30'
+      # api-2: everything under 1s.
+      - series: 'arbiter_http_request_duration_seconds_bucket{instance="api-2", le="1"}'
+        values: '0+60x30'
+      - series: 'arbiter_http_request_duration_seconds_bucket{instance="api-2", le="2"}'
+        values: '0+60x30'
+      - series: 'arbiter_http_request_duration_seconds_bucket{instance="api-2", le="5"}'
+        values: '0+60x30'
+      - series: 'arbiter_http_request_duration_seconds_bucket{instance="api-2", le="+Inf"}'
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ArbiterHighLatency
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ArbiterHighLatency
+        exp_alerts:
+          - exp_labels: { severity: warning, instance: api-1 }
+            exp_annotations:
+              summary: "arbiter-backend api-1 p95 request latency is above 2s"
+              runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterhighlatency"
+
+  - name: store down and store not durable
+    interval: 1m
+    input_series:
+      - series: 'arbiter_store_up{instance="api-1"}'
+        values: '1 1 0x10'
+      - series: 'arbiter_store_up{instance="api-2"}'
+        values: '1x12'
+      - series: 'arbiter_store_durable{instance="api-1"}'
+        values: '1x12'
+      # api-2 fell back to the in-memory store at boot: "up", but not durable.
+      - series: 'arbiter_store_durable{instance="api-2"}'
+        values: '0x12'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: ArbiterStoreDown
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: ArbiterStoreDown
+        exp_alerts:
+          - exp_labels: { severity: critical, instance: api-1 }
+            exp_annotations:
+              summary: "arbiter-backend api-1 cannot reach Redis"
+              runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterstoredown"
+      - eval_time: 3m
+        alertname: ArbiterStoreNotDurable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: ArbiterStoreNotDurable
+        exp_alerts:
+          - exp_labels: { severity: critical, instance: api-2 }
+            exp_annotations:
+              summary: "arbiter-backend api-2 is running on the in-memory store; a restart will lose all state"
+              runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterstorenotdurable"
+
+  - name: chain RPC down
+    interval: 1m
+    input_series:
+      - series: 'arbiter_chain_rpc_up{instance="api-1"}'
+        values: '1 0x10'
+      - series: 'arbiter_chain_rpc_up{instance="api-2"}'
+        values: '1x11'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ArbiterChainRpcDown
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: ArbiterChainRpcDown
+        exp_alerts:
+          - exp_labels: { severity: critical, instance: api-1 }
+            exp_annotations:
+              summary: "arbiter-backend api-1 cannot reach the Soroban RPC; nothing can be paid for or settled"
+              runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterchainrpcdown"
+
+  - name: chain ledger stalled
+    interval: 1m
+    input_series:
+      # api-1: RPC answers, but the ledger stops at 160 from minute 5.
+      - series: 'arbiter_chain_rpc_up{instance="api-1"}'
+        values: '1x25'
+      - series: 'arbiter_chain_latest_ledger{instance="api-1"}'
+        values: '100+12x5 160x20'
+      # api-2: ledger keeps moving.
+      - series: 'arbiter_chain_rpc_up{instance="api-2"}'
+        values: '1x25'
+      - series: 'arbiter_chain_latest_ledger{instance="api-2"}'
+        values: '100+12x25'
+      # api-3: RPC down and ledger frozen — that's ArbiterChainRpcDown's job, not this one's.
+      - series: 'arbiter_chain_rpc_up{instance="api-3"}'
+        values: '0x25'
+      - series: 'arbiter_chain_latest_ledger{instance="api-3"}'
+        values: '160x25'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: ArbiterChainLedgerStalled
+        exp_alerts: []
+      - eval_time: 18m
+        alertname: ArbiterChainLedgerStalled
+        exp_alerts:
+          - exp_labels: { severity: warning, instance: api-1 }
+            exp_annotations:
+              summary: "The Soroban RPC used by api-1 answers but its latest ledger has not moved in 5m"
+              runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterchainledgerstalled"
+
+  - name: admin contract call failures
+    interval: 1m
+    input_series:
+      - series: 'arbiter_admin_invocations_total{instance="api-1", method="resolve", result="error"}'
+        values: '0 0 1 2 3 4 4 4 4 4'
+      - series: 'arbiter_admin_invocations_total{instance="api-1", method="resolve", result="ok"}'
+        values: '0+5x9'
+      # api-2: a single transient failure.
+      - series: 'arbiter_admin_invocations_total{instance="api-2", method="refund", result="error"}'
+        values: '0 0 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: ArbiterAdminCallFailures
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: ArbiterAdminCallFailures
+        exp_alerts:
+          - exp_labels: { severity: warning, instance: api-1, method: resolve }
+            exp_annotations:
+              summary: "resolve() has failed on-chain repeatedly on api-1 in the last 15m"
+              runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiteradmincallfailures"
+
+  - name: settlement fell back to refund_timeout
+    interval: 1m
+    input_series:
+      - series: 'arbiter_settlements_total{instance="api-1", outcome="refund_pending_timeout"}'
+        values: '0 0 0 1 1 1'
+      - series: 'arbiter_settlements_total{instance="api-2", outcome="refund_pending_timeout"}'
+        values: '0x5'
+      - series: 'arbiter_settlements_total{instance="api-2", outcome="resolved"}'
+        values: '0+3x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: ArbiterSettlementFellBackToTimeout
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: ArbiterSettlementFellBackToTimeout
+        exp_alerts:
+          - exp_labels: { severity: warning, instance: api-1 }
+            exp_annotations:
+              summary: "A paid question on api-1 could be neither resolved nor refunded; its payer is waiting on refund_timeout()"
+              runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbitersettlementfellbacktotimeout"
+
+  - name: questions stuck in flight
+    interval: 1m
+    input_series:
+      # api-1: one job that nothing ever settles, ageing a minute per minute.
+      - series: 'arbiter_job_oldest_inflight_age_seconds{instance="api-1"}'
+        values: '0+60x30'
+      # api-2: jobs keep turning over; the oldest is always ~30s old.
+      - series: 'arbiter_job_oldest_inflight_age_seconds{instance="api-2"}'
+        values: '30x30'
+    alert_rule_test:
+      - eval_time: 18m
+        alertname: ArbiterQuestionsStuckInFlight
+        exp_alerts: []
+      - eval_time: 22m
+        alertname: ArbiterQuestionsStuckInFlight
+        exp_alerts:
+          - exp_labels: { severity: warning, instance: api-1 }
+            exp_annotations:
+              summary: "A paid question on api-1 has been in flight for more than 15 minutes"
+              runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterquestionsstuckinflight"
+
+  - name: escrow stranded and inconsistent
+    interval: 1m
+    input_series:
+      # api-1: two orphans the sweep keeps failing to refund.
+      - series: 'arbiter_recovery_actionable_pending_questions{instance="api-1", reason="orphaned"}'
+        values: '2x20'
+      - series: 'arbiter_recovery_actionable_pending_questions{instance="api-1", reason="inconsistent"}'
+        values: '0x20'
+      # api-2: orphans found after a state loss and refunded by the next sweep.
+      - series: 'arbiter_recovery_actionable_pending_questions{instance="api-2", reason="orphaned"}'
+        values: '2 0x19'
+      # api-3: one question settled locally but Pending on-chain.
+      - series: 'arbiter_recovery_actionable_pending_questions{instance="api-3", reason="inconsistent"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ArbiterEscrowStranded
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: ArbiterEscrowStranded
+        exp_alerts:
+          - exp_labels: { severity: critical, instance: api-1 }
+            exp_annotations:
+              summary: "Paid questions on api-1 are stranded in escrow and the recovery sweep is not refunding them"
+              runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterescrowstranded"
+      - eval_time: 3m
+        alertname: ArbiterEscrowInconsistent
+        exp_alerts:
+          - exp_labels: { severity: critical, instance: api-3, reason: inconsistent }
+            exp_annotations:
+              summary: "A question on api-3 is settled locally but still Pending on-chain"
+              runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterescrowinconsistent"
+
+  - name: recovery sweep failing
+    interval: 1m
+    input_series:
+      - series: 'arbiter_recovery_sweep_failures_total{instance="api-1"}'
+        values: '0 1 2 3 4 5x10'
+      # api-2: one failed sweep, then healthy.
+      - series: 'arbiter_recovery_sweep_failures_total{instance="api-2"}'
+        values: '0 1x14'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: ArbiterRecoverySweepFailing
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: ArbiterRecoverySweepFailing
+        exp_alerts:
+          - exp_labels: { severity: warning, instance: api-1 }
+            exp_annotations:
+              summary: "The recovery sweep on api-1 cannot scan the chain; stranded payers would not be refunded"
+              runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterrecoverysweepfailing"

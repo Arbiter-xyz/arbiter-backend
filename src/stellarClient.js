@@ -1,6 +1,7 @@
 import { Keypair, TransactionBuilder, Contract, Account, Address, nativeToScVal, scValToNative, rpc } from '@stellar/stellar-sdk';
 import { config } from './config.js';
 import { withRetry } from './retry.js';
+import { recordAdminInvocation } from './metrics.js';
 
 let server = null;
 export function getServer() {
@@ -128,7 +129,16 @@ export function createSerialQueue() {
 const serializeAdminCall = createSerialQueue();
 
 function invokeAsAdmin(method, scValArgs) {
-  return serializeAdminCall(() => runInvokeAsAdmin(method, scValArgs));
+  return serializeAdminCall(() => runInvokeAsAdmin(method, scValArgs)).then(
+    (result) => {
+      recordAdminInvocation(method, true);
+      return result;
+    },
+    (err) => {
+      recordAdminInvocation(method, false);
+      throw err;
+    },
+  );
 }
 
 export async function resolveQuestion(questionId, matchingWorkerAddresses, losingWorkerAddresses = []) {
@@ -205,6 +215,34 @@ export async function getQuestionOnChain(questionId) {
     status: decodeStatus(native.status),
     createdAt: Number(native.created_at),
   };
+}
+
+/** Latest closed ledger per the RPC — used by the health probe and to age
+ * on-chain questions (Question.created_at is a ledger sequence). */
+export async function getLatestLedgerSequence() {
+  return withRetry(async () => (await getServer().getLatestLedger()).sequence, {
+    attempts: 2,
+    timeoutMs: 5_000,
+    baseDelayMs: 200,
+    label: 'getLatestLedger',
+  });
+}
+
+/** Size of the contract's on-chain Pending-question index (contract
+ * v0.3.0+; see pending_count() in arbiter-contract's lib.rs). */
+export async function getPendingCountOnChain() {
+  return Number((await simulateReadOnly('pending_count')) ?? 0);
+}
+
+/** One page (at most 100, the contract's MAX_PENDING_PAGE) of Pending
+ * question ids from the on-chain index, as decimal strings — the same
+ * representation jobs and pending stashes are keyed by. */
+export async function listPendingOnChain(start, limit = 100) {
+  const ids = await simulateReadOnly('list_pending', [
+    nativeToScVal(start, { type: 'u32' }),
+    nativeToScVal(limit, { type: 'u32' }),
+  ]);
+  return (ids ?? []).map((id) => BigInt(id).toString());
 }
 
 export async function getTimeoutLedgersOnChain() {

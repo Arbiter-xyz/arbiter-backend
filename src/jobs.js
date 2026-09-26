@@ -1,5 +1,6 @@
 import { store } from './store.js';
 import { config } from './config.js';
+import { settlementsTotal } from './metrics.js';
 
 const PREFIX = 'job:';
 
@@ -88,6 +89,9 @@ export async function updateJob(jobId, patch) {
   const current = (await store.get(key)) || {};
   const next = { ...current, ...patch, updatedAt: Date.now() };
   await store.set(key, next, config.jobResultTtlMs);
+  if (next.status === 'settled' && current.status !== 'settled') {
+    settlementsTotal.inc({ outcome: next.outcome || 'unknown' });
+  }
   return next;
 }
 
@@ -115,6 +119,7 @@ export async function markSettled(jobId, outcome, extra = {}) {
     updatedAt: Date.now(),
   };
   await store.set(key, next, config.jobResultTtlMs);
+  settlementsTotal.inc({ outcome: outcome || 'unknown' });
   return true;
 }
 

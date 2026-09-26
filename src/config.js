@@ -21,6 +21,27 @@ function sessionSecret() {
 }
 const SESSION_SECRET = sessionSecret();
 
+// Graceful SESSION_SECRET rotation (#7): during a bounded grace window,
+// session verification also accepts tokens signed by the immediately-prior
+// secret (SESSION_SECRET_PREVIOUS). The window is measured from process
+// start (i.e. from when the rotation was deployed). 0 disables it.
+const SESSION_SECRET_PREVIOUS = process.env.SESSION_SECRET_PREVIOUS || '';
+const SESSION_SECRET_ROTATION_GRACE_MS = num(process.env.SESSION_SECRET_ROTATION_GRACE_MS, 0);
+const SESSION_SECRET_ROTATION_STARTED_AT = Date.now();
+
+function sessionSecrets() {
+  const secrets = [SESSION_SECRET];
+  if (
+    SESSION_SECRET_PREVIOUS &&
+    SESSION_SECRET_PREVIOUS !== SESSION_SECRET &&
+    SESSION_SECRET_ROTATION_GRACE_MS > 0 &&
+    Date.now() - SESSION_SECRET_ROTATION_STARTED_AT < SESSION_SECRET_ROTATION_GRACE_MS
+  ) {
+    secrets.push(SESSION_SECRET_PREVIOUS);
+  }
+  return secrets;
+}
+
 // Per-customer outbound webhook retry policy (#154). Shaped like retry.js's
 // withRetry(fn, { attempts, baseDelayMs, ... }) options so the delivery
 // worker from #56 reuses that exponential-backoff algorithm rather than a
@@ -120,6 +141,30 @@ export const config = Object.freeze({
   // directly); anything else pretty-prints for local dev readability.
   logFormat: process.env.LOG_FORMAT || 'pretty',
   logLevel: process.env.LOG_LEVEL || 'info',
+
+  // Prometheus scrape endpoint (metrics.js) and the probes behind its gauges
+  // (healthProbes.js). METRICS_TOKEN unset = /metrics is open, which is the
+  // usual setup for a scrape target on a private network.
+  metrics: Object.freeze({
+    token: process.env.METRICS_TOKEN || '',
+    probeIntervalMs: num(process.env.METRICS_PROBE_INTERVAL_MS, 15_000),
+    jobScanIntervalMs: num(process.env.METRICS_JOB_SCAN_INTERVAL_MS, 60_000),
+  }),
+
+  // Chain-driven recovery sweep (disasterRecovery.js): refunds on-chain
+  // Pending questions that no local state can still settle, e.g. after the
+  // store was lost. Needs contract v0.3.0+ (list_pending) and PLATFORM_SECRET.
+  recovery: Object.freeze({
+    enabled: process.env.RECOVERY_SWEEP_ENABLED !== 'false',
+    intervalMs: num(process.env.RECOVERY_SWEEP_INTERVAL_MS, 5 * 60 * 1000),
+    minAgeLedgers: num(process.env.RECOVERY_MIN_AGE_LEDGERS, 12),
+    staleInflightMs: num(process.env.RECOVERY_STALE_INFLIGHT_MS, 30 * 60 * 1000),
+    maxRefundsPerSweep: num(process.env.RECOVERY_MAX_REFUNDS_PER_SWEEP, 50),
+  }),
+
+  // Alert drill only (faultInjection.js). Refused in production by
+  // securityPosture.js.
+  faultInjection: process.env.ARBITER_FAULT_INJECTION === 'true',
 
   // Response security headers (see securityHeaders.js). CSP_CONNECT_SRC is a
   // comma-separated list of extra origins the frontend may fetch()/stream
