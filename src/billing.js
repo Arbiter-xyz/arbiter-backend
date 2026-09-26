@@ -14,6 +14,13 @@ import { logger } from './logger.js';
  * uses (see metered.js) — this module only handles how a customer gets
  * credit and how much of it they have, never the on-chain settlement
  * itself.
+ *
+ * Enterprise customers billed after the fact (net-30 invoicing) invert the
+ * prepay-then-consume model: usage happens first, the bill comes later, and
+ * accruing a balance owed is the entire point. Such accounts are marked
+ * invoice-billed (see setInvoiceBilled/isInvoiceBilled) and their usage is
+ * accumulated in a running total (recordInvoiceUsage) that is never
+ * decremented by consumption, so a periodic report can be built from it.
  */
 
 let stripeClient = null;
@@ -44,6 +51,38 @@ async function createAccount() {
   return { accountId, rawKey };
 }
 
+/**
+ * Marks an account as invoice-billed (net-30) rather than prepaid-credit-
+ * billed. Stored alongside the existing account:{accountId} record so the
+ * flag travels with the account identity. Invoice-billed accounts skip
+ * reserveCredit()/settleReservation() entirely in POST /oracle and instead
+ * accrue usage via recordInvoiceUsage().
+ */
+export async function setInvoiceBilled(accountId, invoiceBilled = true) {
+  const account = (await store.get(`account:${accountId}`)) || {};
+  await store.set(`account:${accountId}`, { ...account, invoiceBilled: Boolean(invoiceBilled) });
+}
+
+export async function isInvoiceBilled(accountId) {
+  const account = await store.get(`account:${accountId}`);
+  return Boolean(account?.invoiceBilled);
+}
+
+/**
+ * Accumulates a running usage total for an invoice-billed account. Uses the
+ * same store.incrBy primitive billing.js already uses for credit, but this
+ * counter is never decremented by consumption — it is the raw usage an
+ * invoice would be built from. Returns the new running total.
+ */
+export async function recordInvoiceUsage(accountId, stroops) {
+  if (!(stroops > 0)) return getInvoiceUsageStroops(accountId);
+  return store.incrBy(`invoice-usage:${accountId}`, stroops);
+}
+
+export async function getInvoiceUsageStroops(accountId) {
+  return (await store.get(`invoice-usage:${accountId}`)) || 0;
+}
+
 export async function getCreditBalanceStroops(accountId) {
   return (await store.get(`credit:${accountId}`)) || 0;
 }
@@ -57,6 +96,9 @@ export async function getCreditBalanceStroops(accountId) {
  * refunding the difference via settleReservation(), means the ledger can
  * never go negative and a customer can never be charged more than their
  * balance covers, without needing to predict the exact price in advance.
+ *
+ * Invoice-billed accounts deliberately bypass this path (see oracle.js):
+ * going negative — accruing a balance owed — is the entire point for them.
  */
 export async function reserveCredit(accountId, maxStroops) {
   return store.decrIfAtLeast(`credit:${accountId}`, maxStroops);
