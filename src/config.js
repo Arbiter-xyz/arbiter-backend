@@ -277,4 +277,34 @@ export const config = Object.freeze({
     // same trust level as the store itself.
     secretEncryptionKey: process.env.WEBHOOK_SECRET_ENCRYPTION_KEY || '',
   }),
+
+  // Auto-withdraw (see autoWithdraw.js). The backend can never sign a
+  // worker's withdraw() itself, so "auto" means: once Owed crosses the
+  // worker's threshold, prepare the unsigned withdraw transaction and push
+  // it to them to sign. These bound how that runs.
+  autoWithdraw: Object.freeze({
+    // Floor on any worker-configured threshold, so nobody ends up with a
+    // prepared transaction (and a notification) after every tiny credit.
+    minThresholdStroops: BigInt(process.env.AUTO_WITHDRAW_MIN_THRESHOLD_STROOPS || '10000000'), // 1 USDC
+    // How often the background sweep re-checks every opted-in worker's
+    // Owed balance, on top of the check that runs right after settlement.
+    // 0 disables the sweep (settlement-time checks still run).
+    sweepIntervalMs: num(process.env.AUTO_WITHDRAW_SWEEP_INTERVAL_MS, 15 * 60 * 1000),
+    // How long a prepared transaction stays valid for the worker to sign.
+    // Also becomes the transaction's own time bound on-chain.
+    pendingTtlMs: num(process.env.AUTO_WITHDRAW_PENDING_TTL_MS, 24 * 60 * 60 * 1000),
+  }),
+
+  // Annual earnings summary for tax reporting (see taxReport.js). The
+  // payer block is the platform's own details, as they'd appear in the
+  // PAYER box of a 1099. Unset fields are left blank in exports.
+  tax: Object.freeze({
+    // US reporting threshold in USD. At or above it, a summary is flagged
+    // as reportable. $600 matches 1099-NEC; change it if your counsel says
+    // a different form or threshold applies.
+    reportingThresholdUsd: num(process.env.TAX_REPORTING_THRESHOLD_USD, 600),
+    payerName: process.env.TAX_PAYER_NAME || '',
+    payerTin: process.env.TAX_PAYER_TIN || '',
+    payerAddress: process.env.TAX_PAYER_ADDRESS || '',
+  }),
 });
