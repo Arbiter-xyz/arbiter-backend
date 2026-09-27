@@ -186,3 +186,8 @@ backend.
 Load-test tooling (`scripts/loadtest.js`), measured limits, and the current
 bottleneck (serialized on-chain settlement) are in
 [docs/capacity/README.md](docs/capacity/README.md).
+
+## Handsoff notes
+
+<!-- handsoff-issue-59 -->
+- #59: oracle.js's core settlement logic and metered.js have zero unit test coverage
