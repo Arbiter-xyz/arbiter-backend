@@ -226,6 +226,34 @@ export async function getBalanceOnChain(payerAddress) {
   return BigInt(balance ?? 0);
 }
 
+/** Builds and prepares (simulates + assembles footprint/auth) the worker's
+ * OWN withdraw() or withdraw_to() call, with the worker's account as the
+ * source, and returns it UNSIGNED. The backend never signs this — the
+ * worker does, then it goes through the same /sponsor/withdraw-style
+ * fee-bump relay (sponsor.js), whose invoked-function check matches this
+ * call byte for byte since the args are built the same way. */
+export async function buildWorkerWithdrawTx(workerAddress, amountStroops, beneficiaryAddress = null, timeoutSeconds = 3600) {
+  const srv = getServer();
+  const account = await withRetry(() => srv.getAccount(workerAddress), {
+    attempts: 2,
+    timeoutMs: 5_000,
+    baseDelayMs: 200,
+    label: 'getAccount(worker)',
+  });
+  const contract = new Contract(config.contractId);
+  const op = beneficiaryAddress
+    ? contract.call('withdraw_to', addressArg(workerAddress), addressArg(beneficiaryAddress), i128Arg(amountStroops))
+    : contract.call('withdraw', addressArg(workerAddress), i128Arg(amountStroops));
+
+  const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
+    .addOperation(op)
+    .setTimeout(timeoutSeconds)
+    .build();
+
+  const prepared = await srv.prepareTransaction(tx);
+  return prepared.toXDR();
+}
+
 /** Refreshes storage TTL on a worker's Owed/Stake entries via the
  * contract's permissionless touch() — no worker signature involved, so
  * this can run on the platform's own admin key exactly like resolve()

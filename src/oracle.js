@@ -17,6 +17,8 @@ import { config } from './config.js';
 import { undoWindowFor, holdThenDispatch, cancelHeld } from './undoWindow.js';
 import { verifySessionToken } from './workerAuth.js';
 import { restoreCredit } from './billing.js';
+import { recordWorkerCredits } from './earnings.js';
+import { checkAutoWithdrawForWorkers } from './autoWithdraw.js';
 
 const IDEMPOTENCY_PREFIX = 'idempotency:';
 // Who may cancel an API-key-funded job. Kept out of the job record itself,
@@ -544,6 +546,15 @@ async function settleResolved(questionId, submissions, result) {
         type: 'credited',
       }).catch(() => {});
     }
+
+    // Earnings ledger for annual tax summaries (earnings.js), then the
+    // auto-withdraw threshold check for anyone just credited. Neither is
+    // awaited on the settlement path's critical outcome: a bookkeeping or
+    // RPC hiccup here must never turn a landed resolve() into a refund.
+    const settledJob = await getJob(questionId).catch(() => null);
+    recordWorkerCredits(questionId, result.matchingWorkerIds, settledJob?.amountStroops || 0, hash)
+      .catch((err) => jobLogger(questionId).error({ err }, 'failed to record worker earnings'))
+      .then(() => checkAutoWithdrawForWorkers(result.matchingWorkerIds));
     const job = await updateJob(questionId, {
       status: 'settled',
       outcome: 'resolved',
