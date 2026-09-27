@@ -86,7 +86,10 @@ export async function verifyChallengeAndIssueSession(workerAddress, signedXdr) {
 
 function issueSessionToken(address) {
   const exp = Date.now() + config.session.ttlMs;
-  const payload = Buffer.from(JSON.stringify({ address, exp })).toString('base64url');
+  // sid identifies this one session so it can be revoked individually
+  // (see revokeSession) without affecting other sessions for the address.
+  const sid = randomBytes(12).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ address, exp, sid })).toString('base64url');
   const mac = createHmac('sha256', config.session.secret).update(payload).digest('base64url');
   return { token: `${payload}.${mac}`, expiresAt: exp };
 }
@@ -127,12 +130,8 @@ function macMatches(payload, mac, secret) {
   return macBuf.length === expectedBuf.length && timingSafeEqual(macBuf, expectedBuf);
 }
 
-/** Returns the authenticated address if `token` is a valid, unexpired
- * session, or null otherwise. Accepts a MAC produced by the current
- * SESSION_SECRET or, during the rotation grace window, the previous one;
- * the payload/expiry checks are identical either way, so tamper and
- * replay resistance are unchanged. */
-export function verifySessionToken(token) {
+/** Parses and MAC/expiry-checks a token, returning its payload or null. */
+function parseSessionToken(token) {
   if (typeof token !== 'string' || !token.includes('.')) return null;
   const [payload, mac] = token.split('.');
 
@@ -140,10 +139,82 @@ export function verifySessionToken(token) {
   if (!validMac) return null;
 
   try {
-    const { address, exp } = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-    if (typeof exp !== 'number' || Date.now() > exp) return null;
-    return address;
+    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    if (typeof parsed.exp !== 'number' || Date.now() > parsed.exp) return null;
+    return parsed;
   } catch {
     return null;
   }
+}
+
+/** Returns the authenticated address if `token` is a valid, unexpired
+ * session, or null otherwise. Accepts a MAC produced by the current
+ * SESSION_SECRET or, during the rotation grace window, the previous one;
+ * the payload/expiry checks are identical either way, so tamper and
+ * replay resistance are unchanged. Stateless — does NOT check revocation;
+ * route handlers must use verifySession() instead. */
+export function verifySessionToken(token) {
+  return parseSessionToken(token)?.address ?? null;
+}
+
+const REVOKED_PREFIX = 'revoked-session:';
+
+/** verifySessionToken() plus a store lookup rejecting revoked sessions.
+ * This is what every authenticated route should call. */
+export async function verifySession(token) {
+  const parsed = parseSessionToken(token);
+  if (!parsed) return null;
+  if (parsed.sid && (await store.get(REVOKED_PREFIX + parsed.sid))) return null;
+  return parsed.address;
+}
+
+/** Revokes the session `token` itself, returning the address it was for,
+ * or null if the token isn't currently valid (an expired token needs no
+ * revocation). The revocation record's TTL matches the token's remaining
+ * lifetime, so it never outlives the thing it revokes. Tokens minted
+ * before sids existed can't be revoked individually and are rejected. */
+export async function revokeSession(token) {
+  const parsed = parseSessionToken(token);
+  if (!parsed || !parsed.sid) return null;
+  if (await store.get(REVOKED_PREFIX + parsed.sid)) return null;
+  const remainingMs = parsed.exp - Date.now();
+  if (remainingMs <= 0) return null;
+  await store.set(REVOKED_PREFIX + parsed.sid, true, remainingMs);
+  return parsed.address;
+}
+
+/**
+ * The single implementation of "prove control of a Stellar address via
+ * challenge/response", mounted at both /payers/:address/session* and
+ * /workers/:address/session* (the token doesn't distinguish the two —
+ * only the route naming does). `middleware` is applied to every route.
+ */
+export function mountSessionRoutes(app, basePath, ...middleware) {
+  app.post(`${basePath}/:address/session/challenge`, ...middleware, async (req, res) => {
+    try {
+      const xdr = await buildChallengeXdr(req.params.address);
+      res.json({ xdr });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post(`${basePath}/:address/session`, ...middleware, async (req, res) => {
+    const { signedXdr } = req.body || {};
+    if (!signedXdr) return res.status(400).json({ error: 'signedXdr is required' });
+    const session = await verifyChallengeAndIssueSession(req.params.address, signedXdr);
+    if (!session) return res.status(401).json({ error: 'challenge verification failed — signature did not match, or the challenge expired' });
+    res.json(session);
+  });
+
+  // Revokes the session making the request — requires the token itself,
+  // not just knowledge of the address.
+  app.post(`${basePath}/:address/session/revoke`, ...middleware, async (req, res) => {
+    const token = req.body?.token;
+    if ((await verifySession(token)) !== req.params.address) {
+      return res.status(401).json({ error: 'a valid session token for this address is required' });
+    }
+    await revokeSession(token);
+    res.json({ ok: true });
+  });
 }

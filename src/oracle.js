@@ -15,7 +15,7 @@ import { store } from './store.js';
 import { buildProvenanceRecord, saveProvenance, attachSettlement } from './provenance.js';
 import { config } from './config.js';
 import { undoWindowFor, holdThenDispatch, cancelHeld } from './undoWindow.js';
-import { verifySessionToken } from './workerAuth.js';
+import { verifySession } from './workerAuth.js';
 import { restoreCredit } from './billing.js';
 
 const IDEMPOTENCY_PREFIX = 'idempotency:';
@@ -260,7 +260,7 @@ export async function cancelJob(jobId, { sessionToken, apiKeyAccountId } = {}) {
   const owner = await store.get(JOB_OWNER_PREFIX + jobId);
   const authorized = owner?.apiKeyAccountId
     ? Boolean(apiKeyAccountId) && apiKeyAccountId === owner.apiKeyAccountId
-    : Boolean(job.payer) && verifySessionToken(sessionToken) === job.payer;
+    : Boolean(job.payer) && (await verifySession(sessionToken)) === job.payer;
   if (!authorized) {
     return {
       ok: false,

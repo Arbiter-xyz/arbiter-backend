@@ -18,12 +18,20 @@ export function hashApiKey(rawKey) {
   return createHash('sha256').update(rawKey).digest('hex');
 }
 
-/** Returns the accountId a raw key resolves to, or null if the header is
- * missing, malformed, or the key doesn't exist. Never throws. */
-export async function resolveApiKey(req) {
+/** Returns the raw `ak_live_...` key from the Authorization header, or
+ * null if missing/malformed. Does not check the key exists. */
+export function extractApiKey(req) {
   const header = req.get('authorization') || '';
   const [scheme, rawKey] = header.split(' ');
   if (scheme !== 'Bearer' || !rawKey || !rawKey.startsWith(KEY_PREFIX)) return null;
+  return rawKey;
+}
+
+/** Returns the accountId a raw key resolves to, or null if the header is
+ * missing, malformed, or the key doesn't exist. Never throws. */
+export async function resolveApiKey(req) {
+  const rawKey = extractApiKey(req);
+  if (!rawKey) return null;
 
   const record = await store.get(`apikey:${hashApiKey(rawKey)}`);
   return record ? record.accountId : null;
