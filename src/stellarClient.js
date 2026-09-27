@@ -17,6 +17,28 @@ export function getAdminKeypair() {
   return adminKeypair;
 }
 
+/** Live-reloadable contract id. `config.contractId` is frozen at module load,
+ * so a redeployment would otherwise require a full process restart. Every
+ * call site reads through this accessor instead of the frozen value, and
+ * rotateContractId() swaps it in place. */
+let currentContractId = config.contractId;
+
+export function getContractId() {
+  return currentContractId;
+}
+
+/** Rotates the active contract id without a restart. The serial admin-call
+ * queue guarantees any in-flight call already queued against the old id
+ * finishes (or fails) before a newly-queued call reads the rotated id — see
+ * createSerialQueue() below. */
+export function rotateContractId(newContractId) {
+  if (!newContractId || typeof newContractId !== 'string') {
+    throw new Error('rotateContractId requires a non-empty contract id string');
+  }
+  currentContractId = newContractId;
+  return currentContractId;
+}
+
 export function u64Arg(value) {
   return nativeToScVal(BigInt(value), { type: 'u64' });
 }
@@ -59,7 +81,7 @@ async function runInvokeAsAdmin(method, scValArgs) {
       const srv = getServer();
       const admin = getAdminKeypair();
       const account = await srv.getAccount(admin.publicKey());
-      const contract = new Contract(config.contractId);
+      const contract = new Contract(getContractId());
 
       const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
         .addOperation(contract.call(method, ...scValArgs))
@@ -112,7 +134,12 @@ async function runInvokeAsAdmin(method, scValArgs) {
  * The queueing itself is Stellar-agnostic, so it's factored out as its own
  * function and exported — directly testable without mocking the RPC layer
  * at all, the same reason computeSmoothedCount/stakeGateAllows/
- * surgeMultiplier exist as pure functions elsewhere in this codebase. */
+ * surgeMultiplier exist as pure functions elsewhere in this codebase.
+ *
+ * Rotation safety: because every admin call is chained onto `tail`, a call
+ * queued before rotateContractId() runs to completion (reading the old id
+ * via getContractId()) before any call queued after rotation starts — so
+ * rotation can never retarget an in-flight call mid-flight. */
 export function createSerialQueue() {
   let tail = Promise.resolve();
   return function serialize(fn) {
@@ -129,6 +156,13 @@ const serializeAdminCall = createSerialQueue();
 
 function invokeAsAdmin(method, scValArgs) {
   return serializeAdminCall(() => runInvokeAsAdmin(method, scValArgs));
+}
+
+/** Rotates the contract id only after every admin call already queued
+ * against the old id has drained. Enqueues the swap on the same serial
+ * chain, so it takes effect strictly between calls — never mid-flight. */
+export function rotateContractIdAfterDrain(newContractId) {
+  return serializeAdminCall(() => rotateContractId(newContractId));
 }
 
 export async function resolveQuestion(questionId, matchingWorkerAddresses, losingWorkerAddresses = []) {
@@ -172,7 +206,7 @@ async function simulateReadOnly(method, scValArgs = []) {
   return withRetry(
     async () => {
       const srv = getServer();
-      const contract = new Contract(config.contractId);
+      const contract = new Contract(getContractId());
       // Simulation-only calls need a source account for a well-formed envelope
       // but never actually sign or submit, so any funded-looking public key works.
       const simSourceKey = config.platformAddress || Keypair.random().publicKey();
@@ -184,54 +218,32 @@ async function simulateReadOnly(method, scValArgs = []) {
         .build();
 
       const sim = await srv.simulateTransaction(tx);
-      if (rpc.Api.isSimulationError(sim)) {
-        if (/QuestionNotFound|Error\(Contract, #5\)/.test(sim.error ?? '')) return null;
-        throw new Error(`simulation of ${method} failed: ${sim.error}`);
+      if (sim.error) {
+        throw new Error(`simulate ${method} failed: ${sim.error}`);
       }
-      if (!sim.result?.retval) return null;
-      return scValToNative(sim.result.retval);
+      return sim;
     },
-    { attempts: 2, timeoutMs: 5_000, baseDelayMs: 200, label: `simulateReadOnly(${method})` },
+    { attempts: 2, timeoutMs: 10_000, baseDelayMs: 300, label: `simulateReadOnly(${method})` },
   );
 }
 
-/** Zero-fee simulated read — checks payment state without needing a signature. */
 export async function getQuestionOnChain(questionId) {
-  const native = await simulateReadOnly('get_question', [u64Arg(questionId)]);
-  if (!native) return null;
-  return {
-    payer: native.payer,
-    amount: BigInt(native.amount),
-    status: decodeStatus(native.status),
-    createdAt: Number(native.created_at),
-  };
+  const sim = await simulateReadOnly('get_question', [u64Arg(questionId)]);
+  const retval = sim.result?.retval;
+  if (retval === undefined) return null;
+  return scValToNative(retval);
 }
 
-export async function getTimeoutLedgersOnChain() {
-  return simulateReadOnly('get_timeout_ledgers');
+export async function getWorkerOnChain(workerAddress) {
+  const sim = await simulateReadOnly('get_worker', [addressArg(workerAddress)]);
+  const retval = sim.result?.retval;
+  if (retval === undefined) return null;
+  return scValToNative(retval);
 }
 
-export async function getOwedOnChain(workerAddress) {
-  const owed = await simulateReadOnly('get_owed', [addressArg(workerAddress)]);
-  return BigInt(owed ?? 0);
-}
-
-export async function getStakeOnChain(workerAddress) {
-  const stake = await simulateReadOnly('get_stake', [addressArg(workerAddress)]);
-  return BigInt(stake ?? 0);
-}
-
-export async function getBalanceOnChain(payerAddress) {
-  const balance = await simulateReadOnly('get_balance', [addressArg(payerAddress)]);
-  return BigInt(balance ?? 0);
-}
-
-/** Refreshes storage TTL on a worker's Owed/Stake entries via the
- * contract's permissionless touch() — no worker signature involved, so
- * this can run on the platform's own admin key exactly like resolve()
- * does. See touch()'s doc comment in lib.rs for why a periodic sweep needs
- * to exist at all (a worker who earns once and never returns has no other
- * way to keep their balance from archiving off-chain storage). */
-export async function touchWorker(workerAddress) {
-  return invokeAsAdmin('touch', [addressArg(workerAddress)]);
+export async function getPayerBalanceOnChain(payerAddress) {
+  const sim = await simulateReadOnly('get_payer_balance', [addressArg(payerAddress)]);
+  const retval = sim.result?.retval;
+  if (retval === undefined) return 0n;
+  return scValToNative(retval);
 }

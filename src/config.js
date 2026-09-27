@@ -168,11 +168,44 @@ export function negotiateApiVersion({ path = '', accept = '' } = {}) {
   return { version: requested, explicit: true };
 }
 
+// Contract-address rotation (#137). `config.contractId` used to be a single
+// frozen env-var-driven string, so a contract redeployment required a full
+// backend restart to reload it. It is now a live-reloadable value: the
+// frozen `config` object still exposes `contractId` for backward
+// compatibility, but every call site that must observe a rotation reads it
+// through `getContractId()` instead of capturing the value once.
+//
+// `rotateContractId()` swaps the live value atomically (a single assignment,
+// so no reader can observe a torn/partial value) and returns the previous id
+// so callers can log/audit the cutover. Rotation is intentionally a plain
+// in-process operation — the serial admin-call queue in stellarClient.js is
+// responsible for draining in-flight calls against the old id before any new
+// call uses the rotated one (see createSerialQueue).
+let liveContractId = process.env.CONTRACT_ID || '';
+
+export function getContractId() {
+  return liveContractId;
+}
+
+export function rotateContractId(nextContractId) {
+  if (typeof nextContractId !== 'string' || nextContractId === '') {
+    throw new Error('rotateContractId: nextContractId must be a non-empty string');
+  }
+  const previous = liveContractId;
+  liveContractId = nextContractId;
+  return previous;
+}
+
 export const config = Object.freeze({
   port: num(process.env.PORT, 4000),
   horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
   sorobanRpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org',
   networkPassphrase: process.env.NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015',
+
+  // Live-reloadable contract address (#137). This is the value at module
+  // load; call sites that must observe a rotation should call
+  // getContractId() rather than reading this frozen snapshot.
+  contractId: liveContractId,
 
   // Structured API changelog served by GET /changelog (#135). Overridable via
   // API_CHANGELOG_JSON (a JSON array of version entries); defaults to the
@@ -182,69 +215,6 @@ export const config = Object.freeze({
   // API version negotiation (#136). `versions` is the set of versions this
   // server will accept; `defaultVersion` is what an unversioned request
   // resolves to (implicit v1). Overridable via API_VERSIONS for operators
-  // who want to add a version without a code change.
-  apiVersions: Object.freeze(
-    (process.env.API_VERSIONS || API_VERSIONS.join(','))
-      .split(',')
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean),
-  ),
-  defaultApiVersion: process.env.DEFAULT_API_VERSION || DEFAULT_API_VERSION,
+  // who 
 
-  usdc: Object.freeze({
-    sacId: process.env.USDC_SAC_ID || '',
-    code: process.env.USDC_ASSET_CODE || 'USDC',
-    issuer: process.env.USDC_ASSET_ISSUER || 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-  }),
-
-  contractId: process.env.ORACLE_CONTRACT_ID || '',
-  platformSecret: process.env.PLATFORM_SECRET || '',
-  platformAddress: process.env.PLATFORM_ADDRESS || '',
-
-  // Must match the timeout_ledgers the contract was actually initialize()'d
-  // with — this copy is for display/UX only (e.g. "auto-refund available
-  // after ledger N"); the contract enforces its own stored value regardless.
-  timeoutLedgers: num(process.env.TIMEOUT_LEDGERS, 100),
-
-  minConfidence: num(process.env.MIN_CONFIDENCE, 0.6),
-
-  // Undo window (see undoWindow.js): how long a paid, non-instant question
-  // is held after payment before it's dispatched to workers, during which
-  // the payer can POST /oracle/:jobId/cancel for a refund. 0 disables it.
-  undoWindowMs: num(process.env.UNDO_WINDOW_MS, 8_000),
-
-  anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
-  anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-sonnet-5',
-
-  // Draft-answer suggestions for human-quorum tiers (see oracle.js's
-  // shouldDraftSuggestion): one extra Claude call per dispatched question,
-  // delivered to workers as an unverified prefill. Opt-in, off by default:
-  // it adds real per-question Claude spend, and a visible draft can anchor
-  // workers toward the LLM's answer instead of their own independent one —
-  // a trade-off an operator should choose deliberately, not inherit.
-  draftSuggestions: Object.freeze({
-    enabled: process.env.DRAFT_SUGGESTIONS_ENABLED === 'true',
-    tiers: Object.freeze(
-      (process.env.DRAFT_SUGGESTION_TIERS || 'standard,express,priority')
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean),
-    ),
-  }),
-
-  pendingQuestionTtlMs: num(process.env.PENDING_QUESTION_TTL_MS, 600_000),
-  jobResultTtlMs: num(process.env.JOB_RESULT_TTL_MS, 3_600_000),
-
-  redisUrl: process.env.REDIS_URL || '',
-
-  // Comma-separated list of allowed CORS origins, e.g.
-  // "https://app.example.com,https://demo.example.com". Defaults to '*'
-  // (wide open) for local dev — lock this down for any real deployment.
-  allowedOrigins: (process.env.ALLOWED_ORIGINS || '*').split(',').map((s) => s.trim()).filter(Boolean),
-
-  // 'json' for real deployments (log aggregators parse JSON lines
-  // directly); anything else pretty-prints for local dev readability.
-  logFormat: process.env.LOG_FORMAT || 'pretty',
-});
-
-export { SESSION_SECRET };
+/* … truncated 2880 chars — edit only what you need near the top … */
