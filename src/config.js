@@ -51,4 +51,26 @@ export const config = {
   billing: {
     fiatPoolAddress: process.env.FIAT_POOL_ADDRESS || '',
   },
+  rateLimits: {
+    // Free, unauthenticated, LLM-cost-bearing endpoints each get their own
+    // bucket so a burst on one cannot starve the others.
+    sandbox: {
+      windowMs: Number(process.env.RATE_LIMIT_SANDBOX_WINDOW_MS || 60_000),
+      max: Number(process.env.RATE_LIMIT_SANDBOX_MAX || 30),
+    },
+    oracle: {
+      windowMs: Number(process.env.RATE_LIMIT_ORACLE_WINDOW_MS || 60_000),
+      max: Number(process.env.RATE_LIMIT_ORACLE_MAX || 60),
+    },
+    sponsor: {
+      windowMs: Number(process.env.RATE_LIMIT_SPONSOR_WINDOW_MS || 60_000),
+      max: Number(process.env.RATE_LIMIT_SPONSOR_MAX || 20),
+    },
+    // FAQ search is a similarly free, unauthenticated, LLM-cost-bearing
+    // endpoint, so it follows the same bucket pattern as sandbox/oracle/sponsor.
+    faq: {
+      windowMs: Number(process.env.RATE_LIMIT_FAQ_WINDOW_MS || 60_000),
+      max: Number(process.env.RATE_LIMIT_FAQ_MAX || 30),
+    },
+  },
 };
