@@ -56,6 +56,30 @@ export async function payerOwnsQuestion(payerAddress, questionId) {
 }
 
 /**
+ * GDPR erasure (#126): delete this payer's off-chain records — the
+ * `payer-questions:` list and, if present, the address's entry in the
+ * known-payer index. On-chain state (resolved questions, stake, owed
+ * balances) is structurally permanent and is NOT touched here; callers
+ * must surface that distinction in the response body, not just in code.
+ * Returns a summary of exactly what was removed so the endpoint can report
+ * it honestly.
+ */
+export async function erasePayerRecords(payerAddress) {
+  if (!payerAddress) return { deleted: false, questionIds: 0, removedFromIndex: false };
+
+  const ids = await getPayerQuestionIds(payerAddress);
+  await store.delete(PREFIX + payerAddress);
+
+  const known = await getKnownPayerAddresses();
+  const removedFromIndex = known.includes(payerAddress);
+  if (removedFromIndex) {
+    await store.set(PAYER_INDEX_KEY, known.filter((a) => a !== payerAddress));
+  }
+
+  return { deleted: true, questionIds: ids.length, removedFromIndex };
+}
+
+/**
  * Pure aggregation so it's testable without needing real chain-derived
  * job data — `jobs[i]` may be null/undefined if a job record has expired
  * (see jobs.js's TTL), which is filtered out rather than surfaced as a
