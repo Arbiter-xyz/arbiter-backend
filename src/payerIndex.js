@@ -43,6 +43,19 @@ export async function getPayerQuestionIds(payerAddress) {
 }
 
 /**
+ * Ownership check for the dispute endpoint (#124): a payer may only contest
+ * a question that appears in their own payerIndex record. This is the
+ * off-chain analogue of the on-chain payer field — the session token proves
+ * address control, and this proves the address actually paid for the
+ * question, so a valid session for payer A can't dispute payer B's job.
+ */
+export async function payerOwnsQuestion(payerAddress, questionId) {
+  if (!payerAddress || !questionId) return false;
+  const ids = await getPayerQuestionIds(payerAddress);
+  return ids.includes(questionId);
+}
+
+/**
  * Pure aggregation so it's testable without needing real chain-derived
  * job data — `jobs[i]` may be null/undefined if a job record has expired
  * (see jobs.js's TTL), which is filtered out rather than surfaced as a
