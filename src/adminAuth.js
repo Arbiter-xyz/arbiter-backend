@@ -24,6 +24,13 @@ import { hashApiKey } from './apiKeyAuth.js';
  * the live Railway one) are not silently locked out. It is checked after the
  * credential table, so a deployment that has migrated to hashed credentials
  * can drop ADMIN_TOKEN without any code change.
+ *
+ * Session recording (#132): every authenticated admin call is attributed to a
+ * stable per-credential session id so the audit log (#129) can be replayed as
+ * an ordered sequence of admin actions. This is backend API-call recording,
+ * not UI session replay — this repo has no admin console frontend to
+ * instrument. The session id is derived from the credential hash (never the
+ * raw token), so it is stable across requests without persisting secrets.
  */
 
 const ROLE_READONLY = 'readonly';
@@ -41,23 +48,37 @@ function timingSafeEqual(a, b) {
   return crypto.timingSafeEqual(ab, bb);
 }
 
-/** Resolve the role granted by a presented token, or null if it matches no
- * configured credential. Checks the hashed credential table first, then the
- * legacy ADMIN_TOKEN compat path. */
-export function resolveAdminRole(token) {
+/** Derive a stable, non-reversible session id from a credential hash. */
+function sessionIdForHash(hash) {
+  return crypto.createHash('sha256').update(`admin-session:${hash}`).digest('hex').slice(0, 32);
+}
+
+/** Resolve the credential (role + session id) granted by a presented token, or
+ * null if it matches no configured credential. Checks the hashed credential
+ * table first, then the legacy ADMIN_TOKEN compat path. */
+export function resolveAdminCredential(token) {
   if (!token) return null;
 
   const presentedHash = hashApiKey(token);
   for (const cred of config.admin.credentials) {
-    if (timingSafeEqual(presentedHash, cred.hash)) return cred.role;
+    if (timingSafeEqual(presentedHash, cred.hash)) {
+      return { role: cred.role, sessionId: sessionIdForHash(cred.hash) };
+    }
   }
 
   // Legacy compat: the single ADMIN_TOKEN is an implicit full-admin credential.
   if (config.admin.token && timingSafeEqual(token, config.admin.token)) {
-    return ROLE_FULL;
+    return { role: ROLE_FULL, sessionId: sessionIdForHash(hashApiKey(config.admin.token)) };
   }
 
   return null;
+}
+
+/** Resolve the role granted by a presented token, or null if it matches no
+ * configured credential. */
+export function resolveAdminRole(token) {
+  const cred = resolveAdminCredential(token);
+  return cred ? cred.role : null;
 }
 
 /** True when `role` is allowed to satisfy a route requiring `required`. */
@@ -72,21 +93,26 @@ function roleSatisfies(role, required) {
  * requires a full-admin credential; `requireAdmin('readonly')` accepts either
  * a read-only or a full credential. Rejects with 401 when no credential is
  * presented/matched, and 403 when a valid credential lacks the required role.
+ *
+ * On success the resolved role and session id are attached to the request so
+ * downstream audit/recording middleware can attribute the call to a caller
+ * session (#132).
  */
 export function requireAdmin(required = ROLE_FULL) {
   return (req, res, next) => {
     const header = req.headers.authorization || '';
     const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-    const role = resolveAdminRole(token);
+    const cred = resolveAdminCredential(token);
 
-    if (!role) {
+    if (!cred) {
       return res.status(401).json({ error: 'unauthorized' });
     }
-    if (!roleSatisfies(role, required)) {
+    if (!roleSatisfies(cred.role, required)) {
       return res.status(403).json({ error: 'forbidden', requiredRole: required });
     }
 
-    req.adminRole = role;
+    req.adminRole = cred.role;
+    req.adminSessionId = cred.sessionId;
     return next();
   };
 }

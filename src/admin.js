@@ -6,6 +6,7 @@ import { getStakeOnChain, getOwedOnChain } from './stellarClient.js';
 import { getHorizon } from './sponsor.js';
 import { config } from './config.js';
 import { stroopsToUsdc } from './pricing.js';
+import { getAuditLog } from './auditLog.js';
 
 const PLATFORM_FEE_BPS = 2000n; // mirrors contracts/oracle-escrow/src/lib.rs's PLATFORM_FEE_BPS
 const BPS_DENOM = 10_000n;
@@ -161,6 +162,53 @@ export async function listAnchorKyc() {
 }
 
 /**
+ * Session recording/replay for admin console actions (#132).
+ *
+ * This is backend API-call recording, NOT full UI session replay: this repo
+ * contains no admin console frontend to instrument, so there are no mouse
+ * movements or rendered screens to capture. What we can own is the ordered
+ * sequence of admin API calls taken during an incident, which is exactly
+ * what #129's audit log already records — this extends that log with the
+ * full (redacted) request context needed to reconstruct the sequence,
+ * rather than introducing a second, parallel recording mechanism.
+ *
+ * Redaction is applied at write time by the audit log itself, using the
+ * same REDACT_CONFIG that logger.js uses to strip Authorization/cookie
+ * headers, so no sensitive header or body field is ever persisted here.
+ *
+ * Returns the recorded calls for one admin session as an ordered
+ * (oldest-first) list, so an operator can replay the sequence of actions
+ * that led up to a ticket. `sessionId` is the per-caller session identifier
+ * attributed by #131's role-based admin permissions; when omitted, the
+ * caller's own session is used.
+ */
+export async function getSessionRecording({ sessionId, limit = 200 } = {}) {
+  const entries = await getAuditLog({ sessionId, limit });
+  const calls = entries
+    .filter((e) => e.sessionId === sessionId)
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .map((e) => ({
+      timestamp: e.timestamp,
+      method: e.method,
+      path: e.path,
+      status: e.status,
+      adminId: e.adminId ?? null,
+      role: e.role ?? null,
+      request: e.request ?? null,
+      response: e.response ?? null,
+    }));
+
+  return {
+    sessionId,
+    // Explicitly documented so consumers don't mistake this for UI replay.
+    kind: 'api-call-recording',
+    note: 'Backend API-call sequence only; no admin frontend exists in this repo for UI-level replay.',
+    total: calls.length,
+    calls,
+  };
+}
+
+/**
  * Explicit per-route role assignments for every /admin/* route.
  *
  * Every route today is read-only, so all are gated at `readonly` — a
@@ -182,23 +230,5 @@ export const ADMIN_ROUTE_ROLES = [
   { method: 'get', path: '/fee-revenue', role: 'readonly', handler: getFeeRevenue },
   { method: 'get', path: '/anchor-payouts', role: 'readonly', handler: listAnchorPayouts },
   { method: 'get', path: '/anchor-kyc', role: 'readonly', handler: listAnchorKyc },
+  { method: 'get', path: '/sessions/:sessionId/recording', role: 'readonly', handler: getSessionRecording },
 ];
-
-/**
- * Mounts every /admin/* route with its explicit role gate. Callers pass the
- * Express app and the requireAdmin middleware factory so this module stays
- * free of a hard dependency on the HTTP layer (and so tests can mount the
- * same table against a bare router).
- */
-export function mountAdminRoutes(app, requireAdmin) {
-  for (const route of ADMIN_ROUTE_ROLES) {
-    app[route.method](`/admin${route.path}`, requireAdmin(route.role), async (req, res, next) => {
-      try {
-        const result = await route.handler(req.query);
-        res.json(result);
-      } catch (err) {
-        next(err);
-      }
-    });
-  }
-}
