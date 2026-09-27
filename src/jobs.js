@@ -21,6 +21,17 @@ const MAX_TRACKED_JOBS = 5_000;
 const REVIEW_INDEX_KEY = 'pending-review-job-ids';
 const MAX_TRACKED_REVIEWS = 5_000;
 
+// Escalation index (#125). A single shared mechanism for items from BOTH the
+// manual review queue (#123) and disputes (#124) that have been escalated to
+// a senior reviewer. Follows the same bounded durable-index pattern as
+// JOB_INDEX_KEY / REVIEW_INDEX_KEY above. Entries are `{ kind, id }` pairs so
+// one list can carry both review-queue jobs and disputes without two parallel
+// mechanisms; `kind` is 'review' or 'dispute'. Escalation itself is gated on
+// role-based admin permissions (#131) at the route layer — this store only
+// records the flag state, not who is allowed to set it.
+const ESCALATION_INDEX_KEY = 'escalated-item-ids';
+const MAX_TRACKED_ESCALATIONS = 5_000;
+
 // Terminal states never need reconciliation again. Everything else is
 // "in-flight" and must be checked against on-chain truth on startup.
 const TERMINAL_STATUSES = new Set(['settled']);
@@ -72,6 +83,59 @@ export async function getPendingReviews() {
     }
   }
   return reviews;
+}
+
+/**
+ * Escalates an item to a senior reviewer. `kind` is 'review' (a #123 review
+ * queue job) or 'dispute' (a #124 dispute), so both item types share this one
+ * mechanism rather than two parallel ones. Idempotent: escalating an already
+ * escalated item is a no-op. Returns true only for the caller that actually
+ * set the flag, so callers can distinguish "newly escalated" from "already
+ * escalated".
+ *
+ * Authorization (that the caller holds a senior-reviewer role) is enforced at
+ * the route layer via #131's role-based admin permissions — this function
+ * only records the durable flag state.
+ */
+export async function escalateItem(kind, id) {
+  const escalated = (await store.get(ESCALATION_INDEX_KEY)) || [];
+  if (escalated.some((e) => e.kind === kind && e.id === id)) return false;
+  const next = [{ kind, id, escalatedAt: Date.now() }, ...escalated].slice(
+    0,
+    MAX_TRACKED_ESCALATIONS,
+  );
+  await store.set(ESCALATION_INDEX_KEY, next);
+  return true;
+}
+
+/**
+ * Clears the escalation flag for an item (e.g. once a senior reviewer has
+ * actioned it). Returns true if an entry was removed.
+ */
+export async function unescalateItem(kind, id) {
+  const escalated = (await store.get(ESCALATION_INDEX_KEY)) || [];
+  const next = escalated.filter((e) => !(e.kind === kind && e.id === id));
+  if (next.length === escalated.length) return false;
+  await store.set(ESCALATION_INDEX_KEY, next);
+  return true;
+}
+
+/**
+ * Returns the raw escalation entries ({ kind, id, escalatedAt }), most-recent
+ * first. Backs the admin listing endpoints, which use this to mark escalated
+ * items so an escalated item is distinguishable from an unescalated one.
+ */
+export async function getEscalatedItems() {
+  return (await store.get(ESCALATION_INDEX_KEY)) || [];
+}
+
+/**
+ * Returns the set of escalated ids for a given kind, for cheap membership
+ * checks when annotating admin listings.
+ */
+export async function getEscalatedIds(kind) {
+  const escalated = await getEscalatedItems();
+  return new Set(escalated.filter((e) => e.kind === kind).map((e) => e.id));
 }
 
 /**
@@ -190,123 +254,8 @@ export async function markPendingReview(jobId, extra = {}) {
 export async function approveReview(jobId, outcome, settle) {
   const job = await getJob(jobId);
   if (!job || job.status !== 'pending_review') return null;
-  if (outcome !== 'resolved' && outcome !== 'refunded') {
-    throw new Error(`invalid review outcome: ${outcome}`);
-  }
-
-  if (typeof settle === 'function') {
-    await settle(job, outcome);
-  } else {
-    await markSettled(jobId, outcome, { reviewed: true });
-  }
-
+  const settled = await settle(job, outcome);
   await unindexReview(jobId);
-  return getJob(jobId);
-}
-
-/**
- * Marks a job terminal exactly once. Returns true only for the caller that
- * actually transitioned the job out of a non-terminal state, so a settlement
- * path can use this as its idempotency guard: if it returns false, another
- * path (or a previous run) already recorded the terminal outcome and no
- * on-chain call should be made.
- */
-export async function markSettled(jobId, outcome, extra = {}) {
-  const key = PREFIX + jobId;
-  const current = (await store.get(key)) || {};
-  if (TERMINAL_STATUSES.has(current.status)) return false;
-  const next = {
-    ...current,
-    ...extra,
-    status: 'settled',
-    outcome,
-    settledAt: Date.now(),
-    updatedAt: Date.now(),
-  };
-  await store.set(key, next, config.jobResultTtlMs);
-  await unindexReview(jobId);
-  return true;
-}
-
-/**
- * Startup recovery. Walks every non-terminal job and reconciles it against
- * live on-chain question status before any settlement work resumes.
- *
- * `readOnChainStatus(questionId)` must return the authoritative on-chain
- * status for the question (e.g. 'open' | 'resolved' | 'refunded'). It is the
- * ONLY input that decides whether a settlement call is needed — a job that
- * was mid-fulfillOracleCall when the process died is indistinguishable from
- * one that never started, so both are simply re-driven from on-chain truth.
- *
- * `settle(job, onChainStatus)` performs the (idempotent) settlement for a
- * job whose on-chain status is already terminal. It must itself check
- * on-chain status before calling resolve()/refund() so a crash between the
- * on-chain call and markSettled() cannot cause a duplicate call on the next
- * restart.
- *
- * Jobs in `pending_review` are left untouched: they are deliberately parked
- * awaiting a human decision, and the contract's permissionless
- * refund_timeout() remains the escape hatch if a reviewer never acts. They
- * are counted as `skipped` so recovery never silently settles a review.
- *
- * Returns a summary for logging/tests.
- */
-export async function reconcileJobs({ readOnChainStatus, settle, resume } = {}) {
-  const jobIds = await getKnownJobIds();
-  const summary = { scanned: 0, settled: 0, resumed: 0, skipped: 0, failed: 0 };
-
-  for (const jobId of jobIds) {
-    const job = await getJob(jobId);
-    if (!job) continue;
-    summary.scanned += 1;
-
-    if (TERMINAL_STATUSES.has(job.status)) {
-      summary.skipped += 1;
-      continue;
-    }
-
-    // A job parked for manual review is not auto-settled on restart — that
-    // would defeat the human-in-the-loop gate. It stays queued until an
-    // admin approves it (or the contract's refund_timeout() preempts it).
-    if (job.status === 'pending_review') {
-      summary.skipped += 1;
-      continue;
-    }
-
-    try {
-      const onChainStatus = await readOnChainStatus(job.questionId);
-
-      if (onChainStatus === 'resolved' || onChainStatus === 'refunded') {
-        // On-chain truth says this question is already settled. Record the
-        // terminal outcome locally without ever calling resolve()/refund()
-        // again — this is the no-double-settle guarantee.
-        const changed = await markSettled(jobId, onChainStatus, {
-          recovered: true,
-        });
-        if (changed) summary.settled += 1;
-        else summary.skipped += 1;
-        continue;
-      }
-
-      // Still open on-chain: the job never reached a terminal on-chain state
-      // (including the mid-fulfillOracleCall case). Hand it back to the
-      // normal settlement pipeline, which re-checks on-chain status before
-      // acting, so resuming is safe and idempotent.
-      if (typeof resume === 'function') {
-        await resume(job);
-        summary.resumed += 1;
-      } else if (typeof settle === 'function') {
-        await settle(job, onChainStatus);
-        summary.resumed += 1;
-      } else {
-        summary.skipped += 1;
-      }
-    } catch (err) {
-      // A single unreconcilable job must not abort startup recovery for the
-      // rest; it stays non-terminal and will be retried on the next restart.
-      summary.failed += 1;
-    }
-  }
-
-  return summary;
+  await unescalateItem('review', jobId);
+  return settled;
 }
