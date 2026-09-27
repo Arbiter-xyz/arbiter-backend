@@ -180,41 +180,122 @@ export function negotiateApiVersion({ path = '', accept = '' } = {}) {
 // so callers can log/audit the cutover. Rotation is intentionally a plain
 // in-process operation — the serial admin-call queue in stellarClient.js is
 // responsible for draining in-flight calls against the old id before any new
-// call uses the rotated one (see createSerialQueue).
-let liveContractId = process.env.CONTRACT_ID || '';
+// call uses it.
+//
+// Multi-contract support (#138) generalizes this: instead of exactly one
+// active contract, a set of contract instances can be configured, each with
+// its own admin key and its own serial admin-call queue (two instances that
+// share a signing key don't need two queues, but independent keys do — see
+// stellarClient.js). A new question is routed to one instance at
+// `issueChallenge()` time and that choice is recorded in its stashed
+// pendingQuestions record so verify/dispatch/resolve/refund all resolve the
+// same instance. Selection is deliberately random/round-robin in v1 — no
+// capacity awareness (explicitly out of scope).
+
+// Parses the multi-contract configuration. Accepts either:
+//   CONTRACT_INSTANCES_JSON='[{"id":"C...","adminKey":"S..."}, ...]'
+// or a comma-separated CONTRACT_IDS='C...,C...' (each instance then shares
+// the single platform admin key, so they share one serial queue). Falls back
+// to the single legacy CONTRACT_ID so existing deployments keep working
+// unchanged with exactly one instance.
+function parseContractInstances() {
+  const raw = process.env.CONTRACT_INSTANCES_JSON;
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        const instances = parsed
+          .map((entry, i) => {
+            const id = typeof entry === 'string' ? entry : entry?.id;
+            if (!id) return null;
+            return {
+              id,
+              adminKey: (typeof entry === 'object' && entry?.adminKey) || process.env.ADMIN_SECRET_KEY || null,
+              label: (typeof entry === 'object' && entry?.label) || `contract-${i}`,
+            };
+          })
+          .filter(Boolean);
+        if (instances.length > 0) return instances;
+      }
+    } catch {
+      console.warn('[config] CONTRACT_INSTANCES_JSON is not valid JSON — falling back to CONTRACT_ID');
+    }
+  }
+
+  const ids = (process.env.CONTRACT_IDS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (ids.length > 0) {
+    return ids.map((id, i) => ({
+      id,
+      adminKey: process.env.ADMIN_SECRET_KEY || null,
+      label: `contract-${i}`,
+    }));
+  }
+
+  const single = process.env.CONTRACT_ID || '';
+  return [{ id: single, adminKey: process.env.ADMIN_SECRET_KEY || null, label: 'contract-0' }];
+}
+
+const contractInstances = parseContractInstances();
+
+// Live, mutable set of active contract instances. Kept as a plain array so
+// `getContractInstances()` always reflects the current set (rotation of the
+// whole set is a single assignment, same atomicity argument as #137).
+let liveContractInstances = contractInstances;
+
+// Backward-compatible single active contract id: the first configured
+// instance. `getContractId()`/`rotateContractId()` from #137 keep operating
+// on this value so existing single-contract call sites are untouched.
+let liveContractId = contractInstances[0]?.id || '';
 
 export function getContractId() {
   return liveContractId;
 }
 
-export function rotateContractId(nextContractId) {
-  if (typeof nextContractId !== 'string' || nextContractId === '') {
-    throw new Error('rotateContractId: nextContractId must be a non-empty string');
-  }
+export function rotateContractId(nextId) {
   const previous = liveContractId;
-  liveContractId = nextContractId;
+  liveContractId = nextId;
+  // Keep the instance set consistent with a single-contract rotation: the
+  // rotated id becomes the primary instance, preserving its admin key.
+  const primary = liveContractInstances[0];
+  liveContractInstances = [
+    { id: nextId, adminKey: primary?.adminKey || null, label: primary?.label || 'contract-0' },
+    ...liveContractInstances.slice(1),
+  ];
   return previous;
 }
 
+// Returns the currently configured contract instances. Each entry is
+// { id, adminKey, label }. Never empty in practice (falls back to a single
+// entry, possibly with an empty id, matching the legacy CONTRACT_ID shape).
+export function getContractInstances() {
+  return liveContractInstances;
+}
+
+// Resolves a contract instance by id, or null if it isn't configured. Used
+// by every later step (verify/dispatch/resolve/refund) to look up the
+// instance a question was opened against from its stashed record.
+export function getContractInstance(id) {
+  return liveContractInstances.find((c) => c.id === id) || null;
+}
+
+// Random/round-robin instance selection for a newly opened question. v1 is
+// deliberately random across configured instances — no capacity awareness
+// (explicitly out of scope per #138). Returns the chosen instance, or null
+// when no instance is configured.
+export function selectContractInstance() {
+  const instances = liveContractInstances.filter((c) => c.id);
+  if (instances.length === 0) return null;
+  return instances[Math.floor(Math.random() * instances.length)];
+}
+
 export const config = Object.freeze({
-  port: num(process.env.PORT, 4000),
-  horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
-  sorobanRpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org',
-  networkPassphrase: process.env.NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015',
-
-  // Live-reloadable contract address (#137). This is the value at module
-  // load; call sites that must observe a rotation should call
-  // getContractId() rather than reading this frozen snapshot.
+  port: num(process.env.PORT, 3000),
   contractId: liveContractId,
-
-  // Structured API changelog served by GET /changelog (#135). Overridable via
-  // API_CHANGELOG_JSON (a JSON array of version entries); defaults to the
-  // built-in hand-maintained history above.
+  networkPassphrase: process.env.NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015',
+  rpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org',
+  sessionSecret: SESSION_SECRET,
   apiChangelog: parseApiChangelog(process.env.API_CHANGELOG_JSON),
-
-  // API version negotiation (#136). `versions` is the set of versions this
-  // server will accept; `defaultVersion` is what an unversioned request
-  // resolves to (implicit v1). Overridable via API_VERSIONS for operators
-  // who 
-
-/* … truncated 2880 chars — edit only what you need near the top … */
+});
