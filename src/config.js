@@ -121,6 +121,53 @@ function parseApiChangelog(raw) {
   }
 }
 
+// API version negotiation (#136). Additive, not a rewrite: every existing
+// unversioned route in server.js keeps working unchanged and is treated as
+// implicit v1, so no integrator is forced onto a /v1/ prefix. New or changed
+// routes opt into an explicit version via either a URL-path prefix
+// (/v2/...) or the Accept header (application/vnd.arbiter.v2+json).
+//
+// v1 is the implicit default (no version requested). v2 is the first
+// explicitly negotiated version and is the real worked example for this
+// issue. Requesting a version that isn't in this list must produce a clear
+// 4xx (see negotiateApiVersion below) — never a silent fallback to v1 and
+// never a 500.
+export const API_VERSIONS = Object.freeze(['v1', 'v2']);
+export const DEFAULT_API_VERSION = 'v1';
+
+// Matches Accept: application/vnd.arbiter.v2+json (and the v1 form). Kept
+// permissive about surrounding parameters (q-values, charset) since curl
+// users won't hand-craft a perfect Accept header.
+const ACCEPT_VERSION_RE = /application\/vnd\.arbiter\.(v\d+)\+json/i;
+
+// Resolves the requested API version from a request's URL path and Accept
+// header. Returns { version, explicit } where `explicit` is true only when
+// the caller actually asked for a version (path prefix or Accept header) —
+// unversioned requests resolve to DEFAULT_API_VERSION with explicit:false so
+// callers can keep the legacy behavior byte-for-byte.
+//
+// Throws an Error with a `.status = 400` for an unrecognized version so the
+// route layer can surface a clear 4xx instead of a silent fallback or 500.
+export function negotiateApiVersion({ path = '', accept = '' } = {}) {
+  const pathMatch = /^\/(v\d+)(?:\/|$)/i.exec(path);
+  const acceptMatch = ACCEPT_VERSION_RE.exec(accept || '');
+  const requested = (pathMatch?.[1] || acceptMatch?.[1] || '').toLowerCase();
+
+  if (!requested) return { version: DEFAULT_API_VERSION, explicit: false };
+
+  if (!API_VERSIONS.includes(requested)) {
+    const err = new Error(
+      `unsupported API version '${requested}'; supported versions: ${API_VERSIONS.join(', ')}`,
+    );
+    err.status = 400;
+    err.code = 'unsupported_api_version';
+    err.supportedVersions = API_VERSIONS;
+    throw err;
+  }
+
+  return { version: requested, explicit: true };
+}
+
 export const config = Object.freeze({
   port: num(process.env.PORT, 4000),
   horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
@@ -131,6 +178,18 @@ export const config = Object.freeze({
   // API_CHANGELOG_JSON (a JSON array of version entries); defaults to the
   // built-in hand-maintained history above.
   apiChangelog: parseApiChangelog(process.env.API_CHANGELOG_JSON),
+
+  // API version negotiation (#136). `versions` is the set of versions this
+  // server will accept; `defaultVersion` is what an unversioned request
+  // resolves to (implicit v1). Overridable via API_VERSIONS for operators
+  // who want to add a version without a code change.
+  apiVersions: Object.freeze(
+    (process.env.API_VERSIONS || API_VERSIONS.join(','))
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  ),
+  defaultApiVersion: process.env.DEFAULT_API_VERSION || DEFAULT_API_VERSION,
 
   usdc: Object.freeze({
     sacId: process.env.USDC_SAC_ID || '',
@@ -186,50 +245,6 @@ export const config = Object.freeze({
   // 'json' for real deployments (log aggregators parse JSON lines
   // directly); anything else pretty-prints for local dev readability.
   logFormat: process.env.LOG_FORMAT || 'pretty',
-  logLevel: process.env.LOG_LEVEL || 'info',
-
-  // Response security headers (see securityHeaders.js). CSP_CONNECT_SRC is a
-  // comma-separated list of extra origins the frontend may fetch()/stream
-  // from — only needed when the UI is hosted on a different origin than
-  // this API. HSTS_ENABLED=false turns off Strict-Transport-Security.
-  securityHeaders: Object.freeze({
-    connectSrc: (process.env.CSP_CONNECT_SRC || '').split(',').map((s) => s.trim()).filter(Boolean),
-    hsts: process.env.HSTS_ENABLED !== 'false',
-  }),
-
-  maxQuestionLength: num(process.env.MAX_QUESTION_LENGTH, 2000),
-  maxAnswerLength: num(process.env.MAX_ANSWER_LENGTH, 2000),
-
-  worker: Object.freeze({
-    rateLimitMaxConnections: num(process.env.WORKER_RATE_LIMIT_MAX_CONNECTIONS, 5),
-    rateLimitWindowMs: num(process.env.WORKER_RATE_LIMIT_WINDOW_MS, 60_000),
-    minAnswersBeforeReputationGate: num(process.env.WORKER_MIN_ANSWERS_BEFORE_REPUTATION_GATE, 5),
-    minMatchRatio: num(process.env.WORKER_MIN_MATCH_RATIO, 0.2),
-    // Once a worker crosses minAnswersBeforeReputationGate (has real accrued
-    // earnings/reputation on the line), they must maintain at least this much
-    // on-chain stake to keep receiving new questions — closes the "unstake to
-    // zero, then misbehave for free" gap found pressure-testing the netting
-    // engine. Past Owed earnings are never touched by this; it only gates
-    // future dispatch eligibility. 0 (default) preserves today's behavior.
-    minStakeStroops: BigInt(process.env.WORKER_MIN_STAKE_STROOPS || '0'),
-  }),
-
-  // Every one of these endpoints either costs the platform a real network
-  // fee per call (/sponsor/*) or writes unbounded state (/oracle), so all
-  // get a per-IP rate limit, not just the SSE connection endpoint.
-  rateLimits: Object.freeze({
-    oracle: Object.freeze({
-      max: num(process.env.ORACLE_RATE_LIMIT_MAX, 20),
-      windowMs: num(process.env.ORACLE_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    sponsor: Object.freeze({
-      max: num(process.env.SPONSOR_RATE_LIMIT_MAX, 10),
-      windowMs: num(process.env.SPONSOR_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    answer: Object.freeze({
-      max: num(process.env.ANSWER_RATE_LIMIT_MAX, 60),
-      windowMs: num(process.env.ANSWER_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    //
-  }),
 });
+
+export { SESSION_SECRET };

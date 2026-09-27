@@ -59,3 +59,40 @@ export async function getLeaderboard(limit = 50) {
 
   return rankLeaderboard(rows, limit);
 }
+
+/**
+ * v2 leaderboard shape (issue #136's worked example of explicit version
+ * negotiation). The v1 rows above are left byte-for-byte unchanged so the
+ * existing route test suite keeps passing; v2 is purely additive and
+ * reshapes the same underlying data into a self-describing envelope with
+ * an explicit `apiVersion` marker and a stable `rank` field, which is the
+ * kind of change that would otherwise be a silent breaking change for any
+ * integrator parsing positional array order.
+ *
+ * `matchRatio` is emitted as a rounded percentage (0-100) rather than the
+ * raw 0-1 float, and `stake` is nested under a `stake` object alongside
+ * its raw stroops value so a consumer never has to guess units. Workers
+ * with no answers yet keep `matchRatio: null` rather than being coerced to
+ * 0, which would misrepresent "no data" as "zero accuracy".
+ */
+export function toLeaderboardV2(rows) {
+  return {
+    apiVersion: 'v2',
+    workers: rows.map((r, i) => ({
+      rank: i + 1,
+      workerId: r.workerId,
+      totalAnswers: r.totalAnswers,
+      matched: r.matched,
+      matchRatioPct: r.matchRatio === null ? null : Math.round(r.matchRatio * 100),
+      stake: {
+        stroops: r.stakeStroops,
+        usdc: r.stake,
+      },
+      established: r.established,
+    })),
+  };
+}
+
+export async function getLeaderboardV2(limit = 50) {
+  return toLeaderboardV2(await getLeaderboard(limit));
+}
