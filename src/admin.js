@@ -159,3 +159,46 @@ export async function listAnchorKyc() {
   );
   return rows.filter(Boolean);
 }
+
+/**
+ * Explicit per-route role assignments for every /admin/* route.
+ *
+ * Every route today is read-only, so all are gated at `readonly` — a
+ * read-only operator can call them, and a full-admin credential can too
+ * (requireAdmin('readonly') accepts either role). Mutating admin routes
+ * (e.g. #118 category CRUD, #123 review-queue approvals, #124 disputes)
+ * must be registered here as `full` so a read-only credential is rejected
+ * with 403 server-side, not merely hidden in a UI.
+ *
+ * `method` is the HTTP verb; `path` is the Express path as mounted under
+ * /admin. Keeping this table explicit (rather than inferring from the
+ * handler) is what makes the role assignment auditable per-route.
+ */
+export const ADMIN_ROUTE_ROLES = [
+  { method: 'get', path: '/transactions', role: 'readonly', handler: listTransactions },
+  { method: 'get', path: '/workers', role: 'readonly', handler: listWorkers },
+  { method: 'get', path: '/payers', role: 'readonly', handler: listPayers },
+  { method: 'get', path: '/treasury', role: 'readonly', handler: getTreasury },
+  { method: 'get', path: '/fee-revenue', role: 'readonly', handler: getFeeRevenue },
+  { method: 'get', path: '/anchor-payouts', role: 'readonly', handler: listAnchorPayouts },
+  { method: 'get', path: '/anchor-kyc', role: 'readonly', handler: listAnchorKyc },
+];
+
+/**
+ * Mounts every /admin/* route with its explicit role gate. Callers pass the
+ * Express app and the requireAdmin middleware factory so this module stays
+ * free of a hard dependency on the HTTP layer (and so tests can mount the
+ * same table against a bare router).
+ */
+export function mountAdminRoutes(app, requireAdmin) {
+  for (const route of ADMIN_ROUTE_ROLES) {
+    app[route.method](`/admin${route.path}`, requireAdmin(route.role), async (req, res, next) => {
+      try {
+        const result = await route.handler(req.query);
+        res.json(result);
+      } catch (err) {
+        next(err);
+      }
+    });
+  }
+}
