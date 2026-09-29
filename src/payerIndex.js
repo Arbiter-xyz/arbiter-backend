@@ -19,6 +19,26 @@ const MAX_TRACKED_PER_PAYER = 200; // bound growth; keep the most recent
 const PAYER_INDEX_KEY = 'known-payer-addresses';
 const MAX_TRACKED_PAYERS = 5_000;
 
+// CCPA (#127) reuses the GDPR (#126) data-access/erasure plumbing rather
+// than re-deriving the per-address store fan-out. This module owns the
+// payerIndex.js slice of that fan-out; the CCPA wrapper composes it with
+// the other stores' slices (dispatch.js `rep:` records, push.js
+// subscriptions, anchorRecords.js cache) via the shared request handler.
+//
+// "Personal information" under this system's actual data model is narrow:
+// a Stellar public key (the payer address) plus self-reported anchor KYC
+// status. There are no names, emails, or other direct PII stored here, so
+// the CCPA access/erasure surface is exactly the same address-keyed data
+// the GDPR endpoints already expose — no parallel implementation.
+const CCPA_REQUEST_PREFIX = 'ccpa-request:';
+const MAX_TRACKED_CCPA_REQUESTS = 5_000;
+
+// CCPA statutory response window: 45 days from receipt, extendable once by
+// another 45 days. We record the receipt timestamp so a request can be
+// tracked against that deadline without re-deriving it from logs.
+const CCPA_RESPONSE_WINDOW_DAYS = 45;
+const CCPA_RESPONSE_WINDOW_MS = CCPA_RESPONSE_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+
 export async function getKnownPayerAddresses() {
   return (await store.get(PAYER_INDEX_KEY)) || [];
 }
@@ -40,6 +60,41 @@ export async function recordPayerQuestion(payerAddress, questionId) {
 
 export async function getPayerQuestionIds(payerAddress) {
   return (await store.get(PREFIX + payerAddress)) || [];
+}
+
+/**
+ * CCPA (#127) request handling. This is a thin wrapper over the same
+ * address-keyed data-access/erasure plumbing #126 exposes — it does not
+ * duplicate the store fan-out. It only adds CCPA-specific bookkeeping:
+ * categorizing the request and recording a receipt timestamp suitable for
+ * tracking against CCPA's statutory response window.
+ *
+ * CCPA and GDPR are treated as the same underlying request type; there is
+ * no jurisdiction detection or auto-routing (explicitly out of scope).
+ */
+export async function recordCcpaRequest({ requestId, payerAddress, type, receivedAt = Date.now() }) {
+  const record = {
+    requestId,
+    payerAddress,
+    // 'access' | 'deletion' — the two CCPA individual rights this backend
+    // can actually honor against its data model.
+    type,
+    receivedAt,
+    // Deadline for the initial 45-day response window; a single 45-day
+    // extension is permitted but tracked by the caller, not assumed here.
+    responseDueAt: receivedAt + CCPA_RESPONSE_WINDOW_MS,
+  };
+  await store.set(CCPA_REQUEST_PREFIX + requestId, record);
+
+  const known = (await store.get(CCPA_REQUEST_PREFIX + 'index')) || [];
+  if (!known.includes(requestId)) {
+    await store.set(CCPA_REQUEST_PREFIX + 'index', [requestId, ...known].slice(0, MAX_TRACKED_CCPA_REQUESTS));
+  }
+  return record;
+}
+
+export async function getCcpaRequest(requestId) {
+  return (await store.get(CCPA_REQUEST_PREFIX + requestId)) || null;
 }
 
 /**
