@@ -90,19 +90,40 @@ export function validateWebhookRetryPolicy(policy) {
   return { attempts, baseDelayMs };
 }
 
-// Comma-separated list of operator bearer tokens for the /admin/* console.
-// ADMIN_TOKENS is the multi-operator form; the legacy single ADMIN_TOKEN is
-// folded into the same list so existing single-token deployments keep
-// working unchanged. This is still not per-operator *identity* — a request
-// authenticated with any valid token is indistinguishable from any other
-// (no audit-by-who). Revoking one operator's access means removing their
-// specific token value from the list and redistributing the (unchanged)
-// remaining tokens to everyone still using them, not a from-scratch
-// rotation for the whole team.
-const adminTokens = [
-  ...(process.env.ADMIN_TOKENS || '').split(',').map((s) => s.trim()).filter(Boolean),
-  ...(process.env.ADMIN_TOKEN || '').split(',').map((s) => s.trim()).filter(Boolean),
-];
+// Data-retention policy engine (#128). Retention is declared per data type
+// (identified by its store key prefix), not as a single global TTL — the
+// modules that own each prefix have different durability requirements.
+//
+// `ttlMs` is the age at which a record becomes eligible for the sweep to
+// purge. `null` means durable: the sweep will never touch it. Durable is the
+// default for every prefix, and reputation/payer records are explicitly
+// durable because deleting them would silently reset a worker's established
+// status and weaken the sybil-resistance math in dispatch.js/reconcile.js.
+// Aging those out is an explicit opt-in per data type, never a default.
+export const RETENTION_POLICY = Object.freeze({
+  // Job records already expire via config.jobResultTtlMs.
+  'job:': Object.freeze({ ttlMs: num(process.env.RETENTION_JOB_TTL_MS, 3_600_000) }),
+  // Pending-question stash already expires via config.pendingQuestionTtlMs.
+  'pending-question:': Object.freeze({ ttlMs: num(process.env.RETENTION_PENDING_QUESTION_TTL_MS, 600_000) }),
+  // Durable by design — see dispatch.js's isEstablishedWorker().
+  'rep:': Object.freeze({ ttlMs: null }),
+  // Durable by design — payer question history backs reconcile.js.
+  'payer-questions:': Object.freeze({ ttlMs: null }),
+  // Durable by design — anchor records are audit trail.
+  'anchor-tx:': Object.freeze({ ttlMs: null }),
+  'anchor-kyc:': Object.freeze({ ttlMs: null }),
+});
+
+// Resolves the retention rule for a store key by its prefix. Unknown
+// prefixes are durable (never swept) — a new data type must opt in to
+// expiry explicitly rather than inherit a default that could delete it.
+export function retentionRuleFor(key) {
+  if (typeof key !== 'string') return null;
+  for (const prefix of Object.keys(RETENTION_POLICY)) {
+    if (key.startsWith(prefix)) return RETENTION_POLICY[prefix];
+  }
+  return null;
+}
 
 export const config = Object.freeze({
   port: num(process.env.PORT, 4000),
@@ -154,6 +175,14 @@ export const config = Object.freeze({
   pendingQuestionTtlMs: num(process.env.PENDING_QUESTION_TTL_MS, 600_000),
   jobResultTtlMs: num(process.env.JOB_RESULT_TTL_MS, 3_600_000),
 
+  // Retention sweep (#128). Mirrors dispatch.js's sweepWorkerTtls() shape:
+  // a daily unref()'d setInterval that is explicitly skipped when
+  // unconfigured ("don't pay for what isn't wired up"). Off by default.
+  retention: Object.freeze({
+    enabled: process.env.RETENTION_SWEEP_ENABLED === 'true',
+    intervalMs: num(process.env.RETENTION_SWEEP_INTERVAL_MS, 86_400_000),
+  }),
+
   redisUrl: process.env.REDIS_URL || '',
 
   // Comma-separated list of allowed CORS origins, e.g.
@@ -173,46 +202,23 @@ export const config = Object.freeze({
   logFormat: process.env.LOG_FORMAT || 'pretty',
   logLevel: process.env.LOG_LEVEL || 'info',
 
-  // Response security headers (see securityHeaders.js). CSP_CONNECT_SRC is a
-  // comma-separated list of extra origins the frontend may fetch()/stream
-  // from — only needed when the UI is hosted on a different origin than
-  // this API. HSTS_ENABLED=false turns off Strict-Transport-Security.
-  securityHeaders: Object.freeze({
-    connectSrc: (process.env.CSP_CONNECT_SRC || '').split(',').map((s) => s.trim()).filter(Boolean),
-    hsts: process.env.HSTS_ENABLED !== 'false',
+  // Admin console auth. `token` is the single shared bearer secret v1 ships
+  // with (see adminAuth.js's requireAdmin). Multi-operator auth is a real
+  // follow-up, not something to invent ahead of need.
+  //
+  // Second factor (#130): when `totpSecret` is set, requireAdmin additionally
+  // demands a valid TOTP code (RFC 6238, Google-Authenticator-compatible)
+  // alongside the bearer token. Unset means 2FA is off and the existing
+  // single-token behavior is preserved exactly — the same
+  // fail-closed-if-configured / unchanged-if-not pattern config.billing and
+  // config.anchor use. The secret is never logged (see logger.js's
+  // REDACT_CONFIG) and never echoed back in any response.
+  admin: Object.freeze({
+    token: process.env.ADMIN_TOKEN || '',
+    totpSecret: process.env.ADMIN_TOTP_SECRET || '',
+    // ±1 time-step tolerance (30s each) absorbs clock skew between the
+    // operator's authenticator app and this server without widening the
+    // replay window meaningfully.
+    totpWindow: num(process.env.ADMIN_TOTP_WINDOW, 1),
   }),
-
-  maxQuestionLength: num(process.env.MAX_QUESTION_LENGTH, 2000),
-  maxAnswerLength: num(process.env.MAX_ANSWER_LENGTH, 2000),
-
-  worker: Object.freeze({
-    rateLimitMaxConnections: num(process.env.WORKER_RATE_LIMIT_MAX_CONNECTIONS, 5),
-    rateLimitWindowMs: num(process.env.WORKER_RATE_LIMIT_WINDOW_MS, 60_000),
-    minAnswersBeforeReputationGate: num(process.env.WORKER_MIN_ANSWERS_BEFORE_REPUTATION_GATE, 5),
-    minMatchRatio: num(process.env.WORKER_MIN_MATCH_RATIO, 0.2),
-    // Once a worker crosses minAnswersBeforeReputationGate (has real accrued
-    // earnings/reputation on the line), they must maintain at least this much
-    // on-chain stake to keep receiving new questions — closes the "unstake to
-    // zero, then misbehave for free" gap found pressure-testing the netting
-    // engine. Past Owed earnings are never touched by this; it only gates
-    // future dispatch eligibility. 0 (default) preserves today's behavior.
-    minStakeStroops: BigInt(process.env.WORKER_MIN_STAKE_STROOPS || '0'),
-  }),
-
-  // Every one of these endpoints either costs the platform a real network
-  // fee per call (/sponsor/*) or writes unbounded state (/oracle), so all
-  // get a per-IP rate limit, not just the SSE connection endpoint.
-  rateLimits: Object.freeze({
-    oracle: Object.freeze({
-      max: num(process.env.ORACLE_RATE_LIMIT_MAX, 20),
-      windowMs: num(process.env.ORACLE_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    sponsor: Object.freeze({
-      max: num(process.env.SPONSOR_RATE_LIMIT_MAX, 10),
-      windowMs: num(process.env.SPONSOR_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    answer: Object.freeze({
-      max: num(process.env.ANSWER_RATE_LIMIT_MAX, 60),
-      windowMs: num(process.env.ANSWER_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    //
+});

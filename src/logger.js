@@ -21,9 +21,15 @@ import { config } from './config.js';
 // worker/payer session token sent via `Authorization` lands verbatim in
 // every request log line, worse in LOG_FORMAT=json production mode
 // feeding an external aggregator most operators can't fully lock down.
-// Exported standalone so the redaction behavior is directly testable
-// against a real pino instance without needing the app's own transport.
-export const REDACT_CONFIG = { paths: ['req.headers.authorization', 'req.headers.cookie'], censor: '[redacted]' };
+// The admin second-factor code (X-Admin-TOTP) is a live credential for
+// the same reason and gets the same treatment — a leaked log line must
+// never be enough to replay a valid 2FA code. Exported standalone so the
+// redaction behavior is directly testable against a real pino instance
+// without needing the app's own transport.
+export const REDACT_CONFIG = {
+  paths: ['req.headers.authorization', 'req.headers.cookie', 'req.headers["x-admin-totp"]'],
+  censor: '[redacted]',
+};
 
 export const logger = pino({
   level: config.logLevel,

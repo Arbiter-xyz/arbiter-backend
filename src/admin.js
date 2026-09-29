@@ -7,34 +7,45 @@ import { getStakeOnChain, getOwedOnChain } from './stellarClient.js';
 import { getHorizon } from './sponsor.js';
 import { config } from './config.js';
 import { stroopsToUsdc } from './pricing.js';
+import { jobLogger } from './logger.js';
 
 const PLATFORM_FEE_BPS = 2000n; // mirrors contracts/oracle-escrow/src/lib.rs's PLATFORM_FEE_BPS
 const BPS_DENOM = 10_000n;
 
-/** Default page size for the admin listing endpoints, matching
- * listTransactions()'s existing default. */
-const DEFAULT_LIMIT = 50;
+/** Durable, listable audit store for /admin/* actions. Follows jobs.js's
+ * append-and-index pattern: one record per action plus a bounded index used
+ * for listing. Kept in-memory here (same durability model as the rest of
+ * this backend's stores) so an operator can query recent admin activity
+ * rather than only the transient pino request line. */
+const AUDIT_LOG_MAX = 1000;
+const auditLog = [];
 
-/** Cap on simultaneous per-item on-chain reads. Even when an operator
- * explicitly asks for a large page (e.g. limit=5000), we never fire more
- * than this many Soroban RPC/Horizon calls at once, so a single admin
- * request can't blow through RPC rate limits. */
-const MAX_CONCURRENCY = 10;
+/** Records a single /admin/* call. Called for every admin route invocation,
+ * including rejected (401/503) ones, so the log can't be gamed by a caller
+ * who knows a call will fail. Emits a jobLogger()-style child log line for
+ * live tailing and appends a durable record for the /admin/audit-log listing. */
+export function recordAdminAction({ route, method, status, actor = 'shared-token' } = {}) {
+  const entry = {
+    timestamp: Date.now(),
+    route,
+    method,
+    status,
+    actor,
+  };
+  auditLog.push(entry);
+  if (auditLog.length > AUDIT_LOG_MAX) auditLog.splice(0, auditLog.length - AUDIT_LOG_MAX);
+  jobLogger({ route, method, status }).info('admin action');
+  return entry;
+}
 
-/** Runs `fn` over `items` with at most `limit` promises in flight at once,
- * preserving input order in the result. A tiny p-limit-style helper so we
- * don't need a new dependency. */
-async function mapWithConcurrency(items, limit, fn) {
-  const results = new Array(items.length);
-  let next = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const i = next++;
-      results[i] = await fn(items[i], i);
-    }
-  });
-  await Promise.all(workers);
-  return results;
+/** Most-recent-first page of recorded /admin/* actions, following
+ * listTransactions()'s limit/offset pagination shape. */
+export async function listAuditLog({ limit = 50, offset = 0 } = {}) {
+  const recent = auditLog.slice().reverse();
+  return {
+    total: recent.length,
+    entries: recent.slice(offset, offset + limit),
+  };
 }
 
 /** Most-recent-first page of every job this backend has ever created,
