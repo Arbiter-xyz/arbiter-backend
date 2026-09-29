@@ -186,3 +186,8 @@ backend.
 Load-test tooling (`scripts/loadtest.js`), measured limits, and the current
 bottleneck (serialized on-chain settlement) are in
 [docs/capacity/README.md](docs/capacity/README.md).
+
+## Handsoff notes
+
+<!-- handsoff-issue-62 -->
+- #62: sponsor.js has no gasless relay for unstake() or withdraw_balance() — the zero-XLM promise is only half-built

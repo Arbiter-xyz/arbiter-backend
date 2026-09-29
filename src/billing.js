@@ -4,6 +4,7 @@ import { store } from './store.js';
 import { config } from './config.js';
 import { hashApiKey } from './apiKeyAuth.js';
 import { logger } from './logger.js';
+import { withRetry } from './retry.js';
 
 /**
  * The non-crypto onramp: a fiat customer pays via Stripe and is issued an
@@ -16,9 +17,19 @@ import { logger } from './logger.js';
  * itself.
  */
 
+/**
+ * Bounded retry/timeout policy for the outbound Stripe checkout call,
+ * matching the shape of HORIZON_RETRY_OPTS in sponsor.js. The Stripe SDK's
+ * own network retry is disabled (maxNetworkRetries: 0) so this is the
+ * single, uniform retry loop for the call — the same choice round 5 made
+ * for Claude in reconcile.js's getClient(), rather than layering a second,
+ * redundant retry loop on top of the SDK's default.
+ */
+const STRIPE_RETRY_OPTS = { attempts: 2, timeoutMs: 8000, label: 'stripe.checkout.sessions.create' };
+
 let stripeClient = null;
 function getStripe() {
-  if (!stripeClient) stripeClient = new Stripe(config.billing.stripeSecretKey);
+  if (!stripeClient) stripeClient = new Stripe(config.billing.stripeSecretKey, { maxNetworkRetries: 0 });
   return stripeClient;
 }
 
@@ -57,17 +68,57 @@ export async function getCreditBalanceStroops(accountId) {
  * refunding the difference via settleReservation(), means the ledger can
  * never go negative and a customer can never be charged more than their
  * balance covers, without needing to predict the exact price in advance.
+ *
+ * The reservation is recorded durably (keyed by questionId) BEFORE the
+ * on-chain charge runs, so a crash between askMetered() and
+ * settleReservation() leaves a recoverable "pending reservation" record
+ * instead of a permanently over-debited balance — see
+ * reconcilePendingReservations().
  */
-export async function reserveCredit(accountId, maxStroops) {
-  return store.decrIfAtLeast(`credit:${accountId}`, maxStroops);
+export async function reserveCredit(accountId, maxStroops, questionId) {
+  const ok = await store.decrIfAtLeast(`credit:${accountId}`, maxStroops);
+  if (ok && questionId) {
+    await store.set(`reservation:${questionId}`, {
+      accountId,
+      reservedStroops: maxStroops,
+      questionId,
+      createdAt: Date.now(),
+    });
+  }
+  return ok;
 }
 
 /** Credits back the unused portion of a reservation. Pass actualStroops=0
  * to refund the reservation in full (the downstream charge failed
- * entirely — e.g. the pooled on-chain balance itself was insufficient). */
-export async function settleReservation(accountId, reservedStroops, actualStroops) {
+ * entirely — e.g. the pooled on-chain balance itself was insufficient).
+ * Clears the durable pending-reservation record so reconciliation never
+ * revisits a settled reservation. */
+export async function settleReservation(accountId, reservedStroops, actualStroops, questionId) {
   const refund = reservedStroops - actualStroops;
   if (refund > 0) await store.incrBy(`credit:${accountId}`, refund);
+  if (questionId) await store.del(`reservation:${questionId}`);
+}
+
+/**
+ * Startup/periodic reconciliation for the crash window between
+ * reserveCredit() and settleReservation(). For each pending reservation:
+ *  - if the associated job already recorded a final amountStroops, settle
+ *    against that real charge (refunding the unused difference);
+ *  - if no job was ever created, refund the reservation in full.
+ * `getJob` is injected (jobs.js) to avoid a circular import; it returns the
+ * job record or null. Idempotent: settleReservation() deletes the record.
+ */
+export async function reconcilePendingReservations(getJob) {
+  const keys = await store.keys('reservation:*');
+  for (const key of keys) {
+    const reservation = await store.get(key);
+    if (!reservation) continue;
+    const { accountId, reservedStroops, questionId } = reservation;
+    const job = getJob ? await getJob(questionId) : null;
+    const actualStroops = job && Number.isFinite(job.amountStroops) ? job.amountStroops : 0;
+    await settleReservation(accountId, reservedStroops, actualStroops, questionId);
+    logger.info({ questionId, accountId, actualStroops }, 'reconciled abandoned credit reservation');
+  }
 }
 
 /** Creates a fresh account (and its one API key) and a Stripe Checkout
@@ -111,22 +162,25 @@ export async function createCheckoutSession(amountUsd, successUrl, cancelUrl) {
   }
 
   const { accountId, rawKey } = await createAccount();
-  const session = await getStripe().checkout.sessions.create({
-    mode: 'payment',
-    line_items: [
-      {
-        price_data: {
-          currency: 'usd',
-          product_data: { name: 'Arbiter API credit' },
-          unit_amount: Math.round(amountUsd * 100),
+  const session = await withRetry(
+    () => getStripe().checkout.sessions.create({
+      mode: 'payment',
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: { name: 'Arbiter API credit' },
+            unit_amount: Math.round(amountUsd * 100),
+          },
+          quantity: 1,
         },
-        quantity: 1,
-      },
-    ],
-    metadata: { accountId },
-    success_url: `${successUrl}?apiKey=${rawKey}`,
-    cancel_url: cancelUrl,
-  });
+      ],
+      metadata: { accountId },
+      success_url: `${successUrl}?apiKey=${rawKey}`,
+      cancel_url: cancelUrl,
+    }),
+    STRIPE_RETRY_OPTS,
+  );
 
   return { checkoutUrl: session.url };
 }
