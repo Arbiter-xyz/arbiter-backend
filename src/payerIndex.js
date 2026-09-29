@@ -19,6 +19,26 @@ const MAX_TRACKED_PER_PAYER = 200; // bound growth; keep the most recent
 const PAYER_INDEX_KEY = 'known-payer-addresses';
 const MAX_TRACKED_PAYERS = 5_000;
 
+// CCPA (#127) reuses the GDPR (#126) data-access/erasure plumbing rather
+// than re-deriving the per-address store fan-out. This module owns the
+// payerIndex.js slice of that fan-out; the CCPA wrapper composes it with
+// the other stores' slices (dispatch.js `rep:` records, push.js
+// subscriptions, anchorRecords.js cache) via the shared request handler.
+//
+// "Personal information" under this system's actual data model is narrow:
+// a Stellar public key (the payer address) plus self-reported anchor KYC
+// status. There are no names, emails, or other direct PII stored here, so
+// the CCPA access/erasure surface is exactly the same address-keyed data
+// the GDPR endpoints already expose — no parallel implementation.
+const CCPA_REQUEST_PREFIX = 'ccpa-request:';
+const MAX_TRACKED_CCPA_REQUESTS = 5_000;
+
+// CCPA statutory response window: 45 days from receipt, extendable once by
+// another 45 days. We record the receipt timestamp so a request can be
+// tracked against that deadline without re-deriving it from logs.
+const CCPA_RESPONSE_WINDOW_DAYS = 45;
+const CCPA_RESPONSE_WINDOW_MS = CCPA_RESPONSE_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+
 export async function getKnownPayerAddresses() {
   return (await store.get(PAYER_INDEX_KEY)) || [];
 }
