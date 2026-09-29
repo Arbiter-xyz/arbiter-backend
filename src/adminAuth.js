@@ -1,36 +1,26 @@
-import crypto from 'node:crypto';
+import { timingSafeEqual } from 'node:crypto';
 import { config } from './config.js';
 import { hashApiKey } from './apiKeyAuth.js';
 
 /**
- * Admin authentication.
- *
- * Historically this was a single shared operator secret (`config.admin.token`)
- * compared in constant time. A single operator secret didn't need hashing at
- * rest — it lives in the deployment's env, not in a datastore this backend
- * controls. Once there is more than one admin credential, though, the same
- * reasoning billing.js's API keys rely on applies: a table of many
- * customer-controlled secrets should be stored hashed, so a leaked datastore
- * snapshot doesn't hand out live credentials.
- *
- * Credentials are therefore a small, fixed table of `{ hash, role }` entries
- * (see config.js's admin.credentials). Roles are intentionally coarse —
- * `readonly` may only call read-only /admin/* routes, `full` may call
- * everything — consistent with this codebase's "no user-account system"
- * design principle: a fixed set of operator roles, not a general RBAC system.
- *
- * Backwards compatibility: the legacy single `ADMIN_TOKEN` env var keeps
- * working as an implicit `full` credential, so existing deployments (including
- * the live Railway one) are not silently locked out. It is checked after the
- * credential table, so a deployment that has migrated to hashed credentials
- * can drop ADMIN_TOKEN without any code change.
- *
- * Session recording (#132): every authenticated admin call is attributed to a
- * stable per-credential session id so the audit log (#129) can be replayed as
- * an ordered sequence of admin actions. This is backend API-call recording,
- * not UI session replay — this repo has no admin console frontend to
- * instrument. The session id is derived from the credential hash (never the
- * raw token), so it is stable across requests without persisting secrets.
+ * Constant-time string comparison so a wrong admin token can't leak
+ * timing information about the secret. Mirrors the discipline in
+ * workerAuth.js::verifySessionToken(). timingSafeEqual throws on
+ * mismatched-length buffers, so the length is checked first.
+ */
+function safeEqual(a, b) {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
+/**
+ * Gate for every /admin/* route. Deliberately a single shared bearer
+ * token, not a session/account system — see config.js's `admin` block for
+ * why. Refuses every request (rather than failing open) when ADMIN_TOKEN
+ * is unset, so an operator can't accidentally ship this surface wide open
+ * by forgetting to configure it.
  */
 
 const ROLE_READONLY = 'readonly';
@@ -53,22 +43,10 @@ function sessionIdForHash(hash) {
   return crypto.createHash('sha256').update(`admin-session:${hash}`).digest('hex').slice(0, 32);
 }
 
-/** Resolve the credential (role + session id) granted by a presented token, or
- * null if it matches no configured credential. Checks the hashed credential
- * table first, then the legacy ADMIN_TOKEN compat path. */
-export function resolveAdminCredential(token) {
-  if (!token) return null;
-
-  const presentedHash = hashApiKey(token);
-  for (const cred of config.admin.credentials) {
-    if (timingSafeEqual(presentedHash, cred.hash)) {
-      return { role: cred.role, sessionId: sessionIdForHash(cred.hash) };
-    }
-  }
-
-  // Legacy compat: the single ADMIN_TOKEN is an implicit full-admin credential.
-  if (config.admin.token && timingSafeEqual(token, config.admin.token)) {
-    return { role: ROLE_FULL, sessionId: sessionIdForHash(hashApiKey(config.admin.token)) };
+  const header = req.get('authorization') || '';
+  const [scheme, token] = header.split(' ');
+  if (scheme !== 'Bearer' || !token || !safeEqual(token, config.admin.token)) {
+    return res.status(401).json({ error: 'unauthorized' });
   }
 
   return null;
