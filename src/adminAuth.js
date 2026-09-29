@@ -1,66 +1,118 @@
+import crypto from 'node:crypto';
 import { config } from './config.js';
-import { recordAuditEntry } from './auditLog.js';
-import { verifyTotp } from './totp.js';
+import { hashApiKey } from './apiKeyAuth.js';
 
 /**
- * Single shared bearer-token gate for every /admin/* route. There is no
- * per-caller identity today (that's #131's job), so the audit log records
- * only that an action occurred and which route/status it produced.
+ * Admin authentication.
  *
- * When `config.adminTotpSecret` is configured, a valid bearer token alone is
- * no longer sufficient: the caller must also present a valid time-based
- * second-factor code. This follows the same fail-closed-if-configured,
- * unchanged-if-not pattern as `config.billing`/`config.anchor`.
+ * Historically this was a single shared operator secret (`config.admin.token`)
+ * compared in constant time. A single operator secret didn't need hashing at
+ * rest — it lives in the deployment's env, not in a datastore this backend
+ * controls. Once there is more than one admin credential, though, the same
+ * reasoning billing.js's API keys rely on applies: a table of many
+ * customer-controlled secrets should be stored hashed, so a leaked datastore
+ * snapshot doesn't hand out live credentials.
+ *
+ * Credentials are therefore a small, fixed table of `{ hash, role }` entries
+ * (see config.js's admin.credentials). Roles are intentionally coarse —
+ * `readonly` may only call read-only /admin/* routes, `full` may call
+ * everything — consistent with this codebase's "no user-account system"
+ * design principle: a fixed set of operator roles, not a general RBAC system.
+ *
+ * Backwards compatibility: the legacy single `ADMIN_TOKEN` env var keeps
+ * working as an implicit `full` credential, so existing deployments (including
+ * the live Railway one) are not silently locked out. It is checked after the
+ * credential table, so a deployment that has migrated to hashed credentials
+ * can drop ADMIN_TOKEN without any code change.
+ *
+ * Session recording (#132): every authenticated admin call is attributed to a
+ * stable per-credential session id so the audit log (#129) can be replayed as
+ * an ordered sequence of admin actions. This is backend API-call recording,
+ * not UI session replay — this repo has no admin console frontend to
+ * instrument. The session id is derived from the credential hash (never the
+ * raw token), so it is stable across requests without persisting secrets.
  */
-export function requireAdmin(req, res, next) {
-  const header = req.headers['authorization'] || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
 
-  if (!config.adminToken) {
-    // Fail closed: no configured token means admin is unavailable, not open.
-    recordAuditEntry({
-      route: req.path,
-      method: req.method,
-      status: 503,
-      requestId: req.id,
-    }).catch(() => {});
-    return res.status(503).json({ error: 'admin_unavailable' });
+const ROLE_READONLY = 'readonly';
+const ROLE_FULL = 'full';
+
+/** Constant-time string comparison that tolerates differing lengths. */
+function timingSafeEqual(a, b) {
+  const ab = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ab.length !== bb.length) {
+    // Still do a comparison so the failure path isn't obviously faster.
+    crypto.timingSafeEqual(ab, ab);
+    return false;
   }
+  return crypto.timingSafeEqual(ab, bb);
+}
 
-  if (!token || token !== config.adminToken) {
-    recordAuditEntry({
-      route: req.path,
-      method: req.method,
-      status: 401,
-      requestId: req.id,
-    }).catch(() => {});
-    return res.status(401).json({ error: 'unauthorized' });
-  }
+/** Derive a stable, non-reversible session id from a credential hash. */
+function sessionIdForHash(hash) {
+  return crypto.createHash('sha256').update(`admin-session:${hash}`).digest('hex').slice(0, 32);
+}
 
-  // Second factor: only enforced when a TOTP secret is configured. When it is
-  // absent, behavior is unchanged from the single-token model.
-  if (config.adminTotpSecret) {
-    const code = req.headers['x-admin-totp'] || req.query.totp;
-    if (!verifyTotp(config.adminTotpSecret, code)) {
-      recordAuditEntry({
-        route: req.path,
-        method: req.method,
-        status: 401,
-        requestId: req.id,
-      }).catch(() => {});
-      return res.status(401).json({ error: 'unauthorized' });
+/** Resolve the credential (role + session id) granted by a presented token, or
+ * null if it matches no configured credential. Checks the hashed credential
+ * table first, then the legacy ADMIN_TOKEN compat path. */
+export function resolveAdminCredential(token) {
+  if (!token) return null;
+
+  const presentedHash = hashApiKey(token);
+  for (const cred of config.admin.credentials) {
+    if (timingSafeEqual(presentedHash, cred.hash)) {
+      return { role: cred.role, sessionId: sessionIdForHash(cred.hash) };
     }
   }
 
-  // Record the successful admin call. The handler's own status isn't known
-  // yet, so the gate records the authorization outcome (200) — the durable
-  // record proves the call was made and authorized.
-  recordAuditEntry({
-    route: req.path,
-    method: req.method,
-    status: 200,
-    requestId: req.id,
-  }).catch(() => {});
+  // Legacy compat: the single ADMIN_TOKEN is an implicit full-admin credential.
+  if (config.admin.token && timingSafeEqual(token, config.admin.token)) {
+    return { role: ROLE_FULL, sessionId: sessionIdForHash(hashApiKey(config.admin.token)) };
+  }
 
-  return next();
+  return null;
+}
+
+/** Resolve the role granted by a presented token, or null if it matches no
+ * configured credential. */
+export function resolveAdminRole(token) {
+  const cred = resolveAdminCredential(token);
+  return cred ? cred.role : null;
+}
+
+/** True when `role` is allowed to satisfy a route requiring `required`. */
+function roleSatisfies(role, required) {
+  if (role === ROLE_FULL) return true;
+  if (required === ROLE_READONLY) return role === ROLE_READONLY;
+  return false;
+}
+
+/**
+ * Express middleware factory. `requireAdmin()` (or `requireAdmin('full')`)
+ * requires a full-admin credential; `requireAdmin('readonly')` accepts either
+ * a read-only or a full credential. Rejects with 401 when no credential is
+ * presented/matched, and 403 when a valid credential lacks the required role.
+ *
+ * On success the resolved role and session id are attached to the request so
+ * downstream audit/recording middleware can attribute the call to a caller
+ * session (#132).
+ */
+export function requireAdmin(required = ROLE_FULL) {
+  return (req, res, next) => {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    const cred = resolveAdminCredential(token);
+
+    if (!cred) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    if (!roleSatisfies(cred.role, required)) {
+      return res.status(403).json({ error: 'forbidden', requiredRole: required });
+    }
+
+    req.adminRole = cred.role;
+    req.adminSessionId = cred.sessionId;
+    return next();
+  };
 }
