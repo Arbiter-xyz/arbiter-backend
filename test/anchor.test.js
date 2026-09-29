@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isAnchorConfigured } from '../src/anchorClient.js';
+import { isAnchorConfigured, getAnchorConfig } from '../src/anchorClient.js';
 import { recordAnchorTransaction, getAnchorTransactions, recordAnchorKyc, getAnchorKyc } from '../src/anchorRecords.js';
 import { listAnchorPayouts, listAnchorKyc } from '../src/admin.js';
 
@@ -10,6 +10,33 @@ function uniqueAddress(prefix) {
 
 test('isAnchorConfigured is false by default (ANCHOR_HOME_DOMAIN unset, see backend/.env.example)', () => {
   assert.equal(isAnchorConfigured(), false);
+});
+
+test('getAnchorConfig rejects within the configured bound when the stellar.toml resolve hangs', async () => {
+  const originalHomeDomain = process.env.ANCHOR_HOME_DOMAIN;
+  process.env.ANCHOR_HOME_DOMAIN = 'hang.example.com';
+
+  const { StellarToml } = await import('@stellar/stellar-sdk');
+  const originalResolve = StellarToml.Resolver.resolve;
+  StellarToml.Resolver.resolve = () => new Promise(() => {});
+
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      () => getAnchorConfig(),
+      /timed out|timeout/i,
+      'a hanging resolve must reject rather than hang forever',
+    );
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 30_000, `getAnchorConfig should reject within the configured bound, took ${elapsed}ms`);
+  } finally {
+    StellarToml.Resolver.resolve = originalResolve;
+    if (originalHomeDomain === undefined) {
+      delete process.env.ANCHOR_HOME_DOMAIN;
+    } else {
+      process.env.ANCHOR_HOME_DOMAIN = originalHomeDomain;
+    }
+  }
 });
 
 test('recordAnchorTransaction rejects an unknown kind before writing anything', async () => {

@@ -16,6 +16,10 @@ lockstep by hand (see #163). Pre-split history and the round-by-round
 build narrative live in the archived
 [`arbiter`](https://github.com/rudeus112266/arbiter) repo.
 
+> **Security:** this backend custodies the platform's keys and auth flows.
+> To report a vulnerability, see [SECURITY.md](SECURITY.md) — please don't
+> open a public issue.
+
 ## What it does
 
 - Async job-based `/oracle` — `202` immediately once payment is confirmed,
@@ -155,34 +159,13 @@ are grouped into one PR, and each major bump gets its own. It's scoped to
 the repo root (`/`) because this split-out repo carries a single npm package.
 Nothing is auto-merged: these PRs need human review.
 
-## Running it
-
-```sh
-npm install
-npm test              # 230 tests, no chain needed
-cp .env.example .env  # fill in ORACLE_CONTRACT_ID / PLATFORM_SECRET for real use
-npm start
-```
-
-Verified live against a real deployed contract on Stellar testnet — a full
-paid question (payment → dispatch → reconcile → `resolve()`) and a real
-sponsored `withdraw()` landing real USDC in a zero-XLM wallet. (That run
-predates this repo's split; see "Round 6" in the archived
-[`arbiter`](https://github.com/rudeus112266/arbiter) monorepo README for
-the full write-up, including two real bugs that live infrastructure
-surfaced and mocked tests never could.)
-
-### Running the full stack locally
-
-To run the contract, this backend, and the app together (deploy the
-contract to testnet, point this backend at it, point the app at this
-backend, then run a real paid question end to end), see
-**[docs/local-full-stack.md](docs/local-full-stack.md)**. It's the single
-cross-repo guide, and it pins contract/app versions known to work with this
-backend.
-
-### Capacity
+## Running i
 
 Load-test tooling (`scripts/loadtest.js`), measured limits, and the current
 bottleneck (serialized on-chain settlement) are in
 [docs/capacity/README.md](docs/capacity/README.md).
+
+## Handsoff notes
+
+<!-- handsoff-issue-59 -->
+- #59: oracle.js's core settlement logic and metered.js have zero unit test coverage

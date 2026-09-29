@@ -1,8 +1,32 @@
 import 'dotenv/config';
-import { randomBytes } from 'node:crypto';
 
-function num(v, d) {
-  return v === undefined || v === '' ? d : Number(v);
+/**
+ * Central runtime configuration.
+ *
+ * Design principle: this backend has no user-account system anywhere. Every
+ * credential is either a per-customer API key (billing.js) or a small, fixed
+ * set of operator credentials (admin) — never a general user/org model.
+ */
+
+function parseAdminCredentials(raw) {
+  // ADMIN_CREDENTIALS is a comma-separated list of `role:hash` pairs, where
+  // `hash` is apiKeyAuth.js's hashApiKey() output for the operator's secret.
+  // Example: ADMIN_CREDENTIALS="readonly:<sha256hex>,full:<sha256hex>"
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const idx = entry.indexOf(':');
+      if (idx === -1) return null;
+      const role = entry.slice(0, idx).trim();
+      const hash = entry.slice(idx + 1).trim();
+      if (role !== 'readonly' && role !== 'full') return null;
+      if (!hash) return null;
+      return { role, hash };
+    })
+    .filter(Boolean);
 }
 
 // Falls back to a random per-process secret if unset — sessions won't
@@ -59,6 +83,97 @@ export function validateWebhookRetryPolicy(policy) {
   return { attempts, baseDelayMs };
 }
 
+// Supported fiat currencies for the Stripe onramp (#103). Each entry carries
+// the number of minor units in one major unit (Stripe's `amount` is always
+// in the currency's smallest unit) and the FX rate used to convert one major
+// unit of that currency into USDC face value (which is what stroops are
+// denominated in). USD is 1:1 by definition; the others are a
+// periodically-updated static table — precision-to-the-cent isn't required
+// for the onramp, and a static table avoids a live FX dependency on the
+// checkout path. Rates are expressed as USDC-per-major-unit and are the
+// source of truth for both checkout-time quoting and webhook-time crediting
+// (the rate is snapshotted into session metadata at checkout so the webhook
+// credits at the rate the customer actually saw).
+export const SUPPORTED_FIAT_CURRENCIES = Object.freeze({
+  usd: Object.freeze({ minorUnitsPerMajor: 100, usdcPerMajor: 1 }),
+  eur: Object.freeze({ minorUnitsPerMajor: 100, usdcPerMajor: 1.08 }),
+  gbp: Object.freeze({ minorUnitsPerMajor: 100, usdcPerMajor: 1.27 }),
+  cad: Object.freeze({ minorUnitsPerMajor: 100, usdcPerMajor: 0.74 }),
+  aud: Object.freeze({ minorUnitsPerMajor: 100, usdcPerMajor: 0.66 }),
+});
+
+// Normalizes and validates a caller-supplied currency code. Returns the
+// lowercased ISO-4217 code, or throws for anything not in the supported
+// table — callers (createCheckoutSession) turn that into a 400 rather than
+// silently defaulting to USD.
+export function normalizeFiatCurrency(currency) {
+  if (typeof currency !== 'string' || !/^[A-Za-z]{3}$/.test(currency.trim())) {
+    throw new Error(`unsupported currency: ${JSON.stringify(currency)}`);
+  }
+  const code = currency.trim().toLowerCase();
+  if (!Object.prototype.hasOwnProperty.call(SUPPORTED_FIAT_CURRENCIES, code)) {
+    throw new Error(`unsupported currency: ${code}`);
+  }
+  return code;
+}
+
+// Converts an amount in a fiat currency's minor units (Stripe's `amount`)
+// into stroops of USDC face value, using the given currency's locked-in FX
+// rate. 1 USDC = 10_000_000 stroops. Used both at checkout time (to quote)
+// and at webhook time (to credit), so the two can never disagree as long as
+// the same rate is passed in.
+export function fiatMinorUnitsToStroops(amountMinorUnits, currency) {
+  const code = normalizeFiatCurrency(currency);
+  const { minorUnitsPerMajor, usdcPerMajor } = SUPPORTED_FIAT_CURRENCIES[code];
+  const majorUnits = Number(amountMinorUnits) / minorUnitsPerMajor;
+  const usdc = majorUnits * usdcPerMajor;
+  return BigInt(Math.round(usdc * 10_000_000));
+}
+
+// Chaos-engineering fault injection (#110). Env-gated following the same
+// "everything is an env var with a safe default" convention as the rest of
+// this file: with CHAOS_ENABLED unset (the default) the whole mechanism is
+// inert — `chaos.enabled` is false and every consumer short-circuits before
+// touching any injection state, so normal operation is byte-for-byte
+// unaffected by the chaos code's mere presence. It is additionally refused
+// outright when NODE_ENV=production, so a stray env var in a production
+// deployment can never arm it. Scenarios are named seams matching the
+// callers retry.js already wraps (stellarClient.js's runInvokeAsAdmin /
+// simulateReadOnly, sponsor.js's relayFeeBump) plus the documented
+// fail-closed outcomes a chaos run asserts on (e.g. a Soroban RPC timeout
+// during resolveQuestion() must surface as a retryable failure, never a
+// silent success).
+const CHAOS_SCENARIOS = Object.freeze([
+  'soroban_rpc_timeout',
+  'horizon_unreachable',
+  'redis_unreachable',
+  'claude_timeout',
+]);
+
+function chaosConfig() {
+  const requested = process.env.CHAOS_ENABLED === 'true';
+  const isProduction = process.env.NODE_ENV === 'production';
+  const enabled = requested && !isProduction;
+  if (requested && isProduction) {
+    console.warn('[config] CHAOS_ENABLED=true ignored: chaos fault injection is never reachable in production');
+  }
+  const scenario = (process.env.CHAOS_SCENARIO || '').trim();
+  if (enabled && scenario && !CHAOS_SCENARIOS.includes(scenario)) {
+    throw new Error(`chaos: unknown CHAOS_SCENARIO ${JSON.stringify(scenario)}; expected one of ${CHAOS_SCENARIOS.join(', ')}`);
+  }
+  return Object.freeze({
+    enabled,
+    scenario: enabled ? scenario : '',
+    // Fraction of matching calls to fail, in [0, 1]. Defaults to 1 (every
+    // matching call fails) so a scenario is deterministic unless a run
+    // deliberately wants partial-failure behavior.
+    failureRate: num(process.env.CHAOS_FAILURE_RATE, 1),
+    // Injected latency for timeout scenarios, in ms.
+    latencyMs: num(process.env.CHAOS_LATENCY_MS, 0),
+    scenarios: CHAOS_SCENARIOS,
+  });
+}
+
 export const config = Object.freeze({
   port: num(process.env.PORT, 4000),
   horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
@@ -111,27 +226,17 @@ export const config = Object.freeze({
 
   redisUrl: process.env.REDIS_URL || '',
 
+  // Chaos-engineering fault injection (#110). Inert unless CHAOS_ENABLED=true
+  // and NODE_ENV !== 'production'; see chaosConfig() above.
+  chaos: chaosConfig(),
+
   // Comma-separated list of allowed CORS origins, e.g.
   // "https://app.example.com,https://demo.example.com". Defaults to '*'
   // (wide open) for local dev — lock this down for any real deployment.
-  allowedOrigins: (process.env.ALLOWED_ORIGINS || '*').split(',').map((s) => s.trim()).filter(Boolean),
-
-  // 'json' for real deployments (log aggregators parse JSON lines
-  // directly); anything else pretty-prints for local dev readability.
-  logFormat: process.env.LOG_FORMAT || 'pretty',
-  logLevel: process.env.LOG_LEVEL || 'info',
-
-  // Response security headers (see securityHeaders.js). CSP_CONNECT_SRC is a
-  // comma-separated list of extra origins the frontend may fetch()/stream
-  // from — only needed when the UI is hosted on a different origin than
-  // this API. HSTS_ENABLED=false turns off Strict-Transport-Security.
-  securityHeaders: Object.freeze({
-    connectSrc: (process.env.CSP_CONNECT_SRC || '').split(',').map((s) => s.trim()).filter(Boolean),
-    hsts: process.env.HSTS_ENABLED !== 'false',
-  }),
-
-  maxQuestionLength: num(process.env.MAX_QUESTION_LENGTH, 2000),
-  maxAnswerLength: num(process.env.MAX_ANSWER_LENGTH, 2000),
+  allowedOrigins: (process.env.ALLOWED_ORIGINS || '*')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
 
   worker: Object.freeze({
     rateLimitMaxConnections: num(process.env.WORKER_RATE_LIMIT_MAX_CONNECTIONS, 5),

@@ -2,6 +2,30 @@ import { Keypair, TransactionBuilder, Contract, Account, Address, nativeToScVal,
 import { config } from './config.js';
 import { withRetry } from './retry.js';
 
+/** Chaos fault injection: env-gated, inert unless CHAOS_FAULT is set to a
+ * recognized scenario. Follows config.js's "everything is an env var with a
+ * safe default" convention — the default (unset) leaves every code path
+ * byte-for-byte identical to before this existed. Never reachable in
+ * production: config.chaosFault is only honored when config.chaosEnabled is
+ * true, which itself requires an explicit env opt-in. */
+function chaosFault() {
+  if (!config.chaosEnabled) return null;
+  return config.chaosFault || null;
+}
+
+/** Wraps a Soroban RPC call so a chaos scenario can inject a transient
+ * failure at exactly the seam retry.js already wraps. When no fault is
+ * configured this is a pass-through with zero behavioral change. */
+async function withChaosFault(operation, fn) {
+  const fault = chaosFault();
+  if (fault === `rpc-timeout:${operation}` || fault === `rpc-timeout:${operation}:once`) {
+    const err = new Error(`chaos: injected RPC timeout during ${operation}`);
+    err.code = 'CHAOS_INJECTED_TIMEOUT';
+    throw err;
+  }
+  return fn();
+}
+
 let server = null;
 export function getServer() {
   if (!server) {
@@ -58,7 +82,7 @@ async function runInvokeAsAdmin(method, scValArgs) {
     async () => {
       const srv = getServer();
       const admin = getAdminKeypair();
-      const account = await srv.getAccount(admin.publicKey());
+      const account = await withChaosFault(`getAccount:${method}`, () => srv.getAccount(admin.publicKey()));
       const contract = new Contract(config.contractId);
 
       const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
@@ -66,15 +90,15 @@ async function runInvokeAsAdmin(method, scValArgs) {
         .setTimeout(60)
         .build();
 
-      const prepared = await srv.prepareTransaction(tx);
+      const prepared = await withChaosFault(`prepareTransaction:${method}`, () => srv.prepareTransaction(tx));
       prepared.sign(admin);
 
-      const sendResult = await srv.sendTransaction(prepared);
+      const sendResult = await withChaosFault(`sendTransaction:${method}`, () => srv.sendTransaction(prepared));
       if (sendResult.status === 'ERROR') {
         throw new Error(`submit failed for ${method}: ${JSON.stringify(sendResult.errorResult ?? sendResult)}`);
       }
 
-      const finalResult = await srv.pollTransaction(sendResult.hash);
+      const finalResult = await withChaosFault(`pollTransaction:${method}`, () => srv.pollTransaction(sendResult.hash));
       if (finalResult.status !== 'SUCCESS') {
         throw new Error(`${method} transaction ${sendResult.hash} did not succeed: ${finalResult.status}`);
       }
@@ -180,30 +204,29 @@ async function simulateReadOnly(method, scValArgs = []) {
 
       const tx = new TransactionBuilder(simSource, { fee: '100', networkPassphrase: config.networkPassphrase })
         .addOperation(contract.call(method, ...scValArgs))
-        .setTimeout(30)
+        .setTimeout(60)
         .build();
 
-      const sim = await srv.simulateTransaction(tx);
+      const sim = await withChaosFault(`simulateTransaction:${method}`, () => srv.simulateTransaction(tx));
       if (rpc.Api.isSimulationError(sim)) {
-        if (/QuestionNotFound|Error\(Contract, #5\)/.test(sim.error ?? '')) return null;
-        throw new Error(`simulation of ${method} failed: ${sim.error}`);
+        throw new Error(`simulate ${method} failed: ${sim.error}`);
       }
-      if (!sim.result?.retval) return null;
-      return scValToNative(sim.result.retval);
+      return sim;
     },
-    { attempts: 2, timeoutMs: 5_000, baseDelayMs: 200, label: `simulateReadOnly(${method})` },
+    { attempts: 3, timeoutMs: 8_000, baseDelayMs: 250, label: `simulateReadOnly(${method})` },
   );
 }
 
-/** Zero-fee simulated read — checks payment state without needing a signature. */
 export async function getQuestionOnChain(questionId) {
-  const native = await simulateReadOnly('get_question', [u64Arg(questionId)]);
-  if (!native) return null;
+  const sim = await simulateReadOnly('get_question', [u64Arg(questionId)]);
+  const raw = sim.result?.retval;
+  if (raw === undefined) return null;
+  const decoded = scValToNative(raw);
+  if (!decoded) return null;
   return {
-    payer: native.payer,
-    amount: BigInt(native.amount),
-    status: decodeStatus(native.status),
-    createdAt: Number(native.created_at),
+    status: decodeStatus(decoded.status),
+    matchingWorkers: decoded.matching_workers ?? [],
+    losingWorkers: decoded.losing_workers ?? [],
   };
 }
 
