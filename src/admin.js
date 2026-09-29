@@ -1,3 +1,4 @@
+import { StrKey } from '@stellar/stellar-sdk';
 import { getKnownJobIds, getJob } from './jobs.js';
 import { getKnownWorkerIds, getReputation } from './dispatch.js';
 import { getKnownPayerAddresses, getPayerQuestionIds, summarizePayerQuestions } from './payerIndex.js';
@@ -6,14 +7,51 @@ import { getStakeOnChain, getOwedOnChain } from './stellarClient.js';
 import { getHorizon } from './sponsor.js';
 import { config } from './config.js';
 import { stroopsToUsdc } from './pricing.js';
+import { getAuditLog } from './auditLog.js';
 
 const PLATFORM_FEE_BPS = 2000n; // mirrors contracts/oracle-escrow/src/lib.rs's PLATFORM_FEE_BPS
 const BPS_DENOM = 10_000n;
 
+/** Durable, listable audit store for /admin/* actions. Follows jobs.js's
+ * append-and-index pattern: one record per action plus a bounded index used
+ * for listing. Kept in-memory here (same durability model as the rest of
+ * this backend's stores) so an operator can query recent admin activity
+ * rather than only the transient pino request line. */
+const AUDIT_LOG_MAX = 1000;
+const auditLog = [];
+
+/** Records a single /admin/* call. Called for every admin route invocation,
+ * including rejected (401/503) ones, so the log can't be gamed by a caller
+ * who knows a call will fail. Emits a jobLogger()-style child log line for
+ * live tailing and appends a durable record for the /admin/audit-log listing. */
+export function recordAdminAction({ route, method, status, actor = 'shared-token' } = {}) {
+  const entry = {
+    timestamp: Date.now(),
+    route,
+    method,
+    status,
+    actor,
+  };
+  auditLog.push(entry);
+  if (auditLog.length > AUDIT_LOG_MAX) auditLog.splice(0, auditLog.length - AUDIT_LOG_MAX);
+  jobLogger({ route, method, status }).info('admin action');
+  return entry;
+}
+
+/** Most-recent-first page of recorded /admin/* actions, following
+ * listTransactions()'s limit/offset pagination shape. */
+export async function listAuditLog({ limit = 50, offset = 0 } = {}) {
+  const recent = auditLog.slice().reverse();
+  return {
+    total: recent.length,
+    entries: recent.slice(offset, offset + limit),
+  };
+}
+
 /** Most-recent-first page of every job this backend has ever created,
  * regardless of payer/worker — the admin analogue of the payer-scoped
  * /payers/:address/questions and worker-scoped leaderboard views. */
-export async function listTransactions({ limit = 50, offset = 0 } = {}) {
+export async function listTransactions({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
   const ids = await getKnownJobIds();
   const page = ids.slice(offset, offset + limit);
   const jobs = await Promise.all(page.map((id) => getJob(id)));
@@ -27,13 +65,15 @@ export async function listTransactions({ limit = 50, offset = 0 } = {}) {
  * reputation (off-chain) and stake/owed (read live from the contract) —
  * unlike leaderboard.js's getLeaderboard(), this deliberately includes
  * non-established workers too, since an operator needs to see the whole
- * roster, not just the ones good enough to rank publicly. */
-export async function listWorkers() {
+ * roster, not just the ones good enough to rank publicly. Paginated like
+ * listTransactions(): the id list is sliced *before* any per-item work, so
+ * a page of N workers only issues on-chain reads for those N. */
+export async function listWorkers({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
   const ids = await getKnownWorkerIds();
   return Promise.all(
     ids.map(async (workerId) => {
       const rep = await getReputation(workerId);
-      const isAddress = workerId.startsWith('G') && workerId.length === 56;
+      const isAddress = StrKey.isValidEd25519PublicKey(workerId);
       const [stakeStroops, owedStroops] = isAddress
         ? await Promise.all([getStakeOnChain(workerId).catch(() => 0n), getOwedOnChain(workerId).catch(() => 0n)])
         : [0n, 0n];
@@ -52,23 +92,24 @@ export async function listWorkers() {
 
 /** Every payer address this backend has seen a verified on-chain payment
  * from, with the same spend/success aggregation the buyer dashboard shows
- * that payer about themselves (payerIndex.js's summarizePayerQuestions). */
-export async function listPayers() {
+ * that payer about themselves (payerIndex.js's summarizePayerQuestions).
+ * Paginated like listTransactions(): slice before per-item work. */
+export async function listPayers({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
   const addresses = await getKnownPayerAddresses();
-  return Promise.all(
-    addresses.map(async (payerAddress) => {
-      const ids = await getPayerQuestionIds(payerAddress);
-      const jobs = await Promise.all(ids.map((id) => getJob(id)));
-      const summary = summarizePayerQuestions(ids, jobs);
-      return {
-        payerAddress,
-        totalTracked: summary.totalTracked,
-        totalSpend: stroopsToUsdc(summary.totalSpendStroops),
-        settled: summary.settled,
-        successRate: summary.successRate,
-      };
-    }),
-  );
+  const page = addresses.slice(offset, offset + limit);
+  const payers = await mapWithConcurrency(page, MAX_CONCURRENCY, async (payerAddress) => {
+    const ids = await getPayerQuestionIds(payerAddress);
+    const jobs = await Promise.all(ids.map((id) => getJob(id)));
+    const summary = summarizePayerQuestions(ids, jobs);
+    return {
+      payerAddress,
+      totalTracked: summary.totalTracked,
+      totalSpend: stroopsToUsdc(summary.totalSpendStroops),
+      settled: summary.settled,
+      successRate: summary.successRate,
+    };
+  });
+  return { total: addresses.length, payers };
 }
 
 async function loadUsdcBalances(address) {
@@ -113,7 +154,13 @@ export async function getTreasury() {
  * job this backend has recorded. A derived, historical figure (off-chain
  * bookkeeping over this backend's own job records) — the live treasury
  * balance above is the on-chain-verifiable ground truth; this is "how much
- * of that did settlement fees, specifically, account for." */
+ * of that did settlement fees, specifically, account for."
+ *
+ * Deliberately a full-index aggregate: it must sum across every job to
+ * report a total, so it can't be paginated. Its cost is bounded to
+ * O(known jobs) *store* reads only — getJob() reads local job metadata and
+ * makes no chain/RPC calls — so this stays cheap even at the 5,000-entry
+ * index cap and needs no concurrency cap or memoization. */
 export async function getFeeRevenue() {
   const ids = await getKnownJobIds();
   const jobs = await Promise.all(ids.map((id) => getJob(id)));
@@ -135,27 +182,102 @@ export async function getFeeRevenue() {
 /** Bank Payouts — self-reported SEP-24 withdrawal history (see
  * anchorRecords.js for why this is a self-reported cache, not a live
  * per-address anchor query: SEP-10 means only the account holder can pull
- * their own transaction history from the anchor). */
-export async function listAnchorPayouts() {
+ * their own transaction history from the anchor). Paginated like
+ * listTransactions(): slice before per-item work. */
+export async function listAnchorPayouts({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
   const addresses = await getKnownAnchorAddresses();
-  const rows = await Promise.all(
-    addresses.map(async (address) => {
-      const txs = await getAnchorTransactions(address);
-      return txs.filter((t) => t.kind === 'withdrawal').map((t) => ({ address, ...t }));
-    }),
-  );
-  return rows.flat().sort((a, b) => b.reportedAt - a.reportedAt);
+  const page = addresses.slice(offset, offset + limit);
+  const rows = await mapWithConcurrency(page, MAX_CONCURRENCY, async (address) => {
+    const txs = await getAnchorTransactions(address);
+    return txs.filter((t) => t.kind === 'withdrawal').map((t) => ({ address, ...t }));
+  });
+  return {
+    total: addresses.length,
+    payouts: rows.flat().sort((a, b) => b.reportedAt - a.reportedAt),
+  };
 }
 
 /** KYC & Tiers — self-reported SEP-12 customer status per address, same
- * caveat as listAnchorPayouts(). */
-export async function listAnchorKyc() {
+ * caveat as listAnchorPayouts(). Paginated like listTransactions(): slice
+ * before per-item work. */
+export async function listAnchorKyc({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
   const addresses = await getKnownAnchorAddresses();
-  const rows = await Promise.all(
-    addresses.map(async (address) => {
-      const kyc = await getAnchorKyc(address);
-      return kyc ? { address, ...kyc } : null;
-    }),
-  );
-  return rows.filter(Boolean);
+  const page = addresses.slice(offset, offset + limit);
+  const rows = await mapWithConcurrency(page, MAX_CONCURRENCY, async (address) => {
+    const kyc = await getAnchorKyc(address);
+    return kyc ? { address, ...kyc } : null;
+  });
+  return { total: addresses.length, kyc: rows.filter(Boolean) };
 }
+
+/**
+ * Session recording/replay for admin console actions (#132).
+ *
+ * This is backend API-call recording, NOT full UI session replay: this repo
+ * contains no admin console frontend to instrument, so there are no mouse
+ * movements or rendered screens to capture. What we can own is the ordered
+ * sequence of admin API calls taken during an incident, which is exactly
+ * what #129's audit log already records — this extends that log with the
+ * full (redacted) request context needed to reconstruct the sequence,
+ * rather than introducing a second, parallel recording mechanism.
+ *
+ * Redaction is applied at write time by the audit log itself, using the
+ * same REDACT_CONFIG that logger.js uses to strip Authorization/cookie
+ * headers, so no sensitive header or body field is ever persisted here.
+ *
+ * Returns the recorded calls for one admin session as an ordered
+ * (oldest-first) list, so an operator can replay the sequence of actions
+ * that led up to a ticket. `sessionId` is the per-caller session identifier
+ * attributed by #131's role-based admin permissions; when omitted, the
+ * caller's own session is used.
+ */
+export async function getSessionRecording({ sessionId, limit = 200 } = {}) {
+  const entries = await getAuditLog({ sessionId, limit });
+  const calls = entries
+    .filter((e) => e.sessionId === sessionId)
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .map((e) => ({
+      timestamp: e.timestamp,
+      method: e.method,
+      path: e.path,
+      status: e.status,
+      adminId: e.adminId ?? null,
+      role: e.role ?? null,
+      request: e.request ?? null,
+      response: e.response ?? null,
+    }));
+
+  return {
+    sessionId,
+    // Explicitly documented so consumers don't mistake this for UI replay.
+    kind: 'api-call-recording',
+    note: 'Backend API-call sequence only; no admin frontend exists in this repo for UI-level replay.',
+    total: calls.length,
+    calls,
+  };
+}
+
+/**
+ * Explicit per-route role assignments for every /admin/* route.
+ *
+ * Every route today is read-only, so all are gated at `readonly` — a
+ * read-only operator can call them, and a full-admin credential can too
+ * (requireAdmin('readonly') accepts either role). Mutating admin routes
+ * (e.g. #118 category CRUD, #123 review-queue approvals, #124 disputes)
+ * must be registered here as `full` so a read-only credential is rejected
+ * with 403 server-side, not merely hidden in a UI.
+ *
+ * `method` is the HTTP verb; `path` is the Express path as mounted under
+ * /admin. Keeping this table explicit (rather than inferring from the
+ * handler) is what makes the role assignment auditable per-route.
+ */
+export const ADMIN_ROUTE_ROLES = [
+  { method: 'get', path: '/transactions', role: 'readonly', handler: listTransactions },
+  { method: 'get', path: '/workers', role: 'readonly', handler: listWorkers },
+  { method: 'get', path: '/payers', role: 'readonly', handler: listPayers },
+  { method: 'get', path: '/treasury', role: 'readonly', handler: getTreasury },
+  { method: 'get', path: '/fee-revenue', role: 'readonly', handler: getFeeRevenue },
+  { method: 'get', path: '/anchor-payouts', role: 'readonly', handler: listAnchorPayouts },
+  { method: 'get', path: '/anchor-kyc', role: 'readonly', handler: listAnchorKyc },
+  { method: 'get', path: '/sessions/:sessionId/recording', role: 'readonly', handler: getSessionRecording },
+];
