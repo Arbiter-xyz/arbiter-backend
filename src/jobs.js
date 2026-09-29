@@ -13,6 +13,25 @@ const PREFIX = 'job:';
 const JOB_INDEX_KEY = 'known-job-ids';
 const MAX_TRACKED_JOBS = 5_000;
 
+// Durable review queue, following the same bounded-index pattern as
+// JOB_INDEX_KEY above. Holds the jobIds currently sitting in `pending_review`
+// so an admin can enumerate them without a KEYS/SCAN. Entries are removed
+// when a review is approved (or when reconciliation settles the job), so the
+// list stays bounded by the number of in-flight reviews, not by history.
+const REVIEW_INDEX_KEY = 'pending-review-job-ids';
+const MAX_TRACKED_REVIEWS = 5_000;
+
+// Escalation index (#125). A single shared mechanism for items from BOTH the
+// manual review queue (#123) and disputes (#124) that have been escalated to
+// a senior reviewer. Follows the same bounded durable-index pattern as
+// JOB_INDEX_KEY / REVIEW_INDEX_KEY above. Entries are `{ kind, id }` pairs so
+// one list can carry both review-queue jobs and disputes without two parallel
+// mechanisms; `kind` is 'review' or 'dispute'. Escalation itself is gated on
+// role-based admin permissions (#131) at the route layer — this store only
+// records the flag state, not who is allowed to set it.
+const ESCALATION_INDEX_KEY = 'escalated-item-ids';
+const MAX_TRACKED_ESCALATIONS = 5_000;
+
 // Terminal states never need reconciliation again. Everything else is
 // "in-flight" and must be checked against on-chain truth on startup.
 const TERMINAL_STATUSES = new Set(['settled']);
@@ -35,6 +54,98 @@ async function indexJob(jobId) {
 
 export async function getKnownJobIds() {
   return (await store.get(JOB_INDEX_KEY)) || [];
+}
+
+async function indexReview(jobId) {
+  const pending = (await store.get(REVIEW_INDEX_KEY)) || [];
+  if (pending.includes(jobId)) return;
+  await store.set(REVIEW_INDEX_KEY, [jobId, ...pending].slice(0, MAX_TRACKED_REVIEWS));
+}
+
+async function unindexReview(jobId) {
+  const pending = (await store.get(REVIEW_INDEX_KEY)) || [];
+  if (!pending.includes(jobId)) return;
+  await store.set(REVIEW_INDEX_KEY, pending.filter((id) => id !== jobId));
+}
+
+/**
+ * Returns the jobIds currently awaiting manual review, most-recent-first.
+ * Backs the admin "pending reviews" list route.
+ */
+export async function getPendingReviewJobIds() {
+  return (await store.get(REVIEW_INDEX_KEY)) || [];
+}
+
+/**
+ * Returns the full job records currently in `pending_review`. Jobs whose
+ * record has expired (TTL) or already left the review state are filtered out
+ * and pruned from the index so the queue self-heals.
+ */
+export async function getPendingReviews() {
+  const jobIds = await getPendingReviewJobIds();
+  const reviews = [];
+  for (const jobId of jobIds) {
+    const job = await getJob(jobId);
+    if (job && job.status === 'pending_review') {
+      reviews.push(job);
+    } else {
+      await unindexReview(jobId);
+    }
+  }
+  return reviews;
+}
+
+/**
+ * Escalates an item to a senior reviewer. `kind` is 'review' (a #123 review
+ * queue job) or 'dispute' (a #124 dispute), so both item types share this one
+ * mechanism rather than two parallel ones. Idempotent: escalating an already
+ * escalated item is a no-op. Returns true only for the caller that actually
+ * set the flag, so callers can distinguish "newly escalated" from "already
+ * escalated".
+ *
+ * Authorization (that the caller holds a senior-reviewer role) is enforced at
+ * the route layer via #131's role-based admin permissions — this function
+ * only records the durable flag state.
+ */
+export async function escalateItem(kind, id) {
+  const escalated = (await store.get(ESCALATION_INDEX_KEY)) || [];
+  if (escalated.some((e) => e.kind === kind && e.id === id)) return false;
+  const next = [{ kind, id, escalatedAt: Date.now() }, ...escalated].slice(
+    0,
+    MAX_TRACKED_ESCALATIONS,
+  );
+  await store.set(ESCALATION_INDEX_KEY, next);
+  return true;
+}
+
+/**
+ * Clears the escalation flag for an item (e.g. once a senior reviewer has
+ * actioned it). Returns true if an entry was removed.
+ */
+export async function unescalateItem(kind, id) {
+  const escalated = (await store.get(ESCALATION_INDEX_KEY)) || [];
+  const next = escalated.filter((e) => !(e.kind === kind && e.id === id));
+  if (next.length === escalated.length) return false;
+  await store.set(ESCALATION_INDEX_KEY, next);
+  return true;
+}
+
+/**
+ * Returns the raw escalation entries ({ kind, id, escalatedAt }), most-recent
+ * first. Backs the admin listing endpoints, which use this to mark escalated
+ * items so an escalated item is distinguishable from an unescalated one.
+ */
+export async function getEscalatedItems() {
+  return (await store.get(ESCALATION_INDEX_KEY)) || [];
+}
+
+/**
+ * Returns the set of escalated ids for a given kind, for cheap membership
+ * checks when annotating admin listings.
+ */
+export async function getEscalatedIds(kind) {
+  const escalated = await getEscalatedItems();
+  return new Set(escalated.filter((e) => e.kind === kind).map((e) => e.id));
 }
 
 /**
@@ -80,6 +191,10 @@ export function isSyntheticJob(job) {
  * `holding` is the undo window (see undoWindow.js) — paid, not yet
  * dispatched, cancellable until `cancellableUntil`; a cancelled job goes
  * holding -> cancelling -> settled instead.
+ * A job whose reconciliation result is flagged for human review branches
+ * reconciling -> pending_review instead of settling immediately; an admin
+ * approval then drives it to `settled` through the same on-chain path as an
+ * automatic settlement (see approveReview() below).
  * `settled` always carries an `outcome` of 'resolved' or 'refunded' — same
  * fail-closed guarantee as before, just observed asynchronously.
  *
@@ -137,94 +252,51 @@ export async function getJob(jobId) {
 }
 
 /**
- * Marks a job terminal exactly once. Returns true only for the caller that
- * actually transitioned the job out of a non-terminal state, so a settlement
- * path can use this as its idempotency guard: if it returns false, another
- * path (or a previous run) already recorded the terminal outcome and no
- * on-chain call should be made.
+ * Moves a job into the manual review queue. Returns true only for the caller
+ * that actually transitioned the job out of a non-terminal, non-review state,
+ * so the settlement path can use this as its idempotency guard: if it returns
+ * false, the job is already terminal or already queued and no further action
+ * should be taken.
+ *
+ * The job keeps its `questionId` and any reconciliation metadata (e.g. the
+ * confidence that triggered the review) so an admin can inspect why it was
+ * flagged, and so approveReview() can settle it through the same on-chain
+ * path as an automatic settlement.
  */
-export async function markSettled(jobId, outcome, extra = {}) {
+export async function markPendingReview(jobId, extra = {}) {
   const key = PREFIX + jobId;
   const current = (await store.get(key)) || {};
   if (TERMINAL_STATUSES.has(current.status)) return false;
+  if (current.status === 'pending_review') return false;
   const next = {
     ...current,
     ...extra,
-    status: 'settled',
-    outcome,
-    settledAt: Date.now(),
+    status: 'pending_review',
+    reviewRequestedAt: Date.now(),
     updatedAt: Date.now(),
   };
   await store.set(key, next, config.jobResultTtlMs);
+  await indexReview(jobId);
   return true;
 }
 
 /**
- * Startup recovery. Walks every non-terminal job and reconciles it against
- * live on-chain question status before any settlement work resumes.
+ * Approves a queued review and settles it through the SAME on-chain path as
+ * an automatic settlement. `settle(job, outcome)` is expected to call the
+ * existing resolveQuestion()/refundQuestion() stellarClient functions (the
+ * ones oracle.js already uses) and then markSettled() — so a manually
+ * approved outcome produces an identical job record shape to an automatic
+ * one.
  *
- * `readOnChainStatus(questionId)` must return the authoritative on-chain
- * status for the question (e.g. 'open' | 'resolved' | 'refunded'). It is the
- * ONLY input that decides whether a settlement call is needed — a job that
- * was mid-fulfillOracleCall when the process died is indistinguishable from
- * one that never started, so both are simply re-driven from on-chain truth.
- *
- * `settle(job, onChainStatus)` performs the (idempotent) settlement for a
- * job whose on-chain status is already terminal. It must itself check
- * on-chain status before calling resolve()/refund() so a crash between the
- * on-chain call and markSettled() cannot cause a duplicate call on the next
- * restart.
- *
- * Returns a summary for logging/tests.
+ * Returns the settled job record, or null if the job was not in
+ * `pending_review` (already settled, expired, or never queued). The review
+ * index entry is removed on success so the queue stays bounded.
  */
-export async function reconcileJobs({ readOnChainStatus, settle, resume } = {}) {
-  const jobIds = await getKnownJobIds();
-  const summary = { scanned: 0, settled: 0, resumed: 0, skipped: 0, failed: 0 };
-
-  for (const jobId of jobIds) {
-    const job = await getJob(jobId);
-    if (!job) continue;
-    summary.scanned += 1;
-
-    if (TERMINAL_STATUSES.has(job.status)) {
-      summary.skipped += 1;
-      continue;
-    }
-
-    try {
-      const onChainStatus = await readOnChainStatus(job.questionId);
-
-      if (onChainStatus === 'resolved' || onChainStatus === 'refunded') {
-        // On-chain truth says this question is already settled. Record the
-        // terminal outcome locally without ever calling resolve()/refund()
-        // again — this is the no-double-settle guarantee.
-        const changed = await markSettled(jobId, onChainStatus, {
-          recovered: true,
-        });
-        if (changed) summary.settled += 1;
-        else summary.skipped += 1;
-        continue;
-      }
-
-      // Still open on-chain: the job never reached a terminal on-chain state
-      // (including the mid-fulfillOracleCall case). Hand it back to the
-      // normal settlement pipeline, which re-checks on-chain status before
-      // acting, so resuming is safe and idempotent.
-      if (typeof resume === 'function') {
-        await resume(job);
-        summary.resumed += 1;
-      } else if (typeof settle === 'function') {
-        await settle(job, onChainStatus);
-        summary.resumed += 1;
-      } else {
-        summary.skipped += 1;
-      }
-    } catch (err) {
-      // A single unreconcilable job must not abort startup recovery for the
-      // rest; it stays non-terminal and will be retried on the next restart.
-      summary.failed += 1;
-    }
-  }
-
-  return summary;
+export async function approveReview(jobId, outcome, settle) {
+  const job = await getJob(jobId);
+  if (!job || job.status !== 'pending_review') return null;
+  const settled = await settle(job, outcome);
+  await unindexReview(jobId);
+  await unescalateItem('review', jobId);
+  return settled;
 }

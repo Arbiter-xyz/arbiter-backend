@@ -63,38 +63,40 @@ export async function getPayerQuestionIds(payerAddress) {
 }
 
 /**
- * CCPA (#127) request handling. This is a thin wrapper over the same
- * address-keyed data-access/erasure plumbing #126 exposes — it does not
- * duplicate the store fan-out. It only adds CCPA-specific bookkeeping:
- * categorizing the request and recording a receipt timestamp suitable for
- * tracking against CCPA's statutory response window.
- *
- * CCPA and GDPR are treated as the same underlying request type; there is
- * no jurisdiction detection or auto-routing (explicitly out of scope).
+ * Ownership check for the dispute endpoint (#124): a payer may only contest
+ * a question that appears in their own payerIndex record. This is the
+ * off-chain analogue of the on-chain payer field — the session token proves
+ * address control, and this proves the address actually paid for the
+ * question, so a valid session for payer A can't dispute payer B's job.
  */
-export async function recordCcpaRequest({ requestId, payerAddress, type, receivedAt = Date.now() }) {
-  const record = {
-    requestId,
-    payerAddress,
-    // 'access' | 'deletion' — the two CCPA individual rights this backend
-    // can actually honor against its data model.
-    type,
-    receivedAt,
-    // Deadline for the initial 45-day response window; a single 45-day
-    // extension is permitted but tracked by the caller, not assumed here.
-    responseDueAt: receivedAt + CCPA_RESPONSE_WINDOW_MS,
-  };
-  await store.set(CCPA_REQUEST_PREFIX + requestId, record);
-
-  const known = (await store.get(CCPA_REQUEST_PREFIX + 'index')) || [];
-  if (!known.includes(requestId)) {
-    await store.set(CCPA_REQUEST_PREFIX + 'index', [requestId, ...known].slice(0, MAX_TRACKED_CCPA_REQUESTS));
-  }
-  return record;
+export async function payerOwnsQuestion(payerAddress, questionId) {
+  if (!payerAddress || !questionId) return false;
+  const ids = await getPayerQuestionIds(payerAddress);
+  return ids.includes(questionId);
 }
 
-export async function getCcpaRequest(requestId) {
-  return (await store.get(CCPA_REQUEST_PREFIX + requestId)) || null;
+/**
+ * GDPR erasure (#126): delete this payer's off-chain records — the
+ * `payer-questions:` list and, if present, the address's entry in the
+ * known-payer index. On-chain state (resolved questions, stake, owed
+ * balances) is structurally permanent and is NOT touched here; callers
+ * must surface that distinction in the response body, not just in code.
+ * Returns a summary of exactly what was removed so the endpoint can report
+ * it honestly.
+ */
+export async function erasePayerRecords(payerAddress) {
+  if (!payerAddress) return { deleted: false, questionIds: 0, removedFromIndex: false };
+
+  const ids = await getPayerQuestionIds(payerAddress);
+  await store.delete(PREFIX + payerAddress);
+
+  const known = await getKnownPayerAddresses();
+  const removedFromIndex = known.includes(payerAddress);
+  if (removedFromIndex) {
+    await store.set(PAYER_INDEX_KEY, known.filter((a) => a !== payerAddress));
+  }
+
+  return { deleted: true, questionIds: ids.length, removedFromIndex };
 }
 
 /**
