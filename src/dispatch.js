@@ -1,6 +1,7 @@
 import { store } from './store.js';
 import { config } from './config.js';
 import { checkRateLimit } from './rateLimit.js';
+import { screenAnswer } from './answerFilter.js';
 import { getPushEligibleWorkerIds, notifyWorker } from './push.js';
 import { getStakeOnChain, touchWorker } from './stellarClient.js';
 import { jobLogger, logger } from './logger.js';
@@ -381,6 +382,202 @@ function writeSse(res, event, data) {
  * a starved quorum is a worse outcome than one with a fresh worker in it.
  *
  * `whitelist` (a payer's private pool — see privatePools.js) is the one
- * filter here 
+ * filter here that deliberately FAILS CLOSED. Every other filter is a soft
+ * routing preference, so falling back to a wider pool beats stranding the
+ * question. A private pool is a hard requirement the payer explicitly asked
+ * for; falling back to the open pool would quietly defeat the feature and
+ * send their question to exactly the workers they excluded. So it runs
+ * first, and when no whitelisted worker is online this returns [] (the
+ * caller refunds rather than broadcasting). The soft filters below still
+ * fail open, but only as far as the whitelisted set, never past it.
+ */
+async function selectTargets(category, { preferEstablished = false, quorumSize = 0, whitelist = null } = {}) {
+  let targets = [...workers.entries()];
+
+  if (whitelist) {
+    const allowed = new Set(whitelist);
+    targets = targets.filter(([id]) => allowed.has(id));
+    if (targets.length === 0) return [];
+  }
+
+  if (category) {
+    const norm = normalizeCategory(category);
+    // Generalists (no declared categories) always receive everything;
+    // specialists only receive their declared categories.
+    const matching = targets.filter(([, w]) => w.categories.size === 0 || w.categories.has(norm));
+    // Fail open on routing: if nobody in this category is online, broadcast
+    // to everyone rather than stranding the question with zero recipients.
+    if (matching.length > 0) targets = matching;
+  }
+
+  const eligible = [];
+  for (const entry of targets) {
+    if (await isEligible(entry[0])) eligible.push(entry);
+  }
+  // Reputation gating must never be able to zero out the recipient list —
+  // routing quality is a soft preference, payment settlement is not.
+  const pool = eligible.length > 0 ? eligible : targets;
+  if (!preferEstablished) return pool;
+
+  const established = [];
+  for (const entry of pool) {
+    if (await isEstablishedWorker(entry[0])) established.push(entry);
+  }
+  return established.length >= quorumSize ? established : pool;
+}
+
+export async function broadcast(questionId, questionText, { category, quorumSize, expiresInMs, preferEstablished, traceparent } = {}) {
+  // Re-enter the question's trace context (generated at creation time in
+  // jobs.js) so the dispatch span is a child of the same trace, and inject
+  // the current traceparent into the SSE payload so workers can echo it back
+  // on their answers — closing the loop across the SSE boundary.
+  const parentCtx = contextFromTraceparent(traceparent);
+  return context.with(parentCtx, async () => {
+    const span = tracer().startSpan('dispatch.broadcast', {
+      kind: SpanKind.PRODUCER,
+      attributes: {
+        'question.id': questionId.toString(),
+        'dispatch.category': category || 'general',
+        'dispatch.quorum_size': quorumSize || 0,
+      },
+    });
+    try {
+      const payload = {
+        questionId: questionId.toString(),
+        question: questionText,
+        quorumSize,
+        expiresInMs,
+        traceparent: currentTraceparent(),
+      };
+      const targets = await selectTargets(category, { preferEstablished, quorumSize });
+      span.setAttribute('dispatch.recipients', targets.length);
+      for (const [, w] of targets) writeSse(w.res, 'question', payload);
+
+      // Supplement SSE with push notifications for workers who are eligible
+      // but not currently connected — only when the timeout window realistically
+      // allows time to notice, tap, and load before the quorum closes (see
+      // push.js for the honest tradeoff; short-timeout tiers skip this).
+      if (expiresInMs > 0) {
+        const eligibleIds = await getPushEligibleWorkerIds([...targets].map(([id]) => id));
+        for (const workerId of eligibleIds) {
+          await notifyWorker(workerId, payload);
+        }
+      }
+      span.setStatus({ code: SpanStatusCode.OK });
+      return targets.length;
+    } catch (err) {
+      span.recordException(err);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
+}
+
+/**
+ * Record a worker's answer inside the question's trace context. The worker
+ * echoes the traceparent it received on the SSE frame, so the answer span is
+ * correlated with the original HTTP request and the on-chain settlement that
+ * follows — this is the middle link in the end-to-end trace.
+ */
+export async function submitAnswer(questionId, workerId, answer, { traceparent } = {}) {
+  const parentCtx = contextFromTraceparent(traceparent);
+  return context.with(parentCtx, async () => {
+    const span = tracer().startSpan('dispatch.answer', {
+      kind: SpanKind.CONSUMER,
+      attributes: {
+        'question.id': questionId.toString(),
+        'worker.id': workerId,
+      },
+    });
+    try {
+      const collector = collectors.get(questionId.toString());
+      if (!collector || collector.finished) {
+        span.setAttribute('dispatch.answer_accepted', false);
+        return false;
+      }
+      // Screen before recording: a filtered answer must never count
+      // toward quorum or consensus.
+      const screened = screenAnswer(answer);
+      if (!screened.ok) {
+        span.setAttribute('dispatch.answer_accepted', false);
+        span.setAttribute('dispatch.answer_filtered', screened.reason);
+        return false;
+      }
+      collector.submissions.set(workerId, answer);
+      span.setAttribute('dispatch.answer_accepted', true);
+      span.setAttribute('dispatch.submissions', collector.submissions.size);
+      if (collector.submissions.size >= collector.quorumSize) {
+        collector.finished = true;
+        await collector.finish(collector.submissions);
+      }
+      span.setStatus({ code: SpanStatusCode.OK });
+      return true;
+    } catch (err) {
+      span.recordException(err);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
+}
+
+/**
+ * Record the on-chain settlement transaction hash against the question's
+ * trace. Soroban has no native tracing concept, so the traceparent is carried
+ * in the transaction memo (see stellarClient.js) and the resulting hash is
+ * attached here as a span attribute — this is what lets an operator walk from
+ * a trace ID to the exact on-chain transaction.
+ */
+export async function recordSettlement(questionId, txHash, { traceparent } = {}) {
+  const parentCtx = contextFromTraceparent(traceparent);
+  return context.with(parentCtx, async () => {
+    const span = tracer().startSpan('settlement.onchain', {
+      kind: SpanKind.CLIENT,
+      attributes: {
+        'question.id': questionId.toString(),
+        'settlement.tx_hash': txHash,
+      },
+    });
+    try {
+      await touchWorker('settlement', { questionId: questionId.toString(), txHash });
+      span.setStatus({ code: SpanStatusCode.OK });
+      return txHash;
+    } catch (err) {
+      span.recordException(err);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
+}
+
+/**
+ * Register the quorum collector for a question, running inside the question's
+ * trace context so the eventual finish() callback (which triggers settlement)
+ * stays on the same trace.
+ */
+export function registerCollector(questionId, { quorumSize, finish, traceparent } = {}) {
+  const parentCtx = contextFromTraceparent(traceparent);
+  const collector = {
+    submissions: new Map(),
+    quorumSize,
+    finished: false,
+    finish: (submissions) => context.with(parentCtx, () => finish(submissions)),
+  };
+  collectors.set(questionId.toString(), collector);
+  return collector;
+}
+
+export function getCollector(questionId) {
+  return collectors.get(questionId.toString());
+}
+
+export function clearCollector(questionId) {
+  collectors.delete(questionId.toString());
+}
 
 /* … truncated 7639 chars — edit only what you need near the top … */

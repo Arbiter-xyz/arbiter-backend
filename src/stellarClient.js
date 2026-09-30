@@ -1,6 +1,7 @@
 import { Keypair, TransactionBuilder, Contract, Account, Address, nativeToScVal, scValToNative, rpc } from '@stellar/stellar-sdk';
 import { config } from './config.js';
 import { withRetry } from './retry.js';
+import { recordAdminInvocation } from './metrics.js';
 
 /** Chaos fault injection: env-gated, inert unless CHAOS_FAULT is set to a
  * recognized scenario. Follows config.js's "everything is an env var with a
@@ -225,7 +226,16 @@ export function createSerialQueue() {
 const serializeAdminCall = createSerialQueue();
 
 function invokeAsAdmin(method, scValArgs) {
-  return serializeAdminCall(() => runInvokeAsAdmin(method, scValArgs));
+  return serializeAdminCall(() => runInvokeAsAdmin(method, scValArgs)).then(
+    (result) => {
+      recordAdminInvocation(method, true);
+      return result;
+    },
+    (err) => {
+      recordAdminInvocation(method, false);
+      throw err;
+    },
+  );
 }
 
 /** Rotates the contract id only after every admin call already queued
@@ -329,16 +339,71 @@ async function simulateReadOnly(method, scValArgs = []) {
   );
 }
 
-export async function readQuestion(questionId) {
-  const sim = await simulateReadOnly('get_question', [u64Arg(questionId)]);
-  const raw = sim.result?.retval;
-  if (raw === undefined) return null;
-  return scValToNative(raw);
+/** Zero-fee simulated read — checks payment state without needing a signature. */
+export async function getQuestionOnChain(questionId) {
+  const native = await simulateReadOnly('get_question', [u64Arg(questionId)]);
+  if (!native) return null;
+  return {
+    payer: native.payer,
+    amount: BigInt(native.amount),
+    status: decodeStatus(native.status),
+    createdAt: Number(native.created_at),
+  };
 }
 
-export async function readWorker(workerAddress) {
-  const sim = await simulateReadOnly('get_worker', [addressArg(workerAddress)]);
-  const raw = sim.result?.retval;
-  if (raw === undefined) return null;
-  return scValToNative(raw);
+export async function getTimeoutLedgersOnChain() {
+  return simulateReadOnly('get_timeout_ledgers');
+}
+
+export async function getOwedOnChain(workerAddress) {
+  const owed = await simulateReadOnly('get_owed', [addressArg(workerAddress)]);
+  return BigInt(owed ?? 0);
+}
+
+export async function getStakeOnChain(workerAddress) {
+  const stake = await simulateReadOnly('get_stake', [addressArg(workerAddress)]);
+  return BigInt(stake ?? 0);
+}
+
+export async function getBalanceOnChain(payerAddress) {
+  const balance = await simulateReadOnly('get_balance', [addressArg(payerAddress)]);
+  return BigInt(balance ?? 0);
+}
+
+/** Builds and prepares (simulates + assembles footprint/auth) the worker's
+ * OWN withdraw() or withdraw_to() call, with the worker's account as the
+ * source, and returns it UNSIGNED. The backend never signs this — the
+ * worker does, then it goes through the same /sponsor/withdraw-style
+ * fee-bump relay (sponsor.js), whose invoked-function check matches this
+ * call byte for byte since the args are built the same way. */
+export async function buildWorkerWithdrawTx(workerAddress, amountStroops, beneficiaryAddress = null, timeoutSeconds = 3600) {
+  const srv = getServer();
+  const account = await withRetry(() => srv.getAccount(workerAddress), {
+    attempts: 2,
+    timeoutMs: 5_000,
+    baseDelayMs: 200,
+    label: 'getAccount(worker)',
+  });
+  const contract = new Contract(config.contractId);
+  const op = beneficiaryAddress
+    ? contract.call('withdraw_to', addressArg(workerAddress), addressArg(beneficiaryAddress), i128Arg(amountStroops))
+    : contract.call('withdraw', addressArg(workerAddress), i128Arg(amountStroops));
+
+  const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
+    .addOperation(op)
+    .setTimeout(timeoutSeconds)
+    .build();
+
+  const prepared = await srv.prepareTransaction(tx);
+  return prepared.toXDR();
+}
+
+/** Refreshes storage TTL on a worker's Owed/Stake entries via the
+ * contract's permissionless touch() — no worker signature involved, so
+ * this can run on the platform's own admin key exactly like resolve()
+ * does. See touch()'s doc comment in lib.rs for why a periodic sweep needs
+ * to exist at all (a worker who earns once and never returns has no other
+ * way to keep their balance from archiving off-chain storage). */
+export async function touchWorker(workerAddress) {
+  return invokeAsAdmin('touch', [addressArg(workerAddress)]);
 }

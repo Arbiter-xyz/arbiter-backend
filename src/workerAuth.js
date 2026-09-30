@@ -86,7 +86,10 @@ export async function verifyChallengeAndIssueSession(workerAddress, signedXdr) {
 
 function issueSessionToken(address) {
   const exp = Date.now() + config.session.ttlMs;
-  const payload = Buffer.from(JSON.stringify({ address, exp })).toString('base64url');
+  // sid identifies this one session so it can be revoked individually
+  // (see revokeSession) without affecting other sessions for the address.
+  const sid = randomBytes(12).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ address, exp, sid })).toString('base64url');
   const mac = createHmac('sha256', config.session.secret).update(payload).digest('base64url');
   return { token: `${payload}.${mac}`, expiresAt: exp };
 }
@@ -127,12 +130,8 @@ function macMatches(payload, mac, secret) {
   return macBuf.length === expectedBuf.length && timingSafeEqual(macBuf, expectedBuf);
 }
 
-/** Returns the authenticated address if `token` is a valid, unexpired
- * session, or null otherwise. Accepts a MAC produced by the current
- * SESSION_SECRET or, during the rotation grace window, the previous one;
- * the payload/expiry checks are identical either way, so tamper and
- * replay resistance are unchanged. */
-export function verifySessionToken(token) {
+/** Parses and MAC/expiry-checks a token, returning its payload or null. */
+function parseSessionToken(token) {
   if (typeof token !== 'string' || !token.includes('.')) return null;
   const [payload, mac] = token.split('.');
 
@@ -140,66 +139,82 @@ export function verifySessionToken(token) {
   if (!validMac) return null;
 
   try {
-    const { address, exp } = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-    if (typeof exp !== 'number' || Date.now() > exp) return null;
-    return address;
+    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    if (typeof parsed.exp !== 'number' || Date.now() > parsed.exp) return null;
+    return parsed;
   } catch {
     return null;
   }
 }
 
-/**
- * GDPR data-export/erasure support (issue #126).
- *
- * A payer or worker can only export or erase data for an address they
- * have actually proven control of. This reuses the exact same
- * challenge/response session mechanism as the rest of the app
- * (`verifySessionToken`), so an attacker who merely names someone else's
- * address in a request body cannot read or delete that address's data —
- * the same impersonation-rejection guarantee `workerAuth.test.js`
- * already covers for POST /app/answer.
- *
- * Returns the authenticated address on success, or null when the token
- * is missing, malformed, expired, or scoped to a different address than
- * the one being requested. Callers should respond 401 on null rather
- * than leaking which of those cases applied.
- */
-export function authorizeDataSubject(token, requestedAddress) {
-  const authenticated = verifySessionToken(token);
-  if (!authenticated) return null;
-  if (typeof requestedAddress !== 'string' || authenticated !== requestedAddress) return null;
-  return authenticated;
+/** Returns the authenticated address if `token` is a valid, unexpired
+ * session, or null otherwise. Accepts a MAC produced by the current
+ * SESSION_SECRET or, during the rotation grace window, the previous one;
+ * the payload/expiry checks are identical either way, so tamper and
+ * replay resistance are unchanged. Stateless — does NOT check revocation;
+ * route handlers must use verifySession() instead. */
+export function verifySessionToken(token) {
+  return parseSessionToken(token)?.address ?? null;
+}
+
+const REVOKED_PREFIX = 'revoked-session:';
+
+/** verifySessionToken() plus a store lookup rejecting revoked sessions.
+ * This is what every authenticated route should call. */
+export async function verifySession(token) {
+  const parsed = parseSessionToken(token);
+  if (!parsed) return null;
+  if (parsed.sid && (await store.get(REVOKED_PREFIX + parsed.sid))) return null;
+  return parsed.address;
+}
+
+/** Revokes the session `token` itself, returning the address it was for,
+ * or null if the token isn't currently valid (an expired token needs no
+ * revocation). The revocation record's TTL matches the token's remaining
+ * lifetime, so it never outlives the thing it revokes. Tokens minted
+ * before sids existed can't be revoked individually and are rejected. */
+export async function revokeSession(token) {
+  const parsed = parseSessionToken(token);
+  if (!parsed || !parsed.sid) return null;
+  if (await store.get(REVOKED_PREFIX + parsed.sid)) return null;
+  const remainingMs = parsed.exp - Date.now();
+  if (remainingMs <= 0) return null;
+  await store.set(REVOKED_PREFIX + parsed.sid, true, remainingMs);
+  return parsed.address;
 }
 
 /**
- * The off-chain stores this backend keeps per address, enumerated in one
- * place so export and erasure (and, later, the retention-policy engine
- * from #128) share the same list instead of drifting apart. Each entry
- * names the store module and the key prefix it uses for address-scoped
- * records. On-chain contract state (resolved questions, stake, owed
- * balances) is deliberately absent — it is not ours to delete and cannot
- * be, so it must never appear here as if it were erasable.
+ * The single implementation of "prove control of a Stellar address via
+ * challenge/response", mounted at both /payers/:address/session* and
+ * /workers/:address/session* (the token doesn't distinguish the two —
+ * only the route naming does). `middleware` is applied to every route.
  */
-export const OFF_CHAIN_STORES = [
-  { store: 'payerIndex', prefix: 'payer-questions:', description: 'Payer question index' },
-  { store: 'dispatch', prefix: 'rep:', description: 'Worker reputation history' },
-  { store: 'push', prefix: 'push-sub:', description: 'Push notification subscriptions' },
-  { store: 'anchorRecords', prefix: 'anchor-tx:', description: 'Self-reported SEP-24/SEP-12 anchor transactions' },
-  { store: 'anchorRecords', prefix: 'anchor-kyc:', description: 'Self-reported SEP-12 KYC status' },
-  { store: 'workerAuth', prefix: CHALLENGE_PREFIX, description: 'Outstanding auth challenges' },
-];
+export function mountSessionRoutes(app, basePath, ...middleware) {
+  app.post(`${basePath}/:address/session/challenge`, ...middleware, async (req, res) => {
+    try {
+      const xdr = await buildChallengeXdr(req.params.address);
+      res.json({ xdr });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
 
-/**
- * The parts of a data subject's footprint that live on-chain and are
- * therefore permanent. Returned verbatim in erasure responses so the
- * caller is told plainly what was *not* deleted, rather than being left
- * to assume erasure was total. Mirrors the honesty of
- * `anchorRecords.js`'s own "self-reported cache, not ground truth"
- * disclaimer.
- */
-export const ON_CHAIN_PERMANENT = [
-  'Resolved question answers and their consensus outcome',
-  'Staked balances and slashing history',
-  'Owed/withdrawable balances',
-  'Any transaction history recorded on the Stellar ledger',
-];
+  app.post(`${basePath}/:address/session`, ...middleware, async (req, res) => {
+    const { signedXdr } = req.body || {};
+    if (!signedXdr) return res.status(400).json({ error: 'signedXdr is required' });
+    const session = await verifyChallengeAndIssueSession(req.params.address, signedXdr);
+    if (!session) return res.status(401).json({ error: 'challenge verification failed — signature did not match, or the challenge expired' });
+    res.json(session);
+  });
+
+  // Revokes the session making the request — requires the token itself,
+  // not just knowledge of the address.
+  app.post(`${basePath}/:address/session/revoke`, ...middleware, async (req, res) => {
+    const token = req.body?.token;
+    if ((await verifySession(token)) !== req.params.address) {
+      return res.status(401).json({ error: 'a valid session token for this address is required' });
+    }
+    await revokeSession(token);
+    res.json({ ok: true });
+  });
+}
