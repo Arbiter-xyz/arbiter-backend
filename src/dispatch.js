@@ -17,6 +17,109 @@ const workers = new Map(); // workerId -> { res, categories: Set<string>, connec
 // for that mode; fixed-quorum collectors leave it undefined.
 const collectors = new Map(); // questionId -> { submissions: Map<workerId, answer>, quorumSize, finished, finish, escalation? }
 
+// Cross-instance answer routing (issue #160).
+//
+// The collector/quorum state machine above stays in-memory on whichever
+// instance dispatched the question — only the *routing* of an answer to the
+// owning collector crosses the instance boundary. We use Redis pub/sub
+// (rather than Streams) because answers are fire-and-forget: a late answer
+// for an already-settled question is simply dropped, so we don't need the
+// replay/ordering guarantees Streams would buy us, and pub/sub keeps the
+// transport to a single subscribe/publish pair with no consumer-group
+// bookkeeping. The channel is keyed by questionId, so the owning instance
+// subscribes to exactly the questions it dispatched.
+const ANSWER_CHANNEL_PREFIX = 'quorum:answer:';
+
+function answerChannel(questionId) {
+  return ANSWER_CHANNEL_PREFIX + questionId;
+}
+
+// questionId -> unsubscribe handle for the pub/sub subscription owned by
+// this instance. Kept alongside `collectors` so the subscription is torn
+// down at the same moment the collector is.
+const answerSubscriptions = new Map();
+
+/**
+ * Subscribe this instance to the answer channel for a question it owns.
+ * Called when a collector is created. No-op (and no new failure mode) when
+ * the store has no pub/sub support — single-instance deployments keep
+ * working exactly as before.
+ */
+async function subscribeToAnswers(questionId) {
+  if (typeof store.subscribe !== 'function') return;
+  if (answerSubscriptions.has(questionId)) return;
+  try {
+    const unsubscribe = await store.subscribe(answerChannel(questionId), (payload) => {
+      // Answers arriving over the wire are routed through the same local
+      // path as answers submitted directly to this instance, so quorum
+      // accounting is identical regardless of which instance received them.
+      handleAnswer(payload.questionId, payload.workerId, payload.answer, payload.traceparent);
+    });
+    answerSubscriptions.set(questionId, unsubscribe);
+  } catch (err) {
+    logger.warn({ err, questionId }, 'failed to subscribe to cross-instance answer channel');
+  }
+}
+
+function unsubscribeFromAnswers(questionId) {
+  const unsubscribe = answerSubscriptions.get(questionId);
+  if (!unsubscribe) return;
+  answerSubscriptions.delete(questionId);
+  try {
+    unsubscribe();
+  } catch (err) {
+    logger.warn({ err, questionId }, 'failed to unsubscribe from cross-instance answer channel');
+  }
+}
+
+/**
+ * Publish an answer to the channel owned by whichever instance holds the
+ * collector. Used when this instance receives an answer for a question it
+ * does not own (no local collector). Best-effort: if publishing fails the
+ * answer is dropped, which is the same outcome as today's behavior for an
+ * answer that lands on the wrong instance.
+ */
+async function publishAnswer(questionId, workerId, answer, traceparent) {
+  if (typeof store.publish !== 'function') return;
+  try {
+    await store.publish(answerChannel(questionId), { questionId, workerId, answer, traceparent });
+  } catch (err) {
+    logger.warn({ err, questionId, workerId }, 'failed to publish cross-instance answer');
+  }
+}
+
+/**
+ * Entry point for an answer submission. If this instance owns the
+ * collector, record it locally; otherwise forward it to the owning
+ * instance over pub/sub. This is the single routing decision that makes
+ * cross-instance quorum collection work.
+ */
+export async function submitAnswer(questionId, workerId, answer, traceparent) {
+  if (collectors.has(questionId)) {
+    return handleAnswer(questionId, workerId, answer, traceparent);
+  }
+  return publishAnswer(questionId, workerId, answer, traceparent);
+}
+
+/**
+ * Record an answer against the local collector for `questionId`. Shared by
+ * the direct-submission path and the pub/sub delivery path so both count
+ * toward quorum identically. Returns false when there is no local collector
+ * (e.g. the owning instance died and this is a stale delivery).
+ */
+function handleAnswer(questionId, workerId, answer, traceparent) {
+  const collector = collectors.get(questionId);
+  if (!collector || collector.finished) return false;
+  if (collector.submissions.has(workerId)) return false;
+  collector.submissions.set(workerId, answer);
+  if (collector.submissions.size >= collector.quorumSize) {
+    collector.finished = true;
+    unsubscribeFromAnswers(questionId);
+    collector.finish(collector.submissions);
+  }
+  return true;
+}
+
 const REPUTATION_PREFIX = 'rep:';
 // A single durable list of every workerId that has ever had an outcome
 // recorded — reputation itself is keyed per-worker (rep:{workerId}), which

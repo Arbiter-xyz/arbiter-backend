@@ -4,7 +4,7 @@ import { store } from './store.js';
 import { config } from './config.js';
 import { hashApiKey } from './apiKeyAuth.js';
 import { logger } from './logger.js';
-import { withRetry } from './retry.js';
+import { fiatPoolBalanceStroops, billingReservationCount, billingSettlementCount } from './metrics.js';
 
 /**
  * The non-crypto onramp: a fiat customer pays via Stripe and is issued an
@@ -198,8 +198,10 @@ export async function getCreditBalanceStroops(accountId) {
  * backstop for in-flight requests rather than the primary gate.
  */
 export async function reserveCredit(accountId, maxStroops) {
-  await recordCallVelocity(accountId);
-  return store.decrIfAtLeast(`credit:${accountId}`, maxStroops);
+  const ok = await store.decrIfAtLeast(`credit:${accountId}`, maxStroops);
+  if (ok) billingReservationCount.inc({ outcome: 'reserved' });
+  else billingReservationCount.inc({ outcome: 'insufficient' });
+  return ok;
 }
 
 /** Credits back the unused portion of a reservation. Pass actualStroops=0
@@ -210,29 +212,7 @@ export async function reserveCredit(accountId, maxStroops) {
 export async function settleReservation(accountId, reservedStroops, actualStroops, questionId) {
   const refund = reservedStroops - actualStroops;
   if (refund > 0) await store.incrBy(`credit:${accountId}`, refund);
-  if (questionId) await store.del(`reservation:${questionId}`);
-}
-
-/**
- * Startup/periodic reconciliation for the crash window between
- * reserveCredit() and settleReservation(). For each pending reservation:
- *  - if the associated job already recorded a final amountStroops, settle
- *    against that real charge (refunding the unused difference);
- *  - if no job was ever created, refund the reservation in full.
- * `getJob` is injected (jobs.js) to avoid a circular import; it returns the
- * job record or null. Idempotent: settleReservation() deletes the record.
- */
-export async function reconcilePendingReservations(getJob) {
-  const keys = await store.keys('reservation:*');
-  for (const key of keys) {
-    const reservation = await store.get(key);
-    if (!reservation) continue;
-    const { accountId, reservedStroops, questionId } = reservation;
-    const job = getJob ? await getJob(questionId) : null;
-    const actualStroops = job && Number.isFinite(job.amountStroops) ? job.amountStroops : 0;
-    await settleReservation(accountId, reservedStroops, actualStroops, questionId);
-    logger.info({ questionId, accountId, actualStroops }, 'reconciled abandoned credit reservation');
-  }
+  billingSettlementCount.inc({ outcome: actualStroops > 0 ? 'charged' : 'refunded' });
 }
 
 /** Creates a fresh account (and its one API key) and a Stripe Checkout
@@ -661,7 +641,26 @@ export async function recordUsage(accountId, endpoint, tier, ts = Date.now()) {
 }
 
 /**
- * Reads back the last USAGE_WINDOW_DAYS days of usage for an account,
- * aggregated per endpoint and per tier. Retu
+ * Reads the pooled fiat balance for the /metrics endpoint (issue #162).
+ * Returns null when billing isn't configured so the metrics route can skip
+ * the gauge entirely rather than reporting a misleading zero. The balance
+ * itself is read from the same store key the on-chain pool accounting
+ * already maintains; this is a read-only accessor, not a new source of
+ * truth.
+ */
+export async function getFiatPoolBalanceStroops() {
+  if (!isBillingConfigured()) return null;
+  const balance = await store.get(`pool:${config.billing.fiatPoolAddress}`);
+  return balance || 0;
+}
 
-/* … truncated 1336 chars — edit only what you need near the top … */
+/**
+ * Refreshes the fiat-pool-balance gauge. Called by the /metrics handler
+ * before scraping so the gauge reflects the current pool rather than a
+ * stale value from process start. No-op when billing is unconfigured.
+ */
+export async function refreshFiatPoolBalanceMetric() {
+  const balance = await getFiatPoolBalanceStroops();
+  if (balance === null) return;
+  fiatPoolBalanceStroops.set(balance);
+}

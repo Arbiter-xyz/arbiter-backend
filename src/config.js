@@ -83,29 +83,20 @@ export function validateWebhookRetryPolicy(policy) {
   return { attempts, baseDelayMs };
 }
 
-// Comma-separated list of Soroban RPC endpoints, e.g.
-// "https://primary.example.com,https://backup.example.com". The first entry
-// is the primary; the rest are failover candidates used by
-// stellarClient.js's getServerWithFailover() when the primary is degraded
-// (see #147). Mirrors allowedOrigins's comma-split parsing convention.
-const sorobanRpcUrls = (process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-// Deployment profile (#150). 'demo' is the disposable free-tier deployment
-// documented in README's "Try it live" table; 'sandbox' is the long-lived
-// developer sandbox environment that integrators point at. The profile only
-// selects defaults below — every value stays overridable via its own env var
-// so a single service can still be tuned without a code change.
-const deploymentProfile = process.env.DEPLOYMENT_PROFILE === 'sandbox' ? 'sandbox' : 'demo';
-
-// Rate-limit ceilings per profile (#150). The sandbox absorbs sustained
-// integrator traffic rather than one-off demo hits, so it gets a more
-// generous ceiling while still reusing the same rateLimit.js machinery.
-const rateLimitDefaults = deploymentProfile === 'sandbox'
-  ? { windowMs: 60_000, max: 600 }
-  : { windowMs: 60_000, max: 120 };
+// Contract compatibility pin (#163). This backend is developed independently
+// of `arbiter-contract`, so nothing at build time guarantees the two agree on
+// argument shapes. COMPATIBLE_CONTRACT_VERSION names the tagged contract
+// release this backend is built against, and COMPATIBLE_CONTRACT_WASM_HASH is
+// that release's recorded WASM hash (from arbiter-contract's release notes).
+// At startup (see contractVersionCheck.js) the deployed instance's hash is
+// fetched on-chain and compared against this pin; a mismatch logs a loud,
+// specific warning rather than surfacing later as an opaque Soroban error.
+// Compatibility model: same major version = safe; different major = verify
+// manually against arbiter-contract's breaking-change definition.
+export const contractCompatibility = Object.freeze({
+  version: process.env.COMPATIBLE_CONTRACT_VERSION || '',
+  wasmHash: (process.env.COMPATIBLE_CONTRACT_WASM_HASH || '').toLowerCase(),
+});
 
 export const config = Object.freeze({
   port: num(process.env.PORT, 4000),
@@ -132,16 +123,15 @@ export const config = Object.freeze({
   platformSecret: process.env.PLATFORM_SECRET || '',
   platformAddress: process.env.PLATFORM_ADDRESS || '',
 
-function parseApiChangelog(raw) {
-  if (raw === undefined || raw === null || raw === '') return DEFAULT_API_CHANGELOG;
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : DEFAULT_API_CHANGELOG;
-  } catch {
-    console.warn('[config] API_CHANGELOG_JSON is not valid JSON — falling back to the built-in changelog');
-    return DEFAULT_API_CHANGELOG;
-  }
-}
+  // Pinned arbiter-contract release this backend expects (see
+  // contractCompatibility above and contractVersionCheck.js).
+  compatibleContractVersion: contractCompatibility.version,
+  compatibleContractWasmHash: contractCompatibility.wasmHash,
+
+  // Must match the timeout_ledgers the contract was actually initialize()'d
+  // with — this copy is for display/UX only (e.g. "auto-refund available
+  // after ledger N"); the contract enforces its own stored value regardless.
+  timeoutLedgers: num(process.env.TIMEOUT_LEDGERS, 100),
 
 // API version negotiation (#136). Additive, not a rewrite: every existing
 // unversioned route in server.js keeps working unchanged and is treated as
@@ -190,29 +180,31 @@ export function negotiateApiVersion({ path = '', accept = '' } = {}) {
   return { version: requested, explicit: true };
 }
 
-// Contract-address rotation (#137). `config.contractId` used to be a single
-// frozen env-var-driven string, so a contract redeployment required a full
-// backend restart to reload it. It is now a live-reloadable value: the
-// frozen `config` object still exposes `contractId` for backward
-// compatibility, but every call site that must observe a rotation reads it
-// through `getContractId()` instead of capturing the value once.
-//
-// `rotateContractId()` swaps the live value atomically (a single assignment,
-// so no reader can observe a torn/partial value) and returns the previous id
-// so callers can log/audit the cutover. Rotation is intentionally a plain
-// in-process operation — the serial admin-call queue in stellarClient.js is
-// responsible for draining in-flight calls against the old id before any new
-// call uses it.
-//
-// Multi-contract support (#138) generalizes this: instead of exactly one
-// active contract, a set of contract instances can be configured, each with
-// its own admin key and its own serial admin-call queue (two instances that
-// share a signing key don't need two queues, but independent keys do — see
-// stellarClient.js). A new question is routed to one instance at
-// `issueChallenge()` time and that choice is recorded in its stashed
-// pendingQuestions record so verify/dispatch/resolve/refund all resolve the
-// same instance. Selection is deliberately random/round-robin in v1 — no
-// capacity awareness (explicitly out of scope).
+  // Cross-instance quorum collection (#160). When more than one backend
+  // instance is running, a question's collector lives in the memory of
+  // whichever instance dispatched it, but an answer for that question can
+  // arrive at any instance a worker happens to be connected to. Answers are
+  // therefore routed over Redis pub/sub: the owning instance subscribes to
+  // `quorum:answers:<questionId>` and any instance that receives an answer
+  // for a question it does not own publishes it there instead of dropping
+  // it. Pub/sub (not Streams) is deliberate: answers are only useful while
+  // the collector is still open, so replay/ordering guarantees buy nothing
+  // here, and the simpler transport keeps the failure modes small. The
+  // channel prefix is configurable so tests can namespace channels against a
+  // shared fake Redis without colliding with a real deployment.
+  quorum: Object.freeze({
+    channelPrefix: process.env.QUORUM_CHANNEL_PREFIX || 'quorum:answers:',
+    // How long an owning instance waits for a cross-instance answer before
+    // treating the question as orphaned and letting the existing TTL/timeout
+    // path refund it. Bounded by pendingQuestionTtlMs so a dead dispatcher
+    // can never hold a question open longer than the normal pending TTL.
+    answerTimeoutMs: num(process.env.QUORUM_ANSWER_TIMEOUT_MS, 30_000),
+  }),
+
+  // Comma-separated list of allowed CORS origins, e.g.
+  // "https://app.example.com,https://demo.example.com". Defaults to '*'
+  // (wide open) for local dev — lock this down for any real deployment.
+  allowedOrigins: (process.env.ALLOWED_ORIGINS || '*').split(',').map((s) => s.trim()).filter(Boolean),
 
 // Parses the multi-contract configuration. Accepts either:
 //   CONTRACT_INSTANCES_JSON='[{"id":"C...","adminKey":"S..."}, ...]'
@@ -272,17 +264,6 @@ function parseContractInstances() {
   worker: Object.freeze({
     rateLimitMaxConnections: num(process.env.WORKER_RATE_LIMIT_MAX_CONNECTIONS, 5),
     rateLimitWindowMs: num(process.env.WORKER_RATE_LIMIT_WINDOW_MS, 60_000),
-    minAnswersBeforeReputationGate: num(process.env.WORKER_MIN_ANSWERS_BEFORE_REPUTATION_GATE, 5),
-    minMatchRatio: num(process.env.WORKER_MIN_MATCH_RATIO, 0.2),
-    // Once a worker crosses minAnswersBeforeReputationGate (has real accrued
-    // earnings/reputation on the line), they must maintain at least this much
-    // on-chain stake to keep receiving new questions — closes the "unstake to
-    // zero, then misbehave for free" gap found pressure-testing the netting
-    // engine. Past Owed earnings are never touched by this; it only gates
-    // future dispatch eligibility. 0 (default) preserves today's behavior.
-    minStakeStroops: BigInt(process.env.WORKER_MIN_STAKE_STROOPS || '0'),
-  }),
+    minAnswersBeforeReputationGate: num(process.env.WORKER_MIN_ANSWERS_BEF
 
-  // Every one of these endpoints
-
-/* … truncated 708 chars — edit only what you need near the top … */
+/* … truncated 1386 chars — edit only what you need near the top … */
