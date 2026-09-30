@@ -7,47 +7,45 @@ import { getStakeOnChain, getOwedOnChain } from './stellarClient.js';
 import { getHorizon } from './sponsor.js';
 import { config } from './config.js';
 import { stroopsToUsdc } from './pricing.js';
-import { evaluateLoyaltyTier } from './loyalty.js';
-import { createAccount, store } from './billing.js';
+import { getClient } from './reconcile.js';
 
 const PLATFORM_FEE_BPS = 2000n; // mirrors contracts/oracle-escrow/src/lib.rs's PLATFORM_FEE_BPS
 const BPS_DENOM = 10_000n;
 
-/** Durable, listable audit store for /admin/* actions. Follows jobs.js's
- * append-and-index pattern: one record per action plus a bounded index used
- * for listing. Kept in-memory here (same durability model as the rest of
- * this backend's stores) so an operator can query recent admin activity
- * rather than only the transient pino request line. */
-const AUDIT_LOG_MAX = 1000;
-const auditLog = [];
-
-/** Records a single /admin/* call. Called for every admin route invocation,
- * including rejected (401/503) ones, so the log can't be gamed by a caller
- * who knows a call will fail. Emits a jobLogger()-style child log line for
- * live tailing and appends a durable record for the /admin/audit-log listing. */
-export function recordAdminAction({ route, method, status, actor = 'shared-token' } = {}) {
-  const entry = {
-    timestamp: Date.now(),
-    route,
-    method,
-    status,
-    actor,
-  };
-  auditLog.push(entry);
-  if (auditLog.length > AUDIT_LOG_MAX) auditLog.splice(0, auditLog.length - AUDIT_LOG_MAX);
-  jobLogger({ route, method, status }).info('admin action');
-  return entry;
-}
-
-/** Most-recent-first page of recorded /admin/* actions, following
- * listTransactions()'s limit/offset pagination shape. */
-export async function listAuditLog({ limit = 50, offset = 0 } = {}) {
-  const recent = auditLog.slice().reverse();
-  return {
-    total: recent.length,
-    entries: recent.slice(offset, offset + limit),
-  };
-}
+/** Tool-forced Claude call, structurally modeled on reconcile.js's
+ * REPORT_CONSENSUS_TOOL / reconcileWithClaude() pattern: a single tool whose
+ * input_schema is the postmortem's structured shape, forced via tool_choice
+ * so the model can only answer by filling that schema in. */
+export const REPORT_POSTMORTEM_TOOL = {
+  name: 'report_postmortem',
+  description:
+    'Draft a structured incident postmortem from a set of correlated log lines.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      summary: { type: 'string', description: 'One-paragraph incident summary.' },
+      timeline: {
+        type: 'array',
+        description: 'Ordered incident timeline derived from the log lines.',
+        items: {
+          type: 'object',
+          properties: {
+            at: { type: 'string', description: 'Timestamp or log position of the event.' },
+            event: { type: 'string', description: 'What happened at this point.' },
+          },
+          required: ['at', 'event'],
+        },
+      },
+      rootCause: { type: 'string', description: 'Best-supported root cause, or "unknown".' },
+      affectedJobs: {
+        type: 'array',
+        description: 'Job ids implicated in the incident.',
+        items: { type: 'string' },
+      },
+    },
+    required: ['summary', 'timeline', 'rootCause', 'affectedJobs'],
+  },
+};
 
 /** Most-recent-first page of every job this backend has ever created,
  * regardless of payer/worker — the admin analogue of the payer-scoped
@@ -238,74 +236,76 @@ export async function listAnchorKyc({ limit = DEFAULT_LIMIT, offset = 0 } = {}) 
   return { total: addresses.length, kyc: rows.filter(Boolean) };
 }
 
-/**
- * Session recording/replay for admin console actions (#132).
- *
- * This is backend API-call recording, NOT full UI session replay: this repo
- * contains no admin console frontend to instrument, so there are no mouse
- * movements or rendered screens to capture. What we can own is the ordered
- * sequence of admin API calls taken during an incident, which is exactly
- * what #129's audit log already records — this extends that log with the
- * full (redacted) request context needed to reconstruct the sequence,
- * rather than introducing a second, parallel recording mechanism.
- *
- * Redaction is applied at write time by the audit log itself, using the
- * same REDACT_CONFIG that logger.js uses to strip Authorization/cookie
- * headers, so no sensitive header or body field is ever persisted here.
- *
- * Returns the recorded calls for one admin session as an ordered
- * (oldest-first) list, so an operator can replay the sequence of actions
- * that led up to a ticket. `sessionId` is the per-caller session identifier
- * attributed by #131's role-based admin permissions; when omitted, the
- * caller's own session is used.
- */
-export async function getSessionRecording({ sessionId, limit = 200 } = {}) {
-  const entries = await getAuditLog({ sessionId, limit });
-  const calls = entries
-    .filter((e) => e.sessionId === sessionId)
-    .sort((a, b) => a.timestamp - b.timestamp)
-    .map((e) => ({
-      timestamp: e.timestamp,
-      method: e.method,
-      path: e.path,
-      status: e.status,
-      adminId: e.adminId ?? null,
-      role: e.role ?? null,
-      request: e.request ?? null,
-      response: e.response ?? null,
-    }));
-
-  return {
-    sessionId,
-    // Explicitly documented so consumers don't mistake this for UI replay.
-    kind: 'api-call-recording',
-    note: 'Backend API-call sequence only; no admin frontend exists in this repo for UI-level replay.',
-    total: calls.length,
-    calls,
-  };
+/** Operator override for the anomaly auto-suspend (issue #153): clears the
+ * suspension flag on an account so a wrongly-suspended key resumes
+ * resolving. Gated behind requireAdmin at the route layer, same as every
+ * other /admin/* handler. */
+export async function unsuspendKey(accountId) {
+  return unsuspendAccount(accountId);
 }
 
-/**
- * Explicit per-route role assignments for every /admin/* route.
- *
- * Every route today is read-only, so all are gated at `readonly` — a
- * read-only operator can call them, and a full-admin credential can too
- * (requireAdmin('readonly') accepts either role). Mutating admin routes
- * (e.g. #118 category CRUD, #123 review-queue approvals, #124 disputes)
- * must be registered here as `full` so a read-only credential is rejected
- * with 403 server-side, not merely hidden in a UI.
- *
- * `method` is the HTTP verb; `path` is the Express path as mounted under
- * /admin. Keeping this table explicit (rather than inferring from the
- * handler) is what makes the role assignment auditable per-route.
- */
-export const ADMIN_ROUTE_ROLES = [
-  { method: 'get', path: '/transactions', role: 'readonly', handler: listTransactions },
-  { method: 'get', path: '/workers', role: 'readonly', handler: listWorkers },
-  { method: 'get', path: '/payers', role: 'readonly', handler: listPayers },
-  { method: 'get', path: '/treasury', role: 'readonly', handler: getTreasury },
-  { method: 'get', path: '/fee-revenue', role: 'readonly', handler: getFeeRevenue },
-  { method: 'get', path: '/anchor-payouts', role: 'readonly', handler: listAnchorPayouts },
-  { method: 'get', path: '/anchor-kyc', role: 'readonly', handler: listAnchorKyc },
-  { method: 'get', path: '/sessions/:sessionId/recording', role: 'readonly', handler: getSessionRecording },
-];
+/** Filters a slice of structured JSON log lines down to the ones correlated
+ * with an incident: an optional [from, to] time range and/or a job id. Log
+ * lines are the pino JSON objects logger.js already emits (request-id /
+ * job-id correlation fields), so this is a pure, unit-testable filter over
+ * a canned sample — no log-aggregator integration required. */
+export function selectIncidentLogs(logs, { from, to, jobId } = {}) {
+  return (logs || []).filter((line) => {
+    if (jobId && line.jobId !== jobId && line['job-id'] !== jobId) return false;
+    const at = line.time ?? line.timestamp;
+    if (from && at != null && at < from) return false;
+    if (to && at != null && at > to) return false;
+    return true;
+  });
+}
+
+/** Turns a set of correlated log lines into a structured postmortem draft
+ * via a tool-forced Claude call, modeled on reconcile.js's
+ * reconcileWithClaude(). Never throws: on any Claude failure (missing key,
+ * timeout, malformed tool output) it resolves to a clearly-marked fallback
+ * so an operator always gets a response and the process never sees an
+ * unhandled rejection. */
+export async function generatePostmortem(logs, { from, to, jobId } = {}) {
+  const selected = selectIncidentLogs(logs, { from, to, jobId });
+  const fallback = {
+    generated: false,
+    error: 'draft generation failed, see raw logs',
+    logCount: selected.length,
+    logs: selected,
+  };
+
+  let client;
+  try {
+    client = getClient();
+  } catch {
+    return fallback;
+  }
+  if (!client) return fallback;
+
+  try {
+    const message = await client.messages.create({
+      model: config.anthropic.model,
+      max_tokens: 2048,
+      tools: [REPORT_POSTMORTEM_TOOL],
+      tool_choice: { type: 'tool', name: REPORT_POSTMORTEM_TOOL.name },
+      messages: [
+        {
+          role: 'user',
+          content:
+            'Draft an incident postmortem from these correlated log lines. ' +
+            'Use only what the logs support; mark anything uncertain as unknown.\n\n' +
+            JSON.stringify(selected),
+        },
+      ],
+    });
+
+    const toolUse = (message.content || []).find(
+      (block) => block.type === 'tool_use' && block.name === REPORT_POSTMORTEM_TOOL.name,
+    );
+    if (!toolUse?.input) return fallback;
+
+    return { generated: true, logCount: selected.length, ...toolUse.input };
+  } catch {
+    return fallback;
+  }
+}

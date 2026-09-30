@@ -34,5 +34,10 @@ export async function resolveApiKey(req) {
   if (!rawKey) return null;
 
   const record = await store.get(`apikey:${hashApiKey(rawKey)}`);
-  return record ? record.accountId : null;
+  if (!record) return null;
+
+  const account = await store.get(`account:${record.accountId}`);
+  if (account && account.suspended) return null;
+
+  return record.accountId;
 }

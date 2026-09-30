@@ -16,21 +16,12 @@ import { recordPaymentReversal } from './paymentReversals.js';
  * credit and how much of it they have, never the on-chain settlement
  * itself.
  *
- * Multiple processors (Stripe, PayPal, Coinbase Commerce) implement the
- * same processor-agnostic interface below — createCheckoutSession() and
- * verifyAndParseWebhook() — mirroring how store.js exposes MemoryStore and
- * RedisStore behind one `store` export. The Stripe path is the original
- * concrete instance and is unchanged in behavior; the additional
- * processors are additive, not a replacement.
- */
-
-/**
- * Bounded retry/timeout policy for the outbound Stripe checkout call,
- * matching the shape of HORIZON_RETRY_OPTS in sponsor.js. The Stripe SDK's
- * own network retry is disabled (maxNetworkRetries: 0) so this is the
- * single, uniform retry loop for the call — the same choice round 5 made
- * for Claude in reconcile.js's getClient(), rather than layering a second,
- * redundant retry loop on top of the SDK's default.
+ * Enterprise customers billed after the fact (net-30 invoicing) invert the
+ * prepay-then-consume model: usage happens first, the bill comes later, and
+ * accruing a balance owed is the entire point. Such accounts are marked
+ * invoice-billed (see setInvoiceBilled/isInvoiceBilled) and their usage is
+ * accumulated in a running total (recordInvoiceUsage) that is never
+ * decremented by consumption, so a periodic report can be built from it.
  */
 const STRIPE_RETRY_OPTS = { attempts: 2, timeoutMs: 8000, label: 'stripe.checkout.sessions.create' };
 
@@ -91,7 +82,7 @@ async function createAccount() {
   const rawKey = generateApiKey();
   // Durable, no TTL — same as every other identity record in this codebase
   // (worker/payer index entries, reputation).
-  await store.set(`account:${accountId}`, { createdAt: Date.now() });
+  await store.set(`account:${accountId}`, { createdAt: Date.now(), suspended: false });
   await store.set(`apikey:${hashApiKey(rawKey)}`, { accountId });
   await store.set(`account-key:${accountId}`, hashApiKey(rawKey));
   return { accountId, rawKey };
@@ -127,22 +118,13 @@ export async function getCreditBalanceStroops(accountId) {
  * never go negative and a customer can never be charged more than their
  * balance covers, without needing to predict the exact price in advance.
  *
- * The reservation is recorded durably (keyed by questionId) BEFORE the
- * on-chain charge runs, so a crash between askMetered() and
- * settleReservation() leaves a recoverable "pending reservation" record
- * instead of a permanently over-debited balance — see
- * reconcilePendingReservations().
+ * Invoice-billed accounts deliberately bypass this path (see oracle.js):
+ * going negative — accruing a balance owed — is the entire point for them.
  */
-export async function reserveCredit(accountId, maxStroops, questionId) {
+export async function reserveCredit(accountId, maxStroops) {
   const ok = await store.decrIfAtLeast(`credit:${accountId}`, maxStroops);
-  if (ok && questionId) {
-    await store.set(`reservation:${questionId}`, {
-      accountId,
-      reservedStroops: maxStroops,
-      questionId,
-      createdAt: Date.now(),
-    });
-  }
+  if (ok) billingReservationCount.inc({ outcome: 'reserved' });
+  else billingReservationCount.inc({ outcome: 'insufficient' });
   return ok;
 }
 
@@ -154,29 +136,7 @@ export async function reserveCredit(accountId, maxStroops, questionId) {
 export async function settleReservation(accountId, reservedStroops, actualStroops, questionId) {
   const refund = reservedStroops - actualStroops;
   if (refund > 0) await store.incrBy(`credit:${accountId}`, refund);
-  if (questionId) await store.del(`reservation:${questionId}`);
-}
-
-/**
- * Startup/periodic reconciliation for the crash window between
- * reserveCredit() and settleReservation(). For each pending reservation:
- *  - if the associated job already recorded a final amountStroops, settle
- *    against that real charge (refunding the unused difference);
- *  - if no job was ever created, refund the reservation in full.
- * `getJob` is injected (jobs.js) to avoid a circular import; it returns the
- * job record or null. Idempotent: settleReservation() deletes the record.
- */
-export async function reconcilePendingReservations(getJob) {
-  const keys = await store.keys('reservation:*');
-  for (const key of keys) {
-    const reservation = await store.get(key);
-    if (!reservation) continue;
-    const { accountId, reservedStroops, questionId } = reservation;
-    const job = getJob ? await getJob(questionId) : null;
-    const actualStroops = job && Number.isFinite(job.amountStroops) ? job.amountStroops : 0;
-    await settleReservation(accountId, reservedStroops, actualStroops, questionId);
-    logger.info({ questionId, accountId, actualStroops }, 'reconciled abandoned credit reservation');
-  }
+  billingSettlementCount.inc({ outcome: actualStroops > 0 ? 'charged' : 'refunded' });
 }
 
 /** Creates a fresh account (and its one API key) and a Stripe Checkout
@@ -616,4 +576,53 @@ async function debitCreditFloored(accountId, stroops) {
     if (await store.decrIfAtLeast(`credit:${accountId}`, take)) return take;
   }
   return 0;
+}
+
+/**
+ * Per-customer usage analytics. Unlike stats.js's incrementStat() counters
+ * (global, platform-wide, sandbox-excluded), these are keyed per account so
+ * a customer can see their own per-endpoint/per-tier call patterns via
+ * GET /billing/usage. Keyed usage:{accountId}:{endpoint}:{tier}:{day} so a
+ * rolling window can be read back without scanning the whole keyspace.
+ *
+ * Sandbox traffic is excluded by the caller (server.js), consistent with
+ * how stats.js already excludes it from platform-wide numbers.
+ */
+const USAGE_WINDOW_DAYS = 30;
+
+function usageDay(ts = Date.now()) {
+  return new Date(ts).toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+}
+
+/** Records one API call for an account. Called from the resolveApiKey()-
+ * gated request flow in server.js's POST /oracle, alongside the existing
+ * incrementStat() calls. */
+export async function recordUsage(accountId, endpoint, tier, ts = Date.now()) {
+  if (!accountId || !endpoint || !tier) return;
+  await store.incrBy(`usage:${accountId}:${endpoint}:${tier}:${usageDay(ts)}`, 1);
+}
+
+/**
+ * Reads the pooled fiat balance for the /metrics endpoint (issue #162).
+ * Returns null when billing isn't configured so the metrics route can skip
+ * the gauge entirely rather than reporting a misleading zero. The balance
+ * itself is read from the same store key the on-chain pool accounting
+ * already maintains; this is a read-only accessor, not a new source of
+ * truth.
+ */
+export async function getFiatPoolBalanceStroops() {
+  if (!isBillingConfigured()) return null;
+  const balance = await store.get(`pool:${config.billing.fiatPoolAddress}`);
+  return balance || 0;
+}
+
+/**
+ * Refreshes the fiat-pool-balance gauge. Called by the /metrics handler
+ * before scraping so the gauge reflects the current pool rather than a
+ * stale value from process start. No-op when billing is unconfigured.
+ */
+export async function refreshFiatPoolBalanceMetric() {
+  const balance = await getFiatPoolBalanceStroops();
+  if (balance === null) return;
+  fiatPoolBalanceStroops.set(balance);
 }

@@ -29,6 +29,8 @@ import { getStashedQuestion, nextQuestionId } from './pendingQuestions.js';
 import { getOwedOnChain, getStakeOnChain } from './stellarClient.js';
 import { askMetered, getMeteredBalance, depositInstructions } from './metered.js';
 import { getLeaderboard } from './leaderboard.js';
+import { getWorkerDashboard } from './workerAnalytics.js';
+import { getGamificationProfile, getXpLeaderboard, badgeCatalog } from './gamification.js';
 import { stroopsToUsdc, resolveTier, MAX_SURGE_MULTIPLIER } from './pricing.js';
 import { checkRateLimit } from './rateLimit.js';
 import { issueSandboxChallenge, startSandboxFulfillment } from './sandbox.js';
@@ -45,6 +47,27 @@ import { registerWebhook, listWebhooks, deleteWebhook, WebhookError } from './we
 import { logger, httpLogger } from './logger.js';
 import { getProvenance } from './provenance.js';
 import { enforceSecurityPosture } from './securityPosture.js';
+import {
+  getAutoWithdrawSettings,
+  setAutoWithdrawSettings,
+  deleteAutoWithdrawSettings,
+  checkAutoWithdraw,
+  submitAutoWithdraw,
+  startAutoWithdrawSweep,
+  AutoWithdrawError,
+} from './autoWithdraw.js';
+import { recordWorkerWithdrawal } from './earnings.js';
+import {
+  parseTaxYear,
+  getTaxProfile,
+  saveTaxProfile,
+  buildTaxSummary,
+  buildAllTaxSummaries,
+  listTaxYears,
+  taxSummaryToCsv,
+  taxSummariesToCsv,
+  TaxReportError,
+} from './taxReport.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -63,6 +86,19 @@ const app = express();
 // further context (questionId, workerId, etc.) to that same request's
 // trace. Placed before every other middleware so nothing is unlogged.
 app.use(httpLogger);
+
+// Request count/latency by matched route for GET /metrics (see metrics.js
+// and ops/observability/). Before every route so nothing is uncounted —
+// including requests failed by the fault injector just below.
+app.use(metricsMiddleware);
+
+// Alert drill only (scripts/alert-drill.js); securityPosture.js refuses to
+// start a production deployment with this on.
+const faultInjector = config.faultInjection ? createFaultInjector() : null;
+if (faultInjector) {
+  logger.warn('ARBITER_FAULT_INJECTION=true: /admin/faults can inject HTTP errors and latency');
+  app.use(faultInjector.middleware);
+}
 
 // Security response headers on every response (API and static UI alike).
 app.use(securityHeadersMiddleware());
@@ -107,9 +143,38 @@ function rateLimited(bucket, keyFn) {
 }
 const byIp = (req) => req.ip;
 
+app.get('/metrics', metricsHandler({ token: config.metrics.token }));
+
 app.get('/health', (req, res) => {
   res.json({ ok: true, onlineWorkers: onlineWorkerCount(), contractId: config.contractId });
 });
+
+// Public, like /health: the dispatch pause in effect (if any) and every
+// scheduled maintenance/holiday window still ahead, so clients and workers
+// can plan around them. See maintenanceWindows.js.
+app.get('/maintenance', async (req, res) => {
+  const now = Date.now();
+  const [pause, upcoming] = await Promise.all([getDispatchPause(now), listUpcomingWindows(now)]);
+  res.json({
+    dispatchPaused: Boolean(pause),
+    ...(pause ? { reason: pause.reason, resumesAt: new Date(pause.resumesAt).toISOString() } : {}),
+    windows: upcoming.map(serializeWindow),
+  });
+});
+
+function serializeWindow(w) {
+  return { ...w, startsAt: new Date(w.startsAt).toISOString(), endsAt: new Date(w.endsAt).toISOString() };
+}
+
+/** 503 + Retry-After for a request that would create a question while
+ * dispatch is paused. Returns true if it responded. */
+async function rejectIfDispatchPaused(res) {
+  const pause = await getDispatchPause();
+  if (!pause) return false;
+  res.set('Retry-After', String(Math.max(1, Math.ceil((pause.resumesAt - Date.now()) / 1000))));
+  res.status(503).json({ error: describePause(pause), reason: pause.reason, resumesAt: new Date(pause.resumesAt).toISOString() });
+  return true;
+}
 
 // Platform-wide, real-settlement-only counters — safe to surface publicly
 // (e.g. a landing page trust strip) since sandbox traffic never counts
@@ -128,6 +193,22 @@ app.get('/leaderboard', async (req, res) => {
     req.log.error({ err }, 'failed to build leaderboard');
     res.status(500).json({ error: 'failed to build leaderboard' });
   }
+});
+
+// Gamification XP leaderboard — see gamification.js. Includes non-established
+// workers, unlike /leaderboard, since XP is dominated by matched answers.
+app.get('/leaderboard/xp', async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+    res.json({ leaderboard: await getXpLeaderboard(limit) });
+  } catch (err) {
+    req.log.error({ err }, 'failed to build xp leaderboard');
+    res.status(500).json({ error: 'failed to build xp leaderboard' });
+  }
+});
+
+app.get('/gamification/badges', (req, res) => {
+  res.json({ badges: badgeCatalog() });
 });
 
 app.get('/stats', async (req, res) => {
@@ -190,6 +271,14 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
   // downstream (dispatch, reconcile, settle) is the identical pipeline,
   // funded from the platform's own pooled balance instead of the caller's.
   const apiKeyAccountId = await resolveApiKey(req);
+
+  // Maintenance windows: refuse to CREATE a question while dispatch is
+  // paused, before anyone is charged. Step 2 of the classic flow is let
+  // through on purpose — that payer has already paid, and startFulfillment
+  // refunds it instead of dispatching (see maintenanceWindows.js).
+  const createsQuestion = Boolean(apiKeyAccountId || payerAddress || !questionId || !paymentTx);
+  if (createsQuestion && (await rejectIfDispatchPaused(res))) return;
+
   if (apiKeyAccountId) {
     if (!question || typeof question !== 'string') {
       return res.status(400).json({ error: 'body.question (string) is required' });
@@ -442,6 +531,117 @@ app.delete('/payers/:address/pool/:worker', rateLimited('push', byIp), async (re
 });
 
 // ---------------------------------------------------------------------
+// Team/organization accounts — see teams.js. The caller is always a
+// Stellar address proven with a session token (POST /payers/:address/session),
+// sent as `address` + `token` in the JSON body or the query string, same as
+// the payer side of /webhooks. Role checks live in teams.js; these handlers
+// only authenticate and map TeamError to its HTTP status.
+// ---------------------------------------------------------------------
+
+const TEAM_AUTH_ERROR = 'a Stellar `address` and its session `token` are required — see POST /payers/:address/session';
+
+function resolveTeamActor(req) {
+  const address = req.body?.address ?? req.query.address;
+  const token = req.body?.token ?? req.query.token;
+  if (typeof address === 'string' && requiresAuth(address) && verifySessionToken(token) === address) return address;
+  return null;
+}
+
+function teamRoute(handler) {
+  return async (req, res) => {
+    const actor = resolveTeamActor(req);
+    if (!actor) return res.status(401).json({ error: TEAM_AUTH_ERROR });
+    try {
+      await handler(req, res, actor);
+    } catch (err) {
+      if (err instanceof TeamError) return res.status(err.status).json({ error: err.message });
+      req.log.error({ err }, 'team request failed');
+      res.status(500).json({ error: 'failed to process team request' });
+    }
+  };
+}
+
+// body: { address, token, name }
+app.post('/teams', rateLimited('push', byIp), teamRoute(async (req, res, actor) => {
+  res.status(201).json({ team: await createTeam(actor, req.body?.name) });
+}));
+
+app.get('/teams', teamRoute(async (req, res, actor) => {
+  res.json({ teams: await listTeamsFor(actor) });
+}));
+
+app.get('/teams/:teamId', teamRoute(async (req, res, actor) => {
+  res.json({ team: await requireTeamRole(req.params.teamId, actor, 'member') });
+}));
+
+// body: { address, token, name }
+app.patch('/teams/:teamId', rateLimited('push', byIp), teamRoute(async (req, res, actor) => {
+  res.json({ team: await renameTeam(req.params.teamId, actor, req.body?.name) });
+}));
+
+app.delete('/teams/:teamId', rateLimited('push', byIp), teamRoute(async (req, res, actor) => {
+  await deleteTeam(req.params.teamId, actor);
+  res.json({ ok: true, id: req.params.teamId });
+}));
+
+// body: { address, token, members: [address, ...], role?: 'member' | 'admin' }
+app.post('/teams/:teamId/members', rateLimited('push', byIp), teamRoute(async (req, res, actor) => {
+  const { members, role } = req.body || {};
+  res.json({ team: await addMembers(req.params.teamId, actor, members, role ?? 'member') });
+}));
+
+// body: { address, token, role: 'member' | 'admin' | 'owner' } — 'owner' transfers ownership.
+app.patch('/teams/:teamId/members/:member', rateLimited('push', byIp), teamRoute(async (req, res, actor) => {
+  res.json({ team: await setMemberRole(req.params.teamId, actor, req.params.member, req.body?.role) });
+}));
+
+// Remove a member, or leave (member === address). Credentials go in the
+// query string, same as DELETE /payers/:address/pool/:worker.
+app.delete('/teams/:teamId/members/:member', rateLimited('push', byIp), teamRoute(async (req, res, actor) => {
+  res.json({ team: await removeMember(req.params.teamId, actor, req.params.member) });
+}));
+
+// The team's combined question history: every member's own payer history
+// (GET /payers/:address/questions), merged, with the same spend buckets
+// plus a per-member breakdown. Any member may read it — sharing that
+// visibility is what a team is for.
+app.get('/teams/:teamId/questions', teamRoute(async (req, res, actor) => {
+  const team = await requireTeamRole(req.params.teamId, actor, 'member');
+  const perMember = await Promise.all(
+    team.members.map(async ({ address }) => {
+      const ids = await getPayerQuestionIds(address);
+      const jobs = await Promise.all(ids.map((id) => getJobStatus(id)));
+      return { address, summary: summarizePayerQuestions(ids, jobs) };
+    }),
+  );
+
+  const questions = perMember
+    .flatMap(({ address, summary }) => summary.questions.map((q) => ({ ...q, askedBy: address })))
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const totalSpendStroops = perMember.reduce((sum, m) => sum + m.summary.totalSpendStroops, 0n);
+  const resolved = perMember.reduce((n, m) => n + m.summary.resolved, 0);
+  const settled = perMember.reduce((n, m) => n + m.summary.settled, 0);
+  const { spendByCategory, spendByDay } = bucketPayerSpend(questions);
+
+  res.json({
+    teamId: team.id,
+    questions,
+    totalTracked: perMember.reduce((n, m) => n + m.summary.totalTracked, 0),
+    totalSpendStroops: totalSpendStroops.toString(),
+    totalSpend: stroopsToUsdc(totalSpendStroops),
+    successRate: settled > 0 ? resolved / settled : null,
+    spendByCategory,
+    spendByDay,
+    spendByMember: perMember.map(({ address, summary }) => ({
+      address,
+      questions: summary.questions.length,
+      spendStroops: summary.totalSpendStroops.toString(),
+      spend: stroopsToUsdc(summary.totalSpendStroops),
+    })),
+  });
+}));
+
+// ---------------------------------------------------------------------
 // Billing — the non-crypto onramp. /billing/webhook is registered above,
 // before express.json(), since it needs the raw request body. Everything
 // here is a no-op 503 when billing isn't configured (see
@@ -614,6 +814,13 @@ app.post('/sponsor/withdraw', rateLimited('sponsor', byIp), async (req, res) => 
     const result = beneficiaryAddress
       ? await feeBumpWithdrawTo(xdr, workerAddress, beneficiaryAddress, amountStroops)
       : await feeBumpWithdraw(xdr, workerAddress, amountStroops);
+    // The relay only lands a transaction the worker signed that matches
+    // this exact withdraw call, so a success here is a real withdrawal.
+    await recordWorkerWithdrawal(workerAddress, {
+      amountStroops,
+      txHash: result.hash,
+      beneficiaryAddress: beneficiaryAddress || null,
+    }).catch((err) => req.log.error({ err }, 'failed to record withdrawal in earnings ledger'));
     res.json(result);
   } catch (err) {
     req.log.error({ err }, 'sponsor withdraw failed');
@@ -654,6 +861,152 @@ app.get('/workers/:address/reputation', async (req, res) => {
   const rep = await getReputation(req.params.address);
   const matchRatio = rep.total > 0 ? rep.matched / rep.total : null;
   res.json({ matched: rep.matched, total: rep.total, matchRatio });
+});
+
+// Worker performance analytics dashboard — daily answered/matched buckets
+// over a trailing window, trend vs. the previous window, streaks, and rank.
+// Public like /reputation: it's the same outcome data, just broken down by
+// day (see workerAnalytics.js).
+app.get('/workers/:address/analytics', async (req, res) => {
+  try {
+    res.json(await getWorkerDashboard(req.params.address, { window: req.query.days }));
+  } catch (err) {
+    req.log.error({ err }, 'worker analytics lookup failed');
+    res.status(500).json({ error: 'failed to build worker analytics' });
+  }
+});
+
+// XP, level, streaks and badges — derived from the same data as the
+// analytics above, never a separate ledger (see gamification.js).
+app.get('/workers/:address/gamification', async (req, res) => {
+  try {
+    const { newlyEarned, ...profile } = await getGamificationProfile(req.params.address);
+    res.json(profile);
+  } catch (err) {
+    req.log.error({ err }, 'worker gamification lookup failed');
+    res.status(500).json({ error: 'failed to build gamification profile' });
+  }
+});
+
+// ---------------------------------------------------------------------
+// Auto-withdraw and tax reporting. Every route here reads or changes a
+// worker's own settings or personal details, so all of them need a session
+// token for that address (POST /workers/:address/session), passed as
+// `Authorization: Bearer <token>`, a `token` body field, or a `token`
+// query param. Non-address worker ids are refused outright: they can't
+// hold withdrawable earnings (see workerAuth.js).
+// ---------------------------------------------------------------------
+
+function requireWorkerSession(req, res, next) {
+  const { address } = req.params;
+  if (!requiresAuth(address)) {
+    return res.status(400).json({ error: 'this endpoint needs a real Stellar worker address' });
+  }
+  const bearer = (req.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  const token = bearer || req.body?.token || req.query.token;
+  if (verifySessionToken(token) !== address) {
+    return res.status(401).json({ error: 'a valid session token for this address is required — see POST /workers/:address/session' });
+  }
+  next();
+}
+
+function sendDomainError(req, res, err, label) {
+  if (err instanceof AutoWithdrawError || err instanceof TaxReportError) {
+    return res.status(err.status).json({ error: err.message });
+  }
+  req.log.error({ err }, label);
+  res.status(500).json({ error: label });
+}
+
+app.get('/workers/:address/auto-withdraw', requireWorkerSession, async (req, res) => {
+  try {
+    res.json(await getAutoWithdrawSettings(req.params.address));
+  } catch (err) {
+    sendDomainError(req, res, err, 'failed to load auto-withdraw settings');
+  }
+});
+
+app.put('/workers/:address/auto-withdraw', rateLimited('push', byIp), requireWorkerSession, async (req, res) => {
+  const { enabled, thresholdStroops, beneficiaryAddress } = req.body || {};
+  try {
+    const settings = await setAutoWithdrawSettings(req.params.address, { enabled, thresholdStroops, beneficiaryAddress });
+    // Check straight away, so a worker already over their new threshold
+    // doesn't wait for the next settlement or sweep. Best-effort only.
+    const check = settings.enabled
+      ? await checkAutoWithdraw(req.params.address).catch((err) => {
+          req.log.warn({ err }, 'initial auto-withdraw check failed');
+          return null;
+        })
+      : null;
+    res.json({ ...settings, check });
+  } catch (err) {
+    sendDomainError(req, res, err, 'failed to save auto-withdraw settings');
+  }
+});
+
+app.delete('/workers/:address/auto-withdraw', rateLimited('push', byIp), requireWorkerSession, async (req, res) => {
+  try {
+    await deleteAutoWithdrawSettings(req.params.address);
+    res.json({ ok: true });
+  } catch (err) {
+    sendDomainError(req, res, err, 'failed to delete auto-withdraw settings');
+  }
+});
+
+// Manual "check now" — the same check settlement and the sweep run. Costs
+// an RPC simulation or two, hence the sponsor-bucket rate limit.
+app.post('/workers/:address/auto-withdraw/check', rateLimited('sponsor', byIp), requireWorkerSession, async (req, res) => {
+  try {
+    res.json(await checkAutoWithdraw(req.params.address));
+  } catch (err) {
+    sendDomainError(req, res, err, 'auto-withdraw check failed');
+  }
+});
+
+// The worker signs the pending transaction (GET .../auto-withdraw returns
+// its XDR) and posts it here to be fee-bumped and submitted.
+app.post('/workers/:address/auto-withdraw/submit', rateLimited('sponsor', byIp), requireWorkerSession, async (req, res) => {
+  const { signedXdr } = req.body || {};
+  if (!signedXdr) return res.status(400).json({ error: 'signedXdr is required' });
+  try {
+    res.json(await submitAutoWithdraw(req.params.address, signedXdr));
+  } catch (err) {
+    sendDomainError(req, res, err, 'auto-withdraw submit failed');
+  }
+});
+
+app.get('/workers/:address/tax-profile', requireWorkerSession, async (req, res) => {
+  const profile = await getTaxProfile(req.params.address);
+  if (!profile) return res.status(404).json({ error: 'no tax profile saved for this address' });
+  res.json(profile);
+});
+
+app.put('/workers/:address/tax-profile', rateLimited('push', byIp), requireWorkerSession, async (req, res) => {
+  try {
+    res.json(await saveTaxProfile(req.params.address, req.body || {}));
+  } catch (err) {
+    sendDomainError(req, res, err, 'failed to save tax profile');
+  }
+});
+
+app.get('/workers/:address/tax-years', requireWorkerSession, async (req, res) => {
+  res.json({ years: await listTaxYears(req.params.address) });
+});
+
+// ?year=2025 (defaults to last calendar year), ?format=csv for a download.
+app.get('/workers/:address/tax-summary', requireWorkerSession, async (req, res) => {
+  try {
+    const year = parseTaxYear(req.query.year);
+    const summary = await buildTaxSummary(req.params.address, year, { includeLines: true });
+    if (req.query.format === 'csv') {
+      res.set('Content-Type', 'text/csv; charset=utf-8');
+      res.set('Content-Disposition', `attachment; filename="arbiter-earnings-${year}-${req.params.address}.csv"`);
+      return res.send(taxSummaryToCsv(summary));
+    }
+    res.json(summary);
+  } catch (err) {
+    sendDomainError(req, res, err, 'failed to build tax summary');
+  }
 });
 
 // ---------------------------------------------------------------------
@@ -752,6 +1105,12 @@ app.post('/app/answer', rateLimited('answer', byIp), async (req, res) => {
   if (requiresAuth(workerId) && (await verifySession(token)) !== workerId) {
     return res.status(401).json({ error: 'a valid session token for this address is required — see POST /workers/:address/session' });
   }
+  // Checked again inside submitAnswer (the authoritative gate); screening
+  // here too just gives the worker a specific reason instead of a 409.
+  const screened = screenAnswer(answer);
+  if (!screened.ok) {
+    return res.status(422).json({ ok: false, error: `answer rejected by content filter: ${screened.reason}` });
+  }
   const accepted = submitAnswer(questionId, workerId, answer);
   if (!accepted) {
     return res.status(409).json({ ok: false, error: 'question is closed, expired, or already answered by this worker' });
@@ -760,10 +1119,10 @@ app.post('/app/answer', rateLimited('answer', byIp), async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// Admin/ops console — everything here is read-only and gated by
-// requireAdmin (see adminAuth.js). No rate limit: these calls don't spend
-// a network fee or write state the way /sponsor/* and /oracle do, and the
-// bearer-token gate is the actual access control.
+// Admin/ops console — gated by requireAdmin (see adminAuth.js). Read-only
+// except for scheduling maintenance windows. No rate limit: these calls
+// don't spend a network fee, and the bearer-token gate is the actual
+// access control.
 // ---------------------------------------------------------------------
 
 app.get('/admin/transactions', requireAdmin, async (req, res) => {
@@ -845,12 +1204,53 @@ app.post('/anchor/report', rateLimited('push', byIp), async (req, res) => {
   }
 });
 
+if (faultInjector) mountFaultRoutes(app, faultInjector, requireAdmin);
+
+// Runs the chain-driven recovery sweep on demand (disasterRecovery.js;
+// docs/runbooks/disaster-recovery.md). `?dryRun=true` classifies every
+// on-chain Pending question without refunding anything.
+app.post('/admin/recovery/sweep', requireAdmin, async (req, res) => {
+  const dryRun = req.query.dryRun === 'true';
+  try {
+    const report = await runRecoverySweep({
+      store,
+      deps: await defaultRecoveryDeps(),
+      options: { ...config.recovery, dryRun },
+    });
+    if (!report) return res.status(409).json({ error: 'another recovery sweep is already running' });
+    res.json(report);
+  } catch (err) {
+    req.log.error({ err }, 'recovery sweep failed');
+    res.status(502).json({ error: `recovery sweep failed: ${err.message}` });
+  }
+});
+
 // Serve the built worker UI from the same Express app.
 app.use(express.static(path.join(__dirname, '../../app/dist')));
 
 app.listen(config.port, () => {
+  startAutoWithdrawSweep();
   logger.info(
     { port: config.port, contractId: config.contractId || null, network: config.networkPassphrase, allowedOrigins: config.allowedOrigins },
     `Arbiter backend listening on :${config.port}`,
   );
+
+  buildInfo.set({ version: process.env.npm_package_version || 'unknown', network: config.networkPassphrase }, 1);
+  startHealthProbes({
+    store,
+    getLatestLedgerSequence,
+    getKnownJobIds,
+    getJob,
+    getOnlineWorkerCount: onlineWorkerCount,
+    intervalMs: config.metrics.probeIntervalMs,
+    jobScanIntervalMs: config.metrics.jobScanIntervalMs,
+  });
+
+  // After a total state loss this is what gets stranded payers refunded:
+  // the first sweep runs immediately on boot, against an empty store.
+  if (config.recovery.enabled && config.contractId && config.platformSecret) {
+    startRecoverySweeper({ store, intervalMs: config.recovery.intervalMs, options: config.recovery });
+  } else {
+    logger.warn('recovery sweep disabled (RECOVERY_SWEEP_ENABLED=false, or ORACLE_CONTRACT_ID/PLATFORM_SECRET unset)');
+  }
 });

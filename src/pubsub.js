@@ -1,6 +1,6 @@
-'use strict';
+import { store } from './store.js';
 
-const { getClient } = require('./store');
+const getClient = () => store.getClient();
 
 /**
  * Pub/sub abstraction mirroring store.js's Memory/Redis split.
@@ -11,7 +11,7 @@ const { getClient } = require('./store');
  * pub/sub so it never blocks the main client's command pipeline.
  */
 
-class MemoryPubSub {
+export class MemoryPubSub {
   constructor() {
     this.handlers = new Map();
   }
@@ -49,7 +49,7 @@ class MemoryPubSub {
   }
 }
 
-class RedisPubSub {
+export class RedisPubSub {
   constructor() {
     const base = getClient();
     if (!base) {
@@ -114,10 +114,8 @@ class RedisPubSub {
 
 let instance = null;
 
-function getPubSub() {
+export function getPubSub() {
   if (instance) return instance;
   instance = process.env.REDIS_URL ? new RedisPubSub() : new MemoryPubSub();
   return instance;
 }
-
-module.exports = { getPubSub, MemoryPubSub, RedisPubSub };

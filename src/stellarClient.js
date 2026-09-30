@@ -1,6 +1,7 @@
 import { Keypair, TransactionBuilder, Contract, Account, Address, nativeToScVal, scValToNative, rpc } from '@stellar/stellar-sdk';
 import { config } from './config.js';
 import { withRetry } from './retry.js';
+import { recordAdminInvocation } from './metrics.js';
 
 /** Chaos fault injection: env-gated, inert unless CHAOS_FAULT is set to a
  * recognized scenario. Follows config.js's "everything is an env var with a
@@ -32,6 +33,46 @@ export function getServer() {
     server = new rpc.Server(config.sorobanRpcUrl, { allowHttp: config.sorobanRpcUrl.startsWith('http://') });
   }
   return server;
+}
+
+/** Comma-separated list of configured RPC URLs, mirroring
+ * config.allowedOrigins' comma-split parsing convention. The first entry is
+ * the primary; the rest are ordered failover candidates. A single-URL
+ * configuration yields a one-element list, so no failover path is ever
+ * exercised. */
+function getRpcUrls() {
+  return String(config.sorobanRpcUrl || '')
+    .split(',')
+    .map((u) => u.trim())
+    .filter(Boolean);
+}
+
+const failoverServers = new Map();
+function getServerForUrl(url) {
+  if (!failoverServers.has(url)) {
+    failoverServers.set(url, new rpc.Server(url, { allowHttp: url.startsWith('http://') }));
+  }
+  return failoverServers.get(url);
+}
+
+/** Runs `fn(srv)` against the primary server, and if it throws (e.g. a
+ * withRetry-exhausted failure against a degraded provider), retries once
+ * against each subsequent configured URL before giving up. Failover happens
+ * only *before* a call starts — `fn` is re-invoked from scratch against the
+ * next server, never resumed mid-flight — so a mid-submission failover can
+ * never race the sequence number createSerialQueue() serializes over. */
+async function withServerFailover(fn) {
+  const urls = getRpcUrls();
+  let lastErr;
+  for (let i = 0; i < urls.length; i++) {
+    const srv = i === 0 ? getServer() : getServerForUrl(urls[i]);
+    try {
+      return await fn(srv);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
 }
 
 let adminKeypair = null;
@@ -98,35 +139,41 @@ export function vecOfAddresses(addresses) {
  * attempts / 10s each — this sits in the critical path of settling a
  * question, so it must fail fast enough to still hit the fail-closed
  * refund fallback promptly, not retry indefinitely.
+ *
+ * Failover is layered *outside* withRetry: the whole retried flow is
+ * re-run against the next configured URL only after the primary's retries
+ * are exhausted, so a failover attempt always starts with its own fresh
+ * getAccount() read against the server that will actually submit it.
  */
 async function runInvokeAsAdmin(method, scValArgs) {
-  return withRetry(
-    async () => {
-      const srv = getServer();
-      const admin = getAdminKeypair();
-      const account = await srv.getAccount(admin.publicKey());
-      const contract = new Contract(getContractId());
+  return withServerFailover((srv) =>
+    withRetry(
+      async () => {
+        const admin = getAdminKeypair();
+        const account = await srv.getAccount(admin.publicKey());
+        const contract = new Contract(config.contractId);
 
-      const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
-        .addOperation(contract.call(method, ...scValArgs))
-        .setTimeout(60)
-        .build();
+        const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
+          .addOperation(contract.call(method, ...scValArgs))
+          .setTimeout(60)
+          .build();
 
-      const prepared = await withChaosFault(`prepareTransaction:${method}`, () => srv.prepareTransaction(tx));
-      prepared.sign(admin);
+        const prepared = await srv.prepareTransaction(tx);
+        prepared.sign(admin);
 
-      const sendResult = await withChaosFault(`sendTransaction:${method}`, () => srv.sendTransaction(prepared));
-      if (sendResult.status === 'ERROR') {
-        throw new Error(`submit failed for ${method}: ${JSON.stringify(sendResult.errorResult ?? sendResult)}`);
-      }
+        const sendResult = await srv.sendTransaction(prepared);
+        if (sendResult.status === 'ERROR') {
+          throw new Error(`submit failed for ${method}: ${JSON.stringify(sendResult.errorResult ?? sendResult)}`);
+        }
 
-      const finalResult = await withChaosFault(`pollTransaction:${method}`, () => srv.pollTransaction(sendResult.hash));
-      if (finalResult.status !== 'SUCCESS') {
-        throw new Error(`${method} transaction ${sendResult.hash} did not succeed: ${finalResult.status}`);
-      }
-      return { hash: sendResult.hash, result: finalResult };
-    },
-    { attempts: 2, timeoutMs: 10_000, baseDelayMs: 300, label: `invokeAsAdmin(${method})` },
+        const finalResult = await srv.pollTransaction(sendResult.hash);
+        if (finalResult.status !== 'SUCCESS') {
+          throw new Error(`${method} transaction ${sendResult.hash} did not succeed: ${finalResult.status}`);
+        }
+        return { hash: sendResult.hash, result: finalResult };
+      },
+      { attempts: 2, timeoutMs: 10_000, baseDelayMs: 300, label: `invokeAsAdmin(${method})` },
+    ),
   );
 }
 
@@ -179,7 +226,16 @@ export function createSerialQueue() {
 const serializeAdminCall = createSerialQueue();
 
 function invokeAsAdmin(method, scValArgs) {
-  return serializeAdminCall(() => runInvokeAsAdmin(method, scValArgs));
+  return serializeAdminCall(() => runInvokeAsAdmin(method, scValArgs)).then(
+    (result) => {
+      recordAdminInvocation(method, true);
+      return result;
+    },
+    (err) => {
+      recordAdminInvocation(method, false);
+      throw err;
+    },
+  );
 }
 
 /** Rotates the contract id only after every admin call already queued
@@ -194,6 +250,40 @@ export async function resolveQuestion(questionId, matchingWorkerAddresses, losin
     u64Arg(questionId),
     vecOfAddresses(matchingWorkerAddresses),
     vecOfAddresses(losingWorkerAddresses),
+  ]);
+}
+
+/** Batch-aware variant of resolve(): settles several questions' worth of
+ * fee/slash bookkeeping in ONE platform-signed transaction, cutting the
+ * per-question serialization + network-fee cost that resolveQuestion()
+ * pays individually. Each entry carries its own matching/losing worker
+ * sets, so a batch can mix questions with different outcomes.
+ *
+ * The contract's resolve_batch() is expected to settle each member
+ * independently and return a per-question outcome vector (e.g. one of
+ * "resolved" / "not_pending" / "already_refunded"), so a single member
+ * losing the refund_timeout() race does NOT fail the whole batch — the
+ * caller inspects the returned outcomes and tags only the racing member
+ * as lost_race_to_timeout_refund. */
+export async function resolveQuestionsBatch(entries) {
+  const questionIds = entries.map((e) => u64Arg(e.questionId));
+  const matching = entries.map((e) => vecOfAddresses(e.matchingWorkerAddresses ?? []));
+  const losing = entries.map((e) => vecOfAddresses(e.losingWorkerAddresses ?? []));
+  return invokeAsAdmin('resolve_batch', [
+    nativeToScVal(questionIds, { type: 'Vec' }),
+    nativeToScVal(matching, { type: 'Vec' }),
+    nativeToScVal(losing, { type: 'Vec' }),
+  ]);
+}
+
+/** Batch-aware variant of refund(): force-refunds several questions in one
+ * platform-signed transaction. Mirrors resolveQuestionsBatch()'s
+ * per-question independence — a member already resolved or already
+ * refunded is reported in the returned outcome vector rather than
+ * aborting the whole batch. */
+export async function refundQuestionsBatch(questionIds) {
+  return invokeAsAdmin('refund_batch', [
+    nativeToScVal(questionIds.map((id) => u64Arg(id)), { type: 'Vec' }),
   ]);
 }
 
@@ -230,7 +320,7 @@ async function simulateReadOnly(method, scValArgs = []) {
   return withRetry(
     async () => {
       const srv = getServer();
-      const contract = new Contract(getContractId());
+      const contract = new Contract(config.contractId);
       // Simulation-only calls need a source account for a well-formed envelope
       // but never actually sign or submit, so any funded-looking public key works.
       const simSourceKey = config.platformAddress || Keypair.random().publicKey();
@@ -238,36 +328,82 @@ async function simulateReadOnly(method, scValArgs = []) {
 
       const tx = new TransactionBuilder(simSource, { fee: '100', networkPassphrase: config.networkPassphrase })
         .addOperation(contract.call(method, ...scValArgs))
-        .setTimeout(60)
+        .setTimeout(30)
         .build();
 
       const sim = await srv.simulateTransaction(tx);
-      if (sim.error) {
-        throw new Error(`simulate ${method} failed: ${sim.error}`);
-      }
+      if (sim.error) throw new Error(`simulate ${method} failed: ${sim.error}`);
       return sim;
     },
     { attempts: 2, timeoutMs: 10_000, baseDelayMs: 300, label: `simulateReadOnly(${method})` },
   );
 }
 
+/** Zero-fee simulated read — checks payment state without needing a signature. */
 export async function getQuestionOnChain(questionId) {
-  const sim = await simulateReadOnly('get_question', [u64Arg(questionId)]);
-  const retval = sim.result?.retval;
-  if (retval === undefined) return null;
-  return scValToNative(retval);
+  const native = await simulateReadOnly('get_question', [u64Arg(questionId)]);
+  if (!native) return null;
+  return {
+    payer: native.payer,
+    amount: BigInt(native.amount),
+    status: decodeStatus(native.status),
+    createdAt: Number(native.created_at),
+  };
 }
 
-export async function getWorkerOnChain(workerAddress) {
-  const sim = await simulateReadOnly('get_worker', [addressArg(workerAddress)]);
-  const retval = sim.result?.retval;
-  if (retval === undefined) return null;
-  return scValToNative(retval);
+export async function getTimeoutLedgersOnChain() {
+  return simulateReadOnly('get_timeout_ledgers');
 }
 
-export async function getPayerBalanceOnChain(payerAddress) {
-  const sim = await simulateReadOnly('get_payer_balance', [addressArg(payerAddress)]);
-  const retval = sim.result?.retval;
-  if (retval === undefined) return 0n;
-  return scValToNative(retval);
+export async function getOwedOnChain(workerAddress) {
+  const owed = await simulateReadOnly('get_owed', [addressArg(workerAddress)]);
+  return BigInt(owed ?? 0);
+}
+
+export async function getStakeOnChain(workerAddress) {
+  const stake = await simulateReadOnly('get_stake', [addressArg(workerAddress)]);
+  return BigInt(stake ?? 0);
+}
+
+export async function getBalanceOnChain(payerAddress) {
+  const balance = await simulateReadOnly('get_balance', [addressArg(payerAddress)]);
+  return BigInt(balance ?? 0);
+}
+
+/** Builds and prepares (simulates + assembles footprint/auth) the worker's
+ * OWN withdraw() or withdraw_to() call, with the worker's account as the
+ * source, and returns it UNSIGNED. The backend never signs this — the
+ * worker does, then it goes through the same /sponsor/withdraw-style
+ * fee-bump relay (sponsor.js), whose invoked-function check matches this
+ * call byte for byte since the args are built the same way. */
+export async function buildWorkerWithdrawTx(workerAddress, amountStroops, beneficiaryAddress = null, timeoutSeconds = 3600) {
+  const srv = getServer();
+  const account = await withRetry(() => srv.getAccount(workerAddress), {
+    attempts: 2,
+    timeoutMs: 5_000,
+    baseDelayMs: 200,
+    label: 'getAccount(worker)',
+  });
+  const contract = new Contract(config.contractId);
+  const op = beneficiaryAddress
+    ? contract.call('withdraw_to', addressArg(workerAddress), addressArg(beneficiaryAddress), i128Arg(amountStroops))
+    : contract.call('withdraw', addressArg(workerAddress), i128Arg(amountStroops));
+
+  const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
+    .addOperation(op)
+    .setTimeout(timeoutSeconds)
+    .build();
+
+  const prepared = await srv.prepareTransaction(tx);
+  return prepared.toXDR();
+}
+
+/** Refreshes storage TTL on a worker's Owed/Stake entries via the
+ * contract's permissionless touch() — no worker signature involved, so
+ * this can run on the platform's own admin key exactly like resolve()
+ * does. See touch()'s doc comment in lib.rs for why a periodic sweep needs
+ * to exist at all (a worker who earns once and never returns has no other
+ * way to keep their balance from archiving off-chain storage). */
+export async function touchWorker(workerAddress) {
+  return invokeAsAdmin('touch', [addressArg(workerAddress)]);
 }

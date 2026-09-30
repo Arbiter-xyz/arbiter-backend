@@ -45,6 +45,27 @@ function sessionSecret() {
 }
 const SESSION_SECRET = sessionSecret();
 
+// Graceful SESSION_SECRET rotation (#7): during a bounded grace window,
+// session verification also accepts tokens signed by the immediately-prior
+// secret (SESSION_SECRET_PREVIOUS). The window is measured from process
+// start (i.e. from when the rotation was deployed). 0 disables it.
+const SESSION_SECRET_PREVIOUS = process.env.SESSION_SECRET_PREVIOUS || '';
+const SESSION_SECRET_ROTATION_GRACE_MS = num(process.env.SESSION_SECRET_ROTATION_GRACE_MS, 0);
+const SESSION_SECRET_ROTATION_STARTED_AT = Date.now();
+
+function sessionSecrets() {
+  const secrets = [SESSION_SECRET];
+  if (
+    SESSION_SECRET_PREVIOUS &&
+    SESSION_SECRET_PREVIOUS !== SESSION_SECRET &&
+    SESSION_SECRET_ROTATION_GRACE_MS > 0 &&
+    Date.now() - SESSION_SECRET_ROTATION_STARTED_AT < SESSION_SECRET_ROTATION_GRACE_MS
+  ) {
+    secrets.push(SESSION_SECRET_PREVIOUS);
+  }
+  return secrets;
+}
+
 // Per-customer outbound webhook retry policy (#154). Shaped like retry.js's
 // withRetry(fn, { attempts, baseDelayMs, ... }) options so the delivery
 // worker from #56 reuses that exponential-backoff algorithm rather than a
@@ -83,67 +104,55 @@ export function validateWebhookRetryPolicy(policy) {
   return { attempts, baseDelayMs };
 }
 
-// Hand-maintained, structured source-of-truth for the public API changelog
-// (#135). Deliberately NOT scraped from the README's narrative prose — each
-// entry is a machine-readable record of a change to this server's HTTP
-// surface, so integrators can diff versions programmatically. Kept as an
-// explicit config value (overridable via API_CHANGELOG_JSON) rather than
-// generated from git history, matching this codebase's bias toward simple,
-// explicit config over inferred behavior. An empty/unset value is valid and
-// must fail soft (see the /changelog route), never 500.
-const DEFAULT_API_CHANGELOG = Object.freeze([
-  {
-    version: '1.0.0',
-    date: '2024-01-01',
-    changes: [
-      {
-        type: 'added',
-        route: 'POST /oracle',
-        description: 'Submit an oracle question. Initially a blocking call that returned the answer inline.',
-      },
-    ],
-  },
-  {
-    version: '1.1.0',
-    date: '2024-02-01',
-    changes: [
-      {
-        type: 'changed',
-        route: 'POST /oracle',
-        description: 'Became async-with-polling: returns a jobId immediately; results are fetched via GET /oracle/:jobId.',
-      },
-      {
-        type: 'added',
-        route: 'POST /oracle/metered',
-        description: 'Separate metered submission path with its own rate limit and billing.',
-      },
-    ],
-  },
-  {
-    version: '1.2.0',
-    date: '2024-03-01',
-    changes: [
-      {
-        type: 'deprecated',
-        route: 'POST /oracle/metered',
-        description: 'Fused directly into POST /oracle in the round 7 "fuse pass". This route no longer exists; use POST /oracle.',
-        sunset: '2024-03-01',
-        replacement: 'POST /oracle',
-      },
-    ],
-  },
-]);
+// Contract compatibility pin (#163). This backend is developed independently
+// of `arbiter-contract`, so nothing at build time guarantees the two agree on
+// argument shapes. COMPATIBLE_CONTRACT_VERSION names the tagged contract
+// release this backend is built against, and COMPATIBLE_CONTRACT_WASM_HASH is
+// that release's recorded WASM hash (from arbiter-contract's release notes).
+// At startup (see contractVersionCheck.js) the deployed instance's hash is
+// fetched on-chain and compared against this pin; a mismatch logs a loud,
+// specific warning rather than surfacing later as an opaque Soroban error.
+// Compatibility model: same major version = safe; different major = verify
+// manually against arbiter-contract's breaking-change definition.
+export const contractCompatibility = Object.freeze({
+  version: process.env.COMPATIBLE_CONTRACT_VERSION || '',
+  wasmHash: (process.env.COMPATIBLE_CONTRACT_WASM_HASH || '').toLowerCase(),
+});
 
-function parseApiChangelog(raw) {
-  if (raw === undefined || raw === null || raw === '') return DEFAULT_API_CHANGELOG;
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : DEFAULT_API_CHANGELOG;
-  } catch {
-    console.warn('[config] API_CHANGELOG_JSON is not valid JSON — falling back to the built-in changelog');
-    return DEFAULT_API_CHANGELOG;
-  }
-}
+export const config = Object.freeze({
+  port: num(process.env.PORT, 4000),
+  horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
+  // Primary RPC URL — kept for backward compatibility with existing callers
+  // that read config.sorobanRpcUrl directly. Equals sorobanRpcUrls[0].
+  sorobanRpcUrl: sorobanRpcUrls[0],
+  // Full ordered list of configured RPC endpoints (primary first).
+  sorobanRpcUrls: Object.freeze(sorobanRpcUrls),
+  networkPassphrase: process.env.NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015',
+
+  // Which deployment this process is (#150): 'demo' (disposable) or
+  // 'sandbox' (long-lived developer sandbox). Surfaced so /health and the
+  // README can distinguish the two environments unambiguously.
+  deploymentProfile,
+
+  usdc: Object.freeze({
+    sacId: process.env.USDC_SAC_ID || '',
+    code: process.env.USDC_ASSET_CODE || 'USDC',
+    issuer: process.env.USDC_ASSET_ISSUER || 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+  }),
+
+  contractId: process.env.ORACLE_CONTRACT_ID || '',
+  platformSecret: process.env.PLATFORM_SECRET || '',
+  platformAddress: process.env.PLATFORM_ADDRESS || '',
+
+  // Pinned arbiter-contract release this backend expects (see
+  // contractCompatibility above and contractVersionCheck.js).
+  compatibleContractVersion: contractCompatibility.version,
+  compatibleContractWasmHash: contractCompatibility.wasmHash,
+
+  // Must match the timeout_ledgers the contract was actually initialize()'d
+  // with — this copy is for display/UX only (e.g. "auto-refund available
+  // after ledger N"); the contract enforces its own stored value regardless.
+  timeoutLedgers: num(process.env.TIMEOUT_LEDGERS, 100),
 
 // API version negotiation (#136). Additive, not a rewrite: every existing
 // unversioned route in server.js keeps working unchanged and is treated as
@@ -192,59 +201,76 @@ export function negotiateApiVersion({ path = '', accept = '' } = {}) {
   return { version: requested, explicit: true };
 }
 
-// Contract-address rotation (#137). `config.contractId` used to be a single
-// frozen env-var-driven string, so a contract redeployment required a full
-// backend restart to reload it. It is now a live-reloadable value: the
-// frozen `config` object still exposes `contractId` for backward
-// compatibility, but every call site that must observe a rotation reads it
-// through `getContractId()` instead of capturing the value once.
-//
-// `rotateContractId()` swaps the live value atomically (a single assignment,
-// so no reader can observe a torn/partial value) and returns the previous id
-// so callers can log/audit the cutover. Rotation is intentionally a plain
-// in-process operation — the serial admin-call queue in stellarClient.js is
-// responsible for draining in-flight calls against the old id before any new
-// call uses it.
-//
-// Multi-contract support (#138) generalizes this: instead of exactly one
-// active contract, a set of contract instances can be configured, each with
-// its own admin key and its own serial admin-call queue (two instances that
-// share a signing key don't need two queues, but independent keys do — see
-// stellarClient.js). A new question is routed to one instance at
-// `issueChallenge()` time and that choice is recorded in its stashed
-// pendingQuestions record so verify/dispatch/resolve/refund all resolve the
-// same instance. Selection is deliberately random/round-robin in v1 — no
-// capacity awareness (explicitly out of scope).
+  // Cross-instance quorum collection (#160). When more than one backend
+  // instance is running, a question's collector lives in the memory of
+  // whichever instance dispatched it, but an answer for that question can
+  // arrive at any instance a worker happens to be connected to. Answers are
+  // therefore routed over Redis pub/sub: the owning instance subscribes to
+  // `quorum:answers:<questionId>` and any instance that receives an answer
+  // for a question it does not own publishes it there instead of dropping
+  // it. Pub/sub (not Streams) is deliberate: answers are only useful while
+  // the collector is still open, so replay/ordering guarantees buy nothing
+  // here, and the simpler transport keeps the failure modes small. The
+  // channel prefix is configurable so tests can namespace channels against a
+  // shared fake Redis without colliding with a real deployment.
+  quorum: Object.freeze({
+    channelPrefix: process.env.QUORUM_CHANNEL_PREFIX || 'quorum:answers:',
+    // How long an owning instance waits for a cross-instance answer before
+    // treating the question as orphaned and letting the existing TTL/timeout
+    // path refund it. Bounded by pendingQuestionTtlMs so a dead dispatcher
+    // can never hold a question open longer than the normal pending TTL.
+    answerTimeoutMs: num(process.env.QUORUM_ANSWER_TIMEOUT_MS, 30_000),
+  }),
 
-// Parses the multi-contract configuration. Accepts either:
-//   CONTRACT_INSTANCES_JSON='[{"id":"C...","adminKey":"S..."}, ...]'
-// or a comma-separated CONTRACT_IDS='C...,C...' (each instance then shares
-// the single platform admin key, so they share one serial queue). Falls back
-// to the single legacy CONTRACT_ID so existing deployments keep working
-// unchanged with exactly one instance.
-function parseContractInstances() {
-  const raw = process.env.CONTRACT_INSTANCES_JSON;
-  if (raw) {
-    try {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        const instances = parsed
-          .map((entry, i) => {
-            const id = typeof entry === 'string' ? entry : entry?.id;
-            if (!id) return null;
-            return {
-              id,
-              adminKey: (typeof entry === 'object' && entry?.adminKey) || process.env.ADMIN_SECRET_KEY || null,
-              label: (typeof entry === 'object' && entry?.label) || `contract-${i}`,
-            };
-          })
-          .filter(Boolean);
-        if (instances.length > 0) return instances;
-      }
-    } catch {
-      console.warn('[config] CONTRACT_INSTANCES_JSON is not valid JSON — falling back to CONTRACT_ID');
-    }
-  }
+  // Comma-separated list of allowed CORS origins, e.g.
+  // "https://app.example.com,https://demo.example.com". Defaults to '*'
+  // (wide open) for local dev — lock this down for any real deployment.
+  allowedOrigins: (process.env.ALLOWED_ORIGINS || '*').split(',').map((s) => s.trim()).filter(Boolean),
+
+  // Express `trust proxy` value, applied in server.js before any rate-limited
+  // route registers. false (default) = trust nothing, req.ip is the raw
+  // socket address (unchanged local-dev behavior). Behind Railway set
+  // TRUST_PROXY=1 (exactly one proxy hop). See trustProxy() above for why
+  // `true` is dangerous here.
+  trustProxy: trustProxy(),
+
+  // 'json' for real deployments (log aggregators parse JSON lines
+  // directly); anything else pretty-prints for local dev readability.
+  logFormat: process.env.LOG_FORMAT || 'pretty',
+  logLevel: process.env.LOG_LEVEL || 'info',
+
+  // Prometheus scrape endpoint (metrics.js) and the probes behind its gauges
+  // (healthProbes.js). METRICS_TOKEN unset = /metrics is open, which is the
+  // usual setup for a scrape target on a private network.
+  metrics: Object.freeze({
+    token: process.env.METRICS_TOKEN || '',
+    probeIntervalMs: num(process.env.METRICS_PROBE_INTERVAL_MS, 15_000),
+    jobScanIntervalMs: num(process.env.METRICS_JOB_SCAN_INTERVAL_MS, 60_000),
+  }),
+
+  // Chain-driven recovery sweep (disasterRecovery.js): refunds on-chain
+  // Pending questions that no local state can still settle, e.g. after the
+  // store was lost. Needs contract v0.3.0+ (list_pending) and PLATFORM_SECRET.
+  recovery: Object.freeze({
+    enabled: process.env.RECOVERY_SWEEP_ENABLED !== 'false',
+    intervalMs: num(process.env.RECOVERY_SWEEP_INTERVAL_MS, 5 * 60 * 1000),
+    minAgeLedgers: num(process.env.RECOVERY_MIN_AGE_LEDGERS, 12),
+    staleInflightMs: num(process.env.RECOVERY_STALE_INFLIGHT_MS, 30 * 60 * 1000),
+    maxRefundsPerSweep: num(process.env.RECOVERY_MAX_REFUNDS_PER_SWEEP, 50),
+  }),
+
+  // Alert drill only (faultInjection.js). Refused in production by
+  // securityPosture.js.
+  faultInjection: process.env.ARBITER_FAULT_INJECTION === 'true',
+
+  // Response security headers (see securityHeaders.js). CSP_CONNECT_SRC is a
+  // comma-separated list of extra origins the frontend may fetch()/stream
+  // from — only needed when the UI is hosted on a different origin than
+  // this API. HSTS_ENABLED=false turns off Strict-Transport-Security.
+  securityHeaders: Object.freeze({
+    connectSrc: (process.env.CSP_CONNECT_SRC || '').split(',').map((s) => s.trim()).filter(Boolean),
+    hsts: process.env.HSTS_ENABLED !== 'false',
+  }),
 
   const ids = (process.env.CONTRACT_IDS || '')
     .split(',')
@@ -257,35 +283,6 @@ function parseContractInstances() {
       label: `contract-${i}`,
     }));
   }
-
-  const single = process.env.CONTRACT_ID || '';
-  return [{ id: single, adminKey: process.env.ADMIN_SECRET_KEY || null, label: 'contract-0' }];
-}
-
-  // Subscription billing tier (#101). A single flat tier for now — prorated
-  // upgrades/downgrades between tiers are explicitly out of scope. The
-  // included volume is credited to the account's stroops balance on each
-  // `invoice.paid` webhook (see billing.js's handleStripeWebhook), so it
-  // flows through the same reserveCredit()/settleReservation() ledger as
-  // one-shot credit and falls back to the existing insufficient-credit 402
-  // path in POST /oracle once exhausted mid-cycle.
-  subscription: Object.freeze({
-    // Stripe Price id for the recurring tier. Empty disables the subscribe
-    // endpoint (returns 503) rather than creating a session Stripe would
-    // reject — same "unset means off" posture as contractId/platformSecret.
-    priceId: process.env.SUBSCRIPTION_PRICE_ID || '',
-    // Included volume per billing cycle, in stroops, credited on invoice.paid.
-    includedVolumeStroops: BigInt(process.env.SUBSCRIPTION_INCLUDED_VOLUME_STROOPS || '0'),
-    // Rollover policy for unused included volume at cycle end. Default false
-    // (use-it-or-lose-it): each invoice.paid credits exactly
-    // includedVolumeStroops, so a subscriber who under-consumes doesn't
-    // accumulate an unbounded balance that later bypasses the metered
-    // overage path. Set true to carry the remaining balance forward instead.
-    // Like worker.minStakeStroops' "0 preserves today's behavior" framing,
-    // this is an explicit, documented policy — not an accident of the order
-    // in which invoice.paid happens to run.
-    rolloverUnusedVolume: process.env.SUBSCRIPTION_ROLLOVER_UNUSED_VOLUME === 'true',
-  }),
 
   worker: Object.freeze({
     rateLimitMaxConnections: num(process.env.WORKER_RATE_LIMIT_MAX_CONNECTIONS, 5),
@@ -317,6 +314,148 @@ function parseContractInstances() {
       max: num(process.env.ANSWER_RATE_LIMIT_MAX, 60),
       windowMs: num(process.env.ANSWER_RATE_LIMIT_WINDOW_MS, 60_000),
     }),
-    //
+    // Sandbox mode is free (no real payment), so it needs its own — more
+    // generous, but still real — limit rather than sharing the paid-flow
+    // 'oracle' bucket, and rather than being unlimited.
+    sandbox: Object.freeze({
+      max: num(process.env.SANDBOX_RATE_LIMIT_MAX, 30),
+      windowMs: num(process.env.SANDBOX_RATE_LIMIT_WINDOW_MS, 60_000),
+    }),
+    push: Object.freeze({
+      max: num(process.env.PUSH_RATE_LIMIT_MAX, 10),
+      windowMs: num(process.env.PUSH_RATE_LIMIT_WINDOW_MS, 60_000),
+    }),
+    billing: Object.freeze({
+      max: num(process.env.BILLING_RATE_LIMIT_MAX, 10),
+      windowMs: num(process.env.BILLING_RATE_LIMIT_WINDOW_MS, 60_000),
+    }),
+    webhooks: Object.freeze({
+      max: num(process.env.WEBHOOKS_RATE_LIMIT_MAX, 20),
+      windowMs: num(process.env.WEBHOOKS_RATE_LIMIT_WINDOW_MS, 60_000),
+    }),
+  }),
 
-/* … truncated 5869 chars — edit only what you need near the top … */
+  vapid: Object.freeze({
+    publicKey: process.env.VAPID_PUBLIC_KEY || '',
+    privateKey: process.env.VAPID_PRIVATE_KEY || '',
+    subject: process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
+  }),
+
+  push: Object.freeze({
+    // Push notifications supplement, never replace, the SSE dispatch
+    // channel — they're for workers who aren't currently connected. A
+    // push round-trip (deliver -> notice -> tap -> app loads) realistically
+    // takes several seconds, so notifying for a very short quorum window
+    // (e.g. the 'express' tier's 12s) would routinely arrive after the
+    // window already closed. Below this threshold, skip push entirely
+    // rather than notify workers for an opportunity they can't act on.
+    minTimeoutForPushMs: num(process.env.PUSH_MIN_TIMEOUT_MS, 20_000),
+  }),
+
+  session: Object.freeze({
+    secret: SESSION_SECRET,
+    // How long a worker's session (proven once via a signed challenge
+    // transaction) stays valid before they'd need to re-authenticate.
+    ttlMs: num(process.env.WORKER_SESSION_TTL_MS, 12 * 60 * 60 * 1000),
+    // Graceful rotation: the set of secrets currently valid for verifying a
+    // session token (current first, then the prior secret while the grace
+    // window is open). Verification must accept a match from any of these;
+    // signing always uses `secret`. Empty/absent previous secret or a 0
+    // grace window yields a single-element list — identical to today.
+    secrets: sessionSecrets,
+    // Length of the rotation grace window in ms (0 = disabled).
+    rotationGraceMs: SESSION_SECRET_ROTATION_GRACE_MS,
+  }),
+
+  // Single shared operator secret for the /admin/* console — this codebase
+  // has no user-account system anywhere, so a bearer token is consistent
+  // with everything else here. Multi-operator auth is a real follow-up,
+  // not something to invent ahead of need.
+  admin: Object.freeze({
+    token: process.env.ADMIN_TOKEN || '',
+  }),
+
+  // Home domain of the SEP-24/SEP-12 anchor Arbiter integrates with for
+  // fiat rails (bank deposit/withdraw, KYC status). Arbiter is a CLIENT of
+  // this anchor's stellar.toml — it never stores PII or bank details
+  // itself. Unset disables the /anchor/* routes entirely.
+  anchor: Object.freeze({
+    homeDomain: process.env.ANCHOR_HOME_DOMAIN || '',
+  }),
+
+  // The non-crypto onramp (see billing.js): API-key customers pay in fiat
+  // via Stripe and are settled on-chain from ONE pooled balance under this
+  // dedicated identity — deliberately separate from platformSecret/
+  // platformAddress above (which already collects platform fee revenue via
+  // resolve()/refund()), so customer float and fee revenue never commingle
+  // in one account. Unset disables the /billing/* routes and the API-key
+  // branch of POST /oracle entirely (same fail-closed-if-unconfigured
+  // posture as admin.token above).
+  billing: Object.freeze({
+    stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
+    stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
+    fiatPoolSecret: process.env.FIAT_POOL_SECRET || '',
+    fiatPoolAddress: process.env.FIAT_POOL_ADDRESS || '',
+    // 1 USD = 1 USDC face value, at USDC's existing 7-decimal stroop
+    // convention (see pricing.js's stroopsToUsdc) — the simplest possible
+    // conversion for v1. Stripe's own processing fee is absorbed by the
+    // platform, not passed through to the credited balance; revisit if
+    // margin matters before volume does.
+    usdToStroops: 10_000_000n,
+    minTopupUsd: num(process.env.MIN_TOPUP_USD, 10),
+  }),
+
+  // Settlement webhooks (see webhooks.js for registration/validation and
+  // webhookDelivery.js for signing/retry). Delivery is best-effort and
+  // never on the settlement path; these bound how hard it tries.
+  webhooks: Object.freeze({
+    maxPerOwner: num(process.env.WEBHOOK_MAX_PER_OWNER, 10),
+    // Total delivery attempts per event, including the first one.
+    maxAttempts: num(process.env.WEBHOOK_MAX_ATTEMPTS, 6),
+    // Backoff before retry n is baseDelayMs * 2^(n-1) plus up to 20%
+    // jitter: 5s, 10s, 20s, 40s, 80s by default, about 2.5 minutes in all.
+    retryBaseDelayMs: num(process.env.WEBHOOK_RETRY_BASE_DELAY_MS, 5_000),
+    timeoutMs: num(process.env.WEBHOOK_TIMEOUT_MS, 10_000),
+    // Local development / tests only: also accept http:// URLs and
+    // loopback/private-network targets. Never enable in production, since
+    // it turns webhook registration into an SSRF primitive against the
+    // backend's own network.
+    allowInsecureTargets: process.env.WEBHOOK_ALLOW_INSECURE_TARGETS === 'true',
+    // Optional key (any string; it's hashed to 32 bytes) used to encrypt
+    // signing secrets at rest with AES-256-GCM. Secrets must stay
+    // recoverable, since signing needs the plaintext, so they can't be
+    // hashed like API keys. Without a key they're stored as-is, which is the
+    // same trust level as the store itself.
+    secretEncryptionKey: process.env.WEBHOOK_SECRET_ENCRYPTION_KEY || '',
+  }),
+
+  // Auto-withdraw (see autoWithdraw.js). The backend can never sign a
+  // worker's withdraw() itself, so "auto" means: once Owed crosses the
+  // worker's threshold, prepare the unsigned withdraw transaction and push
+  // it to them to sign. These bound how that runs.
+  autoWithdraw: Object.freeze({
+    // Floor on any worker-configured threshold, so nobody ends up with a
+    // prepared transaction (and a notification) after every tiny credit.
+    minThresholdStroops: BigInt(process.env.AUTO_WITHDRAW_MIN_THRESHOLD_STROOPS || '10000000'), // 1 USDC
+    // How often the background sweep re-checks every opted-in worker's
+    // Owed balance, on top of the check that runs right after settlement.
+    // 0 disables the sweep (settlement-time checks still run).
+    sweepIntervalMs: num(process.env.AUTO_WITHDRAW_SWEEP_INTERVAL_MS, 15 * 60 * 1000),
+    // How long a prepared transaction stays valid for the worker to sign.
+    // Also becomes the transaction's own time bound on-chain.
+    pendingTtlMs: num(process.env.AUTO_WITHDRAW_PENDING_TTL_MS, 24 * 60 * 60 * 1000),
+  }),
+
+  // Annual earnings summary for tax reporting (see taxReport.js). The
+  // payer block is the platform's own details, as they'd appear in the
+  // PAYER box of a 1099. Unset fields are left blank in exports.
+  tax: Object.freeze({
+    // US reporting threshold in USD. At or above it, a summary is flagged
+    // as reportable. $600 matches 1099-NEC; change it if your counsel says
+    // a different form or threshold applies.
+    reportingThresholdUsd: num(process.env.TAX_REPORTING_THRESHOLD_USD, 600),
+    payerName: process.env.TAX_PAYER_NAME || '',
+    payerTin: process.env.TAX_PAYER_TIN || '',
+    payerAddress: process.env.TAX_PAYER_ADDRESS || '',
+  }),
+});
