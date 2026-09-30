@@ -10,6 +10,17 @@ import { store } from './store.js';
  * route in server.js) purely so the admin console has something to show.
  * Treat every record here as "what this user's own browser told us," not
  * ground truth independently verified by this backend.
+ *
+ * CCPA / GDPR "personal information" note (issue #127): under this system's
+ * actual data model the only identifier is the Stellar public address (a
+ * pseudonymous key, not a name/email/phone). The fields stored here that
+ * constitute personal information are therefore: the address itself (the
+ * index key and the per-address record key), the self-reported anchor KYC
+ * status/tier, and the reported transaction metadata (kind, status, amount,
+ * assetCode, anchorTransactionId, reportedAt). There is no separate PII
+ * schema to reconcile — access/erasure for a consumer is the same per-address
+ * fan-out used for GDPR data-subject requests (#126), so CCPA is handled as
+ * the same underlying request type rather than a parallel implementation.
  */
 
 const TX_PREFIX = 'anchor-tx:';
@@ -59,4 +70,24 @@ export async function recordAnchorKyc(address, { status, tier }) {
 
 export async function getAnchorKyc(address) {
   return store.get(KYC_PREFIX + address);
+}
+
+/**
+ * Erase all anchorRecords data for a single address. This is the per-store
+ * erasure hook consumed by #126's data-access/erasure fan-out (the same
+ * per-address store fan-out used for GDPR requests) — CCPA deletion reuses
+ * it rather than re-deriving store logic. Removes the per-address tx and KYC
+ * records and drops the address from the known-address index so no residual
+ * personal information remains keyed by that address.
+ */
+export async function eraseAnchorRecords(address) {
+  await store.del(TX_PREFIX + address);
+  await store.del(KYC_PREFIX + address);
+  const known = (await store.get(ADDRESS_INDEX_KEY)) || [];
+  if (known.includes(address)) {
+    await store.set(
+      ADDRESS_INDEX_KEY,
+      known.filter((a) => a !== address),
+    );
+  }
 }

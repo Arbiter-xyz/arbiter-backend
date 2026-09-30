@@ -5,11 +5,23 @@ import { screenAnswer } from './answerFilter.js';
 import { getPushEligibleWorkerIds, notifyWorker } from './push.js';
 import { getStakeOnChain, touchWorker } from './stellarClient.js';
 import { jobLogger, logger } from './logger.js';
+import { recordWorkerActivity } from './workerAnalytics.js';
+import { syncBadges } from './gamification.js';
 import { trace, context, propagation, SpanKind, SpanStatusCode } from '@opentelemetry/api';
 
 // Live worker registry — inherently process-local because it holds open SSE
 // response objects (see the multi-instance caveat in store.js).
 const workers = new Map(); // workerId -> { res, categories: Set<string>, connectedAt }
+
+// Shared presence registry — the *fact* that a worker is online (id,
+// categories, connected-at) lives in the Redis-backed store so every backend
+// instance sees the whole fleet, while the SSE `res` object above stays
+// process-local. Presence entries carry a short TTL refreshed on the existing
+// SSE keep-alive heartbeat, so a crashed instance's workers expire on their
+// own without a graceful disconnect. When REDIS_URL is unset, MemoryStore's
+// single-process semantics keep this behaving exactly as before.
+const PRESENCE_PREFIX = 'presence:';
+const PRESENCE_TTL_SECONDS = 60;
 
 // Per-question quorum collector, also process-local for the same reason.
 // `quorumSize` is the CURRENT target and is mutable: fixed-quorum questions
@@ -17,6 +29,109 @@ const workers = new Map(); // workerId -> { res, categories: Set<string>, connec
 // `escalation`, present only on escalating questions, holds the extra state
 // for that mode; fixed-quorum collectors leave it undefined.
 const collectors = new Map(); // questionId -> { submissions: Map<workerId, answer>, quorumSize, finished, finish, escalation? }
+
+// Cross-instance answer routing (issue #160).
+//
+// The collector/quorum state machine above stays in-memory on whichever
+// instance dispatched the question — only the *routing* of an answer to the
+// owning collector crosses the instance boundary. We use Redis pub/sub
+// (rather than Streams) because answers are fire-and-forget: a late answer
+// for an already-settled question is simply dropped, so we don't need the
+// replay/ordering guarantees Streams would buy us, and pub/sub keeps the
+// transport to a single subscribe/publish pair with no consumer-group
+// bookkeeping. The channel is keyed by questionId, so the owning instance
+// subscribes to exactly the questions it dispatched.
+const ANSWER_CHANNEL_PREFIX = 'quorum:answer:';
+
+function answerChannel(questionId) {
+  return ANSWER_CHANNEL_PREFIX + questionId;
+}
+
+// questionId -> unsubscribe handle for the pub/sub subscription owned by
+// this instance. Kept alongside `collectors` so the subscription is torn
+// down at the same moment the collector is.
+const answerSubscriptions = new Map();
+
+/**
+ * Subscribe this instance to the answer channel for a question it owns.
+ * Called when a collector is created. No-op (and no new failure mode) when
+ * the store has no pub/sub support — single-instance deployments keep
+ * working exactly as before.
+ */
+async function subscribeToAnswers(questionId) {
+  if (typeof store.subscribe !== 'function') return;
+  if (answerSubscriptions.has(questionId)) return;
+  try {
+    const unsubscribe = await store.subscribe(answerChannel(questionId), (payload) => {
+      // Answers arriving over the wire are routed through the same local
+      // path as answers submitted directly to this instance, so quorum
+      // accounting is identical regardless of which instance received them.
+      handleAnswer(payload.questionId, payload.workerId, payload.answer, payload.traceparent);
+    });
+    answerSubscriptions.set(questionId, unsubscribe);
+  } catch (err) {
+    logger.warn({ err, questionId }, 'failed to subscribe to cross-instance answer channel');
+  }
+}
+
+function unsubscribeFromAnswers(questionId) {
+  const unsubscribe = answerSubscriptions.get(questionId);
+  if (!unsubscribe) return;
+  answerSubscriptions.delete(questionId);
+  try {
+    unsubscribe();
+  } catch (err) {
+    logger.warn({ err, questionId }, 'failed to unsubscribe from cross-instance answer channel');
+  }
+}
+
+/**
+ * Publish an answer to the channel owned by whichever instance holds the
+ * collector. Used when this instance receives an answer for a question it
+ * does not own (no local collector). Best-effort: if publishing fails the
+ * answer is dropped, which is the same outcome as today's behavior for an
+ * answer that lands on the wrong instance.
+ */
+async function publishAnswer(questionId, workerId, answer, traceparent) {
+  if (typeof store.publish !== 'function') return;
+  try {
+    await store.publish(answerChannel(questionId), { questionId, workerId, answer, traceparent });
+  } catch (err) {
+    logger.warn({ err, questionId, workerId }, 'failed to publish cross-instance answer');
+  }
+}
+
+/**
+ * Entry point for an answer submission. If this instance owns the
+ * collector, record it locally; otherwise forward it to the owning
+ * instance over pub/sub. This is the single routing decision that makes
+ * cross-instance quorum collection work.
+ */
+export async function submitAnswer(questionId, workerId, answer, traceparent) {
+  if (collectors.has(questionId)) {
+    return handleAnswer(questionId, workerId, answer, traceparent);
+  }
+  return publishAnswer(questionId, workerId, answer, traceparent);
+}
+
+/**
+ * Record an answer against the local collector for `questionId`. Shared by
+ * the direct-submission path and the pub/sub delivery path so both count
+ * toward quorum identically. Returns false when there is no local collector
+ * (e.g. the owning instance died and this is a stale delivery).
+ */
+function handleAnswer(questionId, workerId, answer, traceparent) {
+  const collector = collectors.get(questionId);
+  if (!collector || collector.finished) return false;
+  if (collector.submissions.has(workerId)) return false;
+  collector.submissions.set(workerId, answer);
+  if (collector.submissions.size >= collector.quorumSize) {
+    collector.finished = true;
+    unsubscribeFromAnswers(questionId);
+    collector.finish(collector.submissions);
+  }
+  return true;
+}
 
 const REPUTATION_PREFIX = 'rep:';
 // A single durable list of every workerId that has ever had an outcome
@@ -63,8 +178,39 @@ export function currentTraceparent() {
   return carrier.traceparent;
 }
 
-export function onlineWorkerCount() {
-  return workers.size;
+function presenceKey(workerId) {
+  return PRESENCE_PREFIX + workerId;
+}
+
+/**
+ * Read the shared presence set. Returns a Map of workerId -> presence record
+ * ({ categories: string[], connectedAt: number }) covering every instance's
+ * connected workers. Falls back to the local `workers` Map when the store has
+ * no Redis client (MemoryStore), preserving today's single-process behavior.
+ */
+async function readPresence() {
+  const client = store.getClient && store.getClient();
+  if (!client) {
+    const local = new Map();
+    for (const [workerId, w] of workers) {
+      local.set(workerId, { categories: [...w.categories], connectedAt: w.connectedAt });
+    }
+    return local;
+  }
+  const raw = await client.hgetall(PRESENCE_PREFIX + 'workers');
+  const presence = new Map();
+  for (const [workerId, json] of Object.entries(raw || {})) {
+    try {
+      presence.set(workerId, JSON.parse(json));
+    } catch {
+      // Ignore malformed entries rather than failing the whole read.
+    }
+  }
+  return presence;
+}
+
+export async function onlineWorkerCount() {
+  return (await readPresence()).size;
 }
 
 function normalizeCategory(category) {
@@ -80,12 +226,41 @@ export async function checkConnectionRateLimit(ip) {
   return checkRateLimit(`sse:${ip}`, config.worker.rateLimitMaxConnections, config.worker.rateLimitWindowMs);
 }
 
-export function registerWorker(workerId, res, categories = []) {
-  workers.set(workerId, { res, categories: new Set(categories.map(normalizeCategory)), connectedAt: Date.now() });
+export async function registerWorker(workerId, res, categories = []) {
+  const normalized = categories.map(normalizeCategory);
+  workers.set(workerId, { res, categories: new Set(normalized), connectedAt: Date.now() });
+  await writePresence(workerId, normalized);
 }
 
-export function unregisterWorker(workerId) {
+/**
+ * Write (or refresh) a worker's shared presence entry with a short TTL. Called
+ * on connect and on every SSE keep-alive heartbeat, so a crashed instance's
+ * workers expire automatically instead of lingering forever.
+ */
+export async function writePresence(workerId, categories) {
+  const client = store.getClient && store.getClient();
+  if (!client) return;
+  const record = JSON.stringify({ categories, connectedAt: Date.now() });
+  await client.hset(PRESENCE_PREFIX + 'workers', workerId, record);
+  if (client.expire) await client.expire(presenceKey(workerId), PRESENCE_TTL_SECONDS);
+}
+
+/**
+ * Refresh presence for a worker on the existing keep-alive heartbeat. No-op
+ * when the worker isn't locally registered (e.g. already disconnected).
+ */
+export async function refreshPresence(workerId) {
+  const w = workers.get(workerId);
+  if (!w) return;
+  await writePresence(workerId, [...w.categories]);
+}
+
+export async function unregisterWorker(workerId) {
   workers.delete(workerId);
+  const client = store.getClient && store.getClient();
+  if (!client) return;
+  await client.hdel(PRESENCE_PREFIX + 'workers', workerId);
+  if (client.del) await client.del(presenceKey(workerId));
 }
 
 /**
@@ -112,6 +287,16 @@ export async function recordOutcome(workerId, matched) {
     if (!known.includes(workerId)) {
       await store.set(WORKER_INDEX_KEY, [workerId, ...known].slice(0, MAX_TRACKED_WORKERS));
     }
+  }
+
+  // Analytics + gamification are observability only — a failure here must
+  // never fail settlement, so it's logged and swallowed.
+  try {
+    await recordWorkerActivity(workerId, matched);
+    const newlyEarned = await syncBadges(workerId);
+    if (newlyEarned.length > 0) logger.info({ workerId, badges: newlyEarned }, 'worker earned badges');
+  } catch (err) {
+    logger.warn({ err, workerId }, 'failed to record worker analytics');
   }
 }
 
@@ -159,6 +344,25 @@ async function isEligible(workerId) {
 export async function isEstablishedWorker(workerId) {
   const rep = await getReputation(workerId);
   return rep.total >= config.worker.minAnswersBeforeReputationGate;
+}
+
+/**
+ * Pure heuristic deciding whether a known workerId is worth a `touch()` call
+ * during the daily TTL sweep. `touch()` is permissionless (see lib.rs) but
+ * every call still round-trips through the SAME admin-signed serial queue as
+ * real resolve()/refund()/charge() settlement calls (see serializeAdminCall
+ * in stellarClient.js) — so touching a worker that has never staked or been
+ * credited is pure queue-time waste that can delay a payer or worker's
+ * money. A worker is only worth touching when there is off-chain evidence
+ * it has on-chain state to refresh: a cached stake (setCachedStake) or a
+ * recorded resolve()-credited outcome (reputation.total > 0). Factored out
+ * as a pure function, matching this file's existing convention (see
+ * stakeGateAllows, computeSmoothedCount), so the skip/include decision is
+ * directly testable without a live store or chain.
+ */
+export function shouldSweepWorkerTtl({ cachedStake, reputation } = {}) {
+  if (cachedStake !== undefined) return true;
+  return (reputation?.total ?? 0) > 0;
 }
 
 function writeSse(res, event, data) {
@@ -373,6 +577,4 @@ export function clearCollector(questionId) {
   collectors.delete(questionId.toString());
 }
 
-// Re-exported so jobs.js and the HTTP layer can start the root span at
-// question-creation time without importing @opentelemetry/api directly.
-export { tracer, context, propagation, SpanKind, SpanStatusCode };
+/* … truncated 7639 chars — edit only what you need near the top … */
