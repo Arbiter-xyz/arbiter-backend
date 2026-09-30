@@ -243,6 +243,40 @@ export async function resolveQuestion(questionId, matchingWorkerAddresses, losin
   ]);
 }
 
+/** Batch-aware variant of resolve(): settles several questions' worth of
+ * fee/slash bookkeeping in ONE platform-signed transaction, cutting the
+ * per-question serialization + network-fee cost that resolveQuestion()
+ * pays individually. Each entry carries its own matching/losing worker
+ * sets, so a batch can mix questions with different outcomes.
+ *
+ * The contract's resolve_batch() is expected to settle each member
+ * independently and return a per-question outcome vector (e.g. one of
+ * "resolved" / "not_pending" / "already_refunded"), so a single member
+ * losing the refund_timeout() race does NOT fail the whole batch — the
+ * caller inspects the returned outcomes and tags only the racing member
+ * as lost_race_to_timeout_refund. */
+export async function resolveQuestionsBatch(entries) {
+  const questionIds = entries.map((e) => u64Arg(e.questionId));
+  const matching = entries.map((e) => vecOfAddresses(e.matchingWorkerAddresses ?? []));
+  const losing = entries.map((e) => vecOfAddresses(e.losingWorkerAddresses ?? []));
+  return invokeAsAdmin('resolve_batch', [
+    nativeToScVal(questionIds, { type: 'Vec' }),
+    nativeToScVal(matching, { type: 'Vec' }),
+    nativeToScVal(losing, { type: 'Vec' }),
+  ]);
+}
+
+/** Batch-aware variant of refund(): force-refunds several questions in one
+ * platform-signed transaction. Mirrors resolveQuestionsBatch()'s
+ * per-question independence — a member already resolved or already
+ * refunded is reported in the returned outcome vector rather than
+ * aborting the whole batch. */
+export async function refundQuestionsBatch(questionIds) {
+  return invokeAsAdmin('refund_batch', [
+    nativeToScVal(questionIds.map((id) => u64Arg(id)), { type: 'Vec' }),
+  ]);
+}
+
 export async function refundQuestion(questionId) {
   return invokeAsAdmin('refund', [u64Arg(questionId)]);
 }
@@ -273,41 +307,38 @@ export function decodeStatus(raw) {
 }
 
 async function simulateReadOnly(method, scValArgs = []) {
-  return withServerFailover((srv) =>
-    withRetry(
-      async () => {
-        const contract = new Contract(config.contractId);
-        // Simulation-only calls need a source account for a well-formed envelope
-        // but never actually sign or submit, so any funded-looking public key works.
-        const simSourceKey = config.platformAddress || Keypair.random().publicKey();
-        const simSource = new Account(simSourceKey, '0');
+  return withRetry(
+    async () => {
+      const srv = getServer();
+      const contract = new Contract(config.contractId);
+      // Simulation-only calls need a source account for a well-formed envelope
+      // but never actually sign or submit, so any funded-looking public key works.
+      const simSourceKey = config.platformAddress || Keypair.random().publicKey();
+      const simSource = new Account(simSourceKey, '0');
 
-        const tx = new TransactionBuilder(simSource, { fee: '100', networkPassphrase: config.networkPassphrase })
-          .addOperation(contract.call(method, ...scValArgs))
-          .setTimeout(30)
-          .build();
+      const tx = new TransactionBuilder(simSource, { fee: '100', networkPassphrase: config.networkPassphrase })
+        .addOperation(contract.call(method, ...scValArgs))
+        .setTimeout(30)
+        .build();
 
-        const sim = await srv.simulateTransaction(tx);
-        if (rpc.Api.isSimulationError(sim)) {
-          throw new Error(`simulate ${method} failed: ${sim.error}`);
-        }
-        return sim;
-      },
-      { attempts: 2, timeoutMs: 10_000, baseDelayMs: 300, label: `simulateReadOnly(${method})` },
-    ),
+      const sim = await srv.simulateTransaction(tx);
+      if (sim.error) throw new Error(`simulate ${method} failed: ${sim.error}`);
+      return sim;
+    },
+    { attempts: 2, timeoutMs: 10_000, baseDelayMs: 300, label: `simulateReadOnly(${method})` },
   );
 }
 
-export async function getQuestionOnChain(questionId) {
+export async function readQuestion(questionId) {
   const sim = await simulateReadOnly('get_question', [u64Arg(questionId)]);
   const raw = sim.result?.retval;
   if (raw === undefined) return null;
-  const decoded = scValToNative(raw);
-  if (!decoded) return null;
-  return {
-    id: Number(decoded.id),
-    status: decodeStatus(decoded.status),
-    matchingWorkers: decoded.matching_workers ?? [],
-    losingWorkers: decoded.losing_workers ?? [],
-  };
+  return scValToNative(raw);
+}
+
+export async function readWorker(workerAddress) {
+  const sim = await simulateReadOnly('get_worker', [addressArg(workerAddress)]);
+  const raw = sim.result?.retval;
+  if (raw === undefined) return null;
+  return scValToNative(raw);
 }

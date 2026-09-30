@@ -10,6 +10,16 @@ import { trace, context, propagation, SpanKind, SpanStatusCode } from '@opentele
 // response objects (see the multi-instance caveat in store.js).
 const workers = new Map(); // workerId -> { res, categories: Set<string>, connectedAt }
 
+// Shared presence registry — the *fact* that a worker is online (id,
+// categories, connected-at) lives in the Redis-backed store so every backend
+// instance sees the whole fleet, while the SSE `res` object above stays
+// process-local. Presence entries carry a short TTL refreshed on the existing
+// SSE keep-alive heartbeat, so a crashed instance's workers expire on their
+// own without a graceful disconnect. When REDIS_URL is unset, MemoryStore's
+// single-process semantics keep this behaving exactly as before.
+const PRESENCE_PREFIX = 'presence:';
+const PRESENCE_TTL_SECONDS = 60;
+
 // Per-question quorum collector, also process-local for the same reason.
 // `quorumSize` is the CURRENT target and is mutable: fixed-quorum questions
 // never change it, escalating ones (see dispatchEscalating) grow it mid-flight.
@@ -165,8 +175,39 @@ export function currentTraceparent() {
   return carrier.traceparent;
 }
 
-export function onlineWorkerCount() {
-  return workers.size;
+function presenceKey(workerId) {
+  return PRESENCE_PREFIX + workerId;
+}
+
+/**
+ * Read the shared presence set. Returns a Map of workerId -> presence record
+ * ({ categories: string[], connectedAt: number }) covering every instance's
+ * connected workers. Falls back to the local `workers` Map when the store has
+ * no Redis client (MemoryStore), preserving today's single-process behavior.
+ */
+async function readPresence() {
+  const client = store.getClient && store.getClient();
+  if (!client) {
+    const local = new Map();
+    for (const [workerId, w] of workers) {
+      local.set(workerId, { categories: [...w.categories], connectedAt: w.connectedAt });
+    }
+    return local;
+  }
+  const raw = await client.hgetall(PRESENCE_PREFIX + 'workers');
+  const presence = new Map();
+  for (const [workerId, json] of Object.entries(raw || {})) {
+    try {
+      presence.set(workerId, JSON.parse(json));
+    } catch {
+      // Ignore malformed entries rather than failing the whole read.
+    }
+  }
+  return presence;
+}
+
+export async function onlineWorkerCount() {
+  return (await readPresence()).size;
 }
 
 function normalizeCategory(category) {
@@ -182,12 +223,41 @@ export async function checkConnectionRateLimit(ip) {
   return checkRateLimit(`sse:${ip}`, config.worker.rateLimitMaxConnections, config.worker.rateLimitWindowMs);
 }
 
-export function registerWorker(workerId, res, categories = []) {
-  workers.set(workerId, { res, categories: new Set(categories.map(normalizeCategory)), connectedAt: Date.now() });
+export async function registerWorker(workerId, res, categories = []) {
+  const normalized = categories.map(normalizeCategory);
+  workers.set(workerId, { res, categories: new Set(normalized), connectedAt: Date.now() });
+  await writePresence(workerId, normalized);
 }
 
-export function unregisterWorker(workerId) {
+/**
+ * Write (or refresh) a worker's shared presence entry with a short TTL. Called
+ * on connect and on every SSE keep-alive heartbeat, so a crashed instance's
+ * workers expire automatically instead of lingering forever.
+ */
+export async function writePresence(workerId, categories) {
+  const client = store.getClient && store.getClient();
+  if (!client) return;
+  const record = JSON.stringify({ categories, connectedAt: Date.now() });
+  await client.hset(PRESENCE_PREFIX + 'workers', workerId, record);
+  if (client.expire) await client.expire(presenceKey(workerId), PRESENCE_TTL_SECONDS);
+}
+
+/**
+ * Refresh presence for a worker on the existing keep-alive heartbeat. No-op
+ * when the worker isn't locally registered (e.g. already disconnected).
+ */
+export async function refreshPresence(workerId) {
+  const w = workers.get(workerId);
+  if (!w) return;
+  await writePresence(workerId, [...w.categories]);
+}
+
+export async function unregisterWorker(workerId) {
   workers.delete(workerId);
+  const client = store.getClient && store.getClient();
+  if (!client) return;
+  await client.hdel(PRESENCE_PREFIX + 'workers', workerId);
+  if (client.del) await client.del(presenceKey(workerId));
 }
 
 /**

@@ -225,5 +225,8 @@ bottleneck (serialized on-chain settlement) are in
 
 ## Handsoff notes
 
-<!-- handsoff-issue-161 -->
-- #161: Design and implement a multi-signer settlement pool to remove the single admin-key bottleneck
+<!-- handsoff-issue-117 -->
+- #117: Backend-side content moderation for question text before dispatch
+
+<!-- handsoff-issue-158 -->
+- #158: Extend /health to report real dependency status; add scheduled uptime alerting
