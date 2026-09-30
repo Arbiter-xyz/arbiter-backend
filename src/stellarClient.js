@@ -41,6 +41,28 @@ export function getAdminKeypair() {
   return adminKeypair;
 }
 
+/** Live-reloadable contract id. `config.contractId` is frozen at module load,
+ * so a redeployment would otherwise require a full process restart. Every
+ * call site reads through this accessor instead of the frozen value, and
+ * rotateContractId() swaps it in place. */
+let currentContractId = config.contractId;
+
+export function getContractId() {
+  return currentContractId;
+}
+
+/** Rotates the active contract id without a restart. The serial admin-call
+ * queue guarantees any in-flight call already queued against the old id
+ * finishes (or fails) before a newly-queued call reads the rotated id — see
+ * createSerialQueue() below. */
+export function rotateContractId(newContractId) {
+  if (!newContractId || typeof newContractId !== 'string') {
+    throw new Error('rotateContractId requires a non-empty contract id string');
+  }
+  currentContractId = newContractId;
+  return currentContractId;
+}
+
 export function u64Arg(value) {
   return nativeToScVal(BigInt(value), { type: 'u64' });
 }
@@ -82,8 +104,8 @@ async function runInvokeAsAdmin(method, scValArgs) {
     async () => {
       const srv = getServer();
       const admin = getAdminKeypair();
-      const account = await withChaosFault(`getAccount:${method}`, () => srv.getAccount(admin.publicKey()));
-      const contract = new Contract(config.contractId);
+      const account = await srv.getAccount(admin.publicKey());
+      const contract = new Contract(getContractId());
 
       const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
         .addOperation(contract.call(method, ...scValArgs))
@@ -136,7 +158,12 @@ async function runInvokeAsAdmin(method, scValArgs) {
  * The queueing itself is Stellar-agnostic, so it's factored out as its own
  * function and exported — directly testable without mocking the RPC layer
  * at all, the same reason computeSmoothedCount/stakeGateAllows/
- * surgeMultiplier exist as pure functions elsewhere in this codebase. */
+ * surgeMultiplier exist as pure functions elsewhere in this codebase.
+ *
+ * Rotation safety: because every admin call is chained onto `tail`, a call
+ * queued before rotateContractId() runs to completion (reading the old id
+ * via getContractId()) before any call queued after rotation starts — so
+ * rotation can never retarget an in-flight call mid-flight. */
 export function createSerialQueue() {
   let tail = Promise.resolve();
   return function serialize(fn) {
@@ -153,6 +180,13 @@ const serializeAdminCall = createSerialQueue();
 
 function invokeAsAdmin(method, scValArgs) {
   return serializeAdminCall(() => runInvokeAsAdmin(method, scValArgs));
+}
+
+/** Rotates the contract id only after every admin call already queued
+ * against the old id has drained. Enqueues the swap on the same serial
+ * chain, so it takes effect strictly between calls — never mid-flight. */
+export function rotateContractIdAfterDrain(newContractId) {
+  return serializeAdminCall(() => rotateContractId(newContractId));
 }
 
 export async function resolveQuestion(questionId, matchingWorkerAddresses, losingWorkerAddresses = []) {
@@ -196,7 +230,7 @@ async function simulateReadOnly(method, scValArgs = []) {
   return withRetry(
     async () => {
       const srv = getServer();
-      const contract = new Contract(config.contractId);
+      const contract = new Contract(getContractId());
       // Simulation-only calls need a source account for a well-formed envelope
       // but never actually sign or submit, so any funded-looking public key works.
       const simSourceKey = config.platformAddress || Keypair.random().publicKey();
@@ -207,37 +241,33 @@ async function simulateReadOnly(method, scValArgs = []) {
         .setTimeout(60)
         .build();
 
-      const sim = await withChaosFault(`simulateTransaction:${method}`, () => srv.simulateTransaction(tx));
-      if (rpc.Api.isSimulationError(sim)) {
+      const sim = await srv.simulateTransaction(tx);
+      if (sim.error) {
         throw new Error(`simulate ${method} failed: ${sim.error}`);
       }
       return sim;
     },
-    { attempts: 3, timeoutMs: 8_000, baseDelayMs: 250, label: `simulateReadOnly(${method})` },
+    { attempts: 2, timeoutMs: 10_000, baseDelayMs: 300, label: `simulateReadOnly(${method})` },
   );
 }
 
 export async function getQuestionOnChain(questionId) {
   const sim = await simulateReadOnly('get_question', [u64Arg(questionId)]);
-  const raw = sim.result?.retval;
-  if (raw === undefined) return null;
-  const decoded = scValToNative(raw);
-  if (!decoded) return null;
-  return {
-    status: decodeStatus(decoded.status),
-    matchingWorkers: decoded.matching_workers ?? [],
-    losingWorkers: decoded.losing_workers ?? [],
-  };
+  const retval = sim.result?.retval;
+  if (retval === undefined) return null;
+  return scValToNative(retval);
 }
 
-export async function getWorkerOnChain(address) {
-  const sim = await simulateReadOnly('get_worker', [addressArg(address)]);
-  const raw = sim.result?.retval;
-  if (raw === undefined) return null;
-  const decoded = scValToNative(raw);
-  if (!decoded) return null;
-  return {
-    stake: decoded.stake !== undefined ? BigInt(decoded.stake) : 0n,
-    ttl: decoded.ttl !== undefined ? Number(decoded.ttl) : 0,
-  };
+export async function getWorkerOnChain(workerAddress) {
+  const sim = await simulateReadOnly('get_worker', [addressArg(workerAddress)]);
+  const retval = sim.result?.retval;
+  if (retval === undefined) return null;
+  return scValToNative(retval);
+}
+
+export async function getPayerBalanceOnChain(payerAddress) {
+  const sim = await simulateReadOnly('get_payer_balance', [addressArg(payerAddress)]);
+  const retval = sim.result?.retval;
+  if (retval === undefined) return 0n;
+  return scValToNative(retval);
 }

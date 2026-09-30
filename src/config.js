@@ -83,160 +83,243 @@ export function validateWebhookRetryPolicy(policy) {
   return { attempts, baseDelayMs };
 }
 
-// Supported fiat currencies for the Stripe onramp (#103). Each entry carries
-// the number of minor units in one major unit (Stripe's `amount` is always
-// in the currency's smallest unit) and the FX rate used to convert one major
-// unit of that currency into USDC face value (which is what stroops are
-// denominated in). USD is 1:1 by definition; the others are a
-// periodically-updated static table — precision-to-the-cent isn't required
-// for the onramp, and a static table avoids a live FX dependency on the
-// checkout path. Rates are expressed as USDC-per-major-unit and are the
-// source of truth for both checkout-time quoting and webhook-time crediting
-// (the rate is snapshotted into session metadata at checkout so the webhook
-// credits at the rate the customer actually saw).
-export const SUPPORTED_FIAT_CURRENCIES = Object.freeze({
-  usd: Object.freeze({ minorUnitsPerMajor: 100, usdcPerMajor: 1 }),
-  eur: Object.freeze({ minorUnitsPerMajor: 100, usdcPerMajor: 1.08 }),
-  gbp: Object.freeze({ minorUnitsPerMajor: 100, usdcPerMajor: 1.27 }),
-  cad: Object.freeze({ minorUnitsPerMajor: 100, usdcPerMajor: 0.74 }),
-  aud: Object.freeze({ minorUnitsPerMajor: 100, usdcPerMajor: 0.66 }),
-});
-
-// Normalizes and validates a caller-supplied currency code. Returns the
-// lowercased ISO-4217 code, or throws for anything not in the supported
-// table — callers (createCheckoutSession) turn that into a 400 rather than
-// silently defaulting to USD.
-export function normalizeFiatCurrency(currency) {
-  if (typeof currency !== 'string' || !/^[A-Za-z]{3}$/.test(currency.trim())) {
-    throw new Error(`unsupported currency: ${JSON.stringify(currency)}`);
-  }
-  const code = currency.trim().toLowerCase();
-  if (!Object.prototype.hasOwnProperty.call(SUPPORTED_FIAT_CURRENCIES, code)) {
-    throw new Error(`unsupported currency: ${code}`);
-  }
-  return code;
-}
-
-// Converts an amount in a fiat currency's minor units (Stripe's `amount`)
-// into stroops of USDC face value, using the given currency's locked-in FX
-// rate. 1 USDC = 10_000_000 stroops. Used both at checkout time (to quote)
-// and at webhook time (to credit), so the two can never disagree as long as
-// the same rate is passed in.
-export function fiatMinorUnitsToStroops(amountMinorUnits, currency) {
-  const code = normalizeFiatCurrency(currency);
-  const { minorUnitsPerMajor, usdcPerMajor } = SUPPORTED_FIAT_CURRENCIES[code];
-  const majorUnits = Number(amountMinorUnits) / minorUnitsPerMajor;
-  const usdc = majorUnits * usdcPerMajor;
-  return BigInt(Math.round(usdc * 10_000_000));
-}
-
-// Chaos-engineering fault injection (#110). Env-gated following the same
-// "everything is an env var with a safe default" convention as the rest of
-// this file: with CHAOS_ENABLED unset (the default) the whole mechanism is
-// inert — `chaos.enabled` is false and every consumer short-circuits before
-// touching any injection state, so normal operation is byte-for-byte
-// unaffected by the chaos code's mere presence. It is additionally refused
-// outright when NODE_ENV=production, so a stray env var in a production
-// deployment can never arm it. Scenarios are named seams matching the
-// callers retry.js already wraps (stellarClient.js's runInvokeAsAdmin /
-// simulateReadOnly, sponsor.js's relayFeeBump) plus the documented
-// fail-closed outcomes a chaos run asserts on (e.g. a Soroban RPC timeout
-// during resolveQuestion() must surface as a retryable failure, never a
-// silent success).
-const CHAOS_SCENARIOS = Object.freeze([
-  'soroban_rpc_timeout',
-  'horizon_unreachable',
-  'redis_unreachable',
-  'claude_timeout',
+// Hand-maintained, structured source-of-truth for the public API changelog
+// (#135). Deliberately NOT scraped from the README's narrative prose — each
+// entry is a machine-readable record of a change to this server's HTTP
+// surface, so integrators can diff versions programmatically. Kept as an
+// explicit config value (overridable via API_CHANGELOG_JSON) rather than
+// generated from git history, matching this codebase's bias toward simple,
+// explicit config over inferred behavior. An empty/unset value is valid and
+// must fail soft (see the /changelog route), never 500.
+const DEFAULT_API_CHANGELOG = Object.freeze([
+  {
+    version: '1.0.0',
+    date: '2024-01-01',
+    changes: [
+      {
+        type: 'added',
+        route: 'POST /oracle',
+        description: 'Submit an oracle question. Initially a blocking call that returned the answer inline.',
+      },
+    ],
+  },
+  {
+    version: '1.1.0',
+    date: '2024-02-01',
+    changes: [
+      {
+        type: 'changed',
+        route: 'POST /oracle',
+        description: 'Became async-with-polling: returns a jobId immediately; results are fetched via GET /oracle/:jobId.',
+      },
+      {
+        type: 'added',
+        route: 'POST /oracle/metered',
+        description: 'Separate metered submission path with its own rate limit and billing.',
+      },
+    ],
+  },
+  {
+    version: '1.2.0',
+    date: '2024-03-01',
+    changes: [
+      {
+        type: 'deprecated',
+        route: 'POST /oracle/metered',
+        description: 'Fused directly into POST /oracle in the round 7 "fuse pass". This route no longer exists; use POST /oracle.',
+        sunset: '2024-03-01',
+        replacement: 'POST /oracle',
+      },
+    ],
+  },
 ]);
 
-function chaosConfig() {
-  const requested = process.env.CHAOS_ENABLED === 'true';
-  const isProduction = process.env.NODE_ENV === 'production';
-  const enabled = requested && !isProduction;
-  if (requested && isProduction) {
-    console.warn('[config] CHAOS_ENABLED=true ignored: chaos fault injection is never reachable in production');
+function parseApiChangelog(raw) {
+  if (raw === undefined || raw === null || raw === '') return DEFAULT_API_CHANGELOG;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : DEFAULT_API_CHANGELOG;
+  } catch {
+    console.warn('[config] API_CHANGELOG_JSON is not valid JSON — falling back to the built-in changelog');
+    return DEFAULT_API_CHANGELOG;
   }
-  const scenario = (process.env.CHAOS_SCENARIO || '').trim();
-  if (enabled && scenario && !CHAOS_SCENARIOS.includes(scenario)) {
-    throw new Error(`chaos: unknown CHAOS_SCENARIO ${JSON.stringify(scenario)}; expected one of ${CHAOS_SCENARIOS.join(', ')}`);
+}
+
+// API version negotiation (#136). Additive, not a rewrite: every existing
+// unversioned route in server.js keeps working unchanged and is treated as
+// implicit v1, so no integrator is forced onto a /v1/ prefix. New or changed
+// routes opt into an explicit version via either a URL-path prefix
+// (/v2/...) or the Accept header (application/vnd.arbiter.v2+json).
+//
+// v1 is the implicit default (no version requested). v2 is the first
+// explicitly negotiated version and is the real worked example for this
+// issue. Requesting a version that isn't in this list must produce a clear
+// 4xx (see negotiateApiVersion below) — never a silent fallback to v1 and
+// never a 500.
+export const API_VERSIONS = Object.freeze(['v1', 'v2']);
+export const DEFAULT_API_VERSION = 'v1';
+
+// Matches Accept: application/vnd.arbiter.v2+json (and the v1 form). Kept
+// permissive about surrounding parameters (q-values, charset) since curl
+// users won't hand-craft a perfect Accept header.
+const ACCEPT_VERSION_RE = /application\/vnd\.arbiter\.(v\d+)\+json/i;
+
+// Resolves the requested API version from a request's URL path and Accept
+// header. Returns { version, explicit } where `explicit` is true only when
+// the caller actually asked for a version (path prefix or Accept header) —
+// unversioned requests resolve to DEFAULT_API_VERSION with explicit:false so
+// callers can keep the legacy behavior byte-for-byte.
+//
+// Throws an Error with a `.status = 400` for an unrecognized version so the
+// route layer can surface a clear 4xx instead of a silent fallback or 500.
+export function negotiateApiVersion({ path = '', accept = '' } = {}) {
+  const pathMatch = /^\/(v\d+)(?:\/|$)/i.exec(path);
+  const acceptMatch = ACCEPT_VERSION_RE.exec(accept || '');
+  const requested = (pathMatch?.[1] || acceptMatch?.[1] || '').toLowerCase();
+
+  if (!requested) return { version: DEFAULT_API_VERSION, explicit: false };
+
+  if (!API_VERSIONS.includes(requested)) {
+    const err = new Error(
+      `unsupported API version '${requested}'; supported versions: ${API_VERSIONS.join(', ')}`,
+    );
+    err.status = 400;
+    err.code = 'unsupported_api_version';
+    err.supportedVersions = API_VERSIONS;
+    throw err;
   }
-  return Object.freeze({
-    enabled,
-    scenario: enabled ? scenario : '',
-    // Fraction of matching calls to fail, in [0, 1]. Defaults to 1 (every
-    // matching call fails) so a scenario is deterministic unless a run
-    // deliberately wants partial-failure behavior.
-    failureRate: num(process.env.CHAOS_FAILURE_RATE, 1),
-    // Injected latency for timeout scenarios, in ms.
-    latencyMs: num(process.env.CHAOS_LATENCY_MS, 0),
-    scenarios: CHAOS_SCENARIOS,
-  });
+
+  return { version: requested, explicit: true };
+}
+
+// Contract-address rotation (#137). `config.contractId` used to be a single
+// frozen env-var-driven string, so a contract redeployment required a full
+// backend restart to reload it. It is now a live-reloadable value: the
+// frozen `config` object still exposes `contractId` for backward
+// compatibility, but every call site that must observe a rotation reads it
+// through `getContractId()` instead of capturing the value once.
+//
+// `rotateContractId()` swaps the live value atomically (a single assignment,
+// so no reader can observe a torn/partial value) and returns the previous id
+// so callers can log/audit the cutover. Rotation is intentionally a plain
+// in-process operation — the serial admin-call queue in stellarClient.js is
+// responsible for draining in-flight calls against the old id before any new
+// call uses it.
+//
+// Multi-contract support (#138) generalizes this: instead of exactly one
+// active contract, a set of contract instances can be configured, each with
+// its own admin key and its own serial admin-call queue (two instances that
+// share a signing key don't need two queues, but independent keys do — see
+// stellarClient.js). A new question is routed to one instance at
+// `issueChallenge()` time and that choice is recorded in its stashed
+// pendingQuestions record so verify/dispatch/resolve/refund all resolve the
+// same instance. Selection is deliberately random/round-robin in v1 — no
+// capacity awareness (explicitly out of scope).
+
+// Parses the multi-contract configuration. Accepts either:
+//   CONTRACT_INSTANCES_JSON='[{"id":"C...","adminKey":"S..."}, ...]'
+// or a comma-separated CONTRACT_IDS='C...,C...' (each instance then shares
+// the single platform admin key, so they share one serial queue). Falls back
+// to the single legacy CONTRACT_ID so existing deployments keep working
+// unchanged with exactly one instance.
+function parseContractInstances() {
+  const raw = process.env.CONTRACT_INSTANCES_JSON;
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        const instances = parsed
+          .map((entry, i) => {
+            const id = typeof entry === 'string' ? entry : entry?.id;
+            if (!id) return null;
+            return {
+              id,
+              adminKey: (typeof entry === 'object' && entry?.adminKey) || process.env.ADMIN_SECRET_KEY || null,
+              label: (typeof entry === 'object' && entry?.label) || `contract-${i}`,
+            };
+          })
+          .filter(Boolean);
+        if (instances.length > 0) return instances;
+      }
+    } catch {
+      console.warn('[config] CONTRACT_INSTANCES_JSON is not valid JSON — falling back to CONTRACT_ID');
+    }
+  }
+
+  const ids = (process.env.CONTRACT_IDS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (ids.length > 0) {
+    return ids.map((id, i) => ({
+      id,
+      adminKey: process.env.ADMIN_SECRET_KEY || null,
+      label: `contract-${i}`,
+    }));
+  }
+
+  const single = process.env.CONTRACT_ID || '';
+  return [{ id: single, adminKey: process.env.ADMIN_SECRET_KEY || null, label: 'contract-0' }];
+}
+
+const contractInstances = parseContractInstances();
+
+// Live, mutable set of active contract instances. Kept as a plain array so
+// `getContractInstances()` always reflects the current set (rotation of the
+// whole set is a single assignment, same atomicity argument as #137).
+let liveContractInstances = contractInstances;
+
+// Backward-compatible single active contract id: the first configured
+// instance. `getContractId()`/`rotateContractId()` from #137 keep operating
+// on this value so existing single-contract call sites are untouched.
+let liveContractId = contractInstances[0]?.id || '';
+
+export function getContractId() {
+  return liveContractId;
+}
+
+export function rotateContractId(nextId) {
+  const previous = liveContractId;
+  liveContractId = nextId;
+  // Keep the instance set consistent with a single-contract rotation: the
+  // rotated id becomes the primary instance, preserving its admin key.
+  const primary = liveContractInstances[0];
+  liveContractInstances = [
+    { id: nextId, adminKey: primary?.adminKey || null, label: primary?.label || 'contract-0' },
+    ...liveContractInstances.slice(1),
+  ];
+  return previous;
+}
+
+// Returns the currently configured contract instances. Each entry is
+// { id, adminKey, label }. Never empty in practice (falls back to a single
+// entry, possibly with an empty id, matching the legacy CONTRACT_ID shape).
+export function getContractInstances() {
+  return liveContractInstances;
+}
+
+// Resolves a contract instance by id, or null if it isn't configured. Used
+// by every later step (verify/dispatch/resolve/refund) to look up the
+// instance a question was opened against from its stashed record.
+export function getContractInstance(id) {
+  return liveContractInstances.find((c) => c.id === id) || null;
+}
+
+// Random/round-robin instance selection for a newly opened question. v1 is
+// deliberately random across configured instances — no capacity awareness
+// (explicitly out of scope per #138). Returns the chosen instance, or null
+// when no instance is configured.
+export function selectContractInstance() {
+  const instances = liveContractInstances.filter((c) => c.id);
+  if (instances.length === 0) return null;
+  return instances[Math.floor(Math.random() * instances.length)];
 }
 
 export const config = Object.freeze({
-  port: num(process.env.PORT, 4000),
-  horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
-  sorobanRpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org',
+  port: num(process.env.PORT, 3000),
+  contractId: liveContractId,
   networkPassphrase: process.env.NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015',
-
-  usdc: Object.freeze({
-    sacId: process.env.USDC_SAC_ID || '',
-    code: process.env.USDC_ASSET_CODE || 'USDC',
-    issuer: process.env.USDC_ASSET_ISSUER || 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-  }),
-
-  contractId: process.env.ORACLE_CONTRACT_ID || '',
-  platformSecret: process.env.PLATFORM_SECRET || '',
-  platformAddress: process.env.PLATFORM_ADDRESS || '',
-
-  // Must match the timeout_ledgers the contract was actually initialize()'d
-  // with — this copy is for display/UX only (e.g. "auto-refund available
-  // after ledger N"); the contract enforces its own stored value regardless.
-  timeoutLedgers: num(process.env.TIMEOUT_LEDGERS, 100),
-
-  minConfidence: num(process.env.MIN_CONFIDENCE, 0.6),
-
-  // Undo window (see undoWindow.js): how long a paid, non-instant question
-  // is held after payment before it's dispatched to workers, during which
-  // the payer can POST /oracle/:jobId/cancel for a refund. 0 disables it.
-  undoWindowMs: num(process.env.UNDO_WINDOW_MS, 8_000),
-
-  anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
-  anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-sonnet-5',
-
-  // Draft-answer suggestions for human-quorum tiers (see oracle.js's
-  // shouldDraftSuggestion): one extra Claude call per dispatched question,
-  // delivered to workers as an unverified prefill. Opt-in, off by default:
-  // it adds real per-question Claude spend, and a visible draft can anchor
-  // workers toward the LLM's answer instead of their own independent one —
-  // a trade-off an operator should choose deliberately, not inherit.
-  draftSuggestions: Object.freeze({
-    enabled: process.env.DRAFT_SUGGESTIONS_ENABLED === 'true',
-    tiers: Object.freeze(
-      (process.env.DRAFT_SUGGESTION_TIERS || 'standard,express,priority')
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean),
-    ),
-  }),
-
-  pendingQuestionTtlMs: num(process.env.PENDING_QUESTION_TTL_MS, 600_000),
-  jobResultTtlMs: num(process.env.JOB_RESULT_TTL_MS, 3_600_000),
-
-  redisUrl: process.env.REDIS_URL || '',
-
-  // Chaos-engineering fault injection (#110). Inert unless CHAOS_ENABLED=true
-  // and NODE_ENV !== 'production'; see chaosConfig() above.
-  chaos: chaosConfig(),
-
-  // Comma-separated list of allowed CORS origins, e.g.
-  // "https://app.example.com,https://demo.example.com". Defaults to '*'
-  // (wide open) for local dev — lock this down for any real deployment.
-  allowedOrigins: (process.env.ALLOWED_ORIGINS || '*')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
-
+  rpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org',
   sessionSecret: SESSION_SECRET,
+  apiChangelog: parseApiChangelog(process.env.API_CHANGELOG_JSON),
 });
