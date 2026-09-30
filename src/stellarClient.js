@@ -1,6 +1,7 @@
 import { Keypair, TransactionBuilder, Contract, Account, Address, nativeToScVal, scValToNative, rpc } from '@stellar/stellar-sdk';
 import { config } from './config.js';
 import { withRetry } from './retry.js';
+import { recordAdminInvocation } from './metrics.js';
 
 /** Chaos fault injection: env-gated, inert unless CHAOS_FAULT is set to a
  * recognized scenario. Follows config.js's "everything is an env var with a
@@ -225,7 +226,16 @@ export function createSerialQueue() {
 const serializeAdminCall = createSerialQueue();
 
 function invokeAsAdmin(method, scValArgs) {
-  return serializeAdminCall(() => runInvokeAsAdmin(method, scValArgs));
+  return serializeAdminCall(() => runInvokeAsAdmin(method, scValArgs)).then(
+    (result) => {
+      recordAdminInvocation(method, true);
+      return result;
+    },
+    (err) => {
+      recordAdminInvocation(method, false);
+      throw err;
+    },
+  );
 }
 
 /** Rotates the contract id only after every admin call already queued
@@ -329,11 +339,63 @@ async function simulateReadOnly(method, scValArgs = []) {
   );
 }
 
-export async function readQuestion(questionId) {
-  const sim = await simulateReadOnly('get_question', [u64Arg(questionId)]);
-  const raw = sim.result?.retval;
-  if (raw === undefined) return null;
-  return scValToNative(raw);
+/** Zero-fee simulated read — checks payment state without needing a signature. */
+export async function getQuestionOnChain(questionId) {
+  const native = await simulateReadOnly('get_question', [u64Arg(questionId)]);
+  if (!native) return null;
+  return {
+    payer: native.payer,
+    amount: BigInt(native.amount),
+    status: decodeStatus(native.status),
+    createdAt: Number(native.created_at),
+  };
+}
+
+/** Latest closed ledger per the RPC — used by the health probe and to age
+ * on-chain questions (Question.created_at is a ledger sequence). */
+export async function getLatestLedgerSequence() {
+  return withRetry(async () => (await getServer().getLatestLedger()).sequence, {
+    attempts: 2,
+    timeoutMs: 5_000,
+    baseDelayMs: 200,
+    label: 'getLatestLedger',
+  });
+}
+
+/** Size of the contract's on-chain Pending-question index (contract
+ * v0.3.0+; see pending_count() in arbiter-contract's lib.rs). */
+export async function getPendingCountOnChain() {
+  return Number((await simulateReadOnly('pending_count')) ?? 0);
+}
+
+/** One page (at most 100, the contract's MAX_PENDING_PAGE) of Pending
+ * question ids from the on-chain index, as decimal strings — the same
+ * representation jobs and pending stashes are keyed by. */
+export async function listPendingOnChain(start, limit = 100) {
+  const ids = await simulateReadOnly('list_pending', [
+    nativeToScVal(start, { type: 'u32' }),
+    nativeToScVal(limit, { type: 'u32' }),
+  ]);
+  return (ids ?? []).map((id) => BigInt(id).toString());
+}
+
+export async function getTimeoutLedgersOnChain() {
+  return simulateReadOnly('get_timeout_ledgers');
+}
+
+export async function getOwedOnChain(workerAddress) {
+  const owed = await simulateReadOnly('get_owed', [addressArg(workerAddress)]);
+  return BigInt(owed ?? 0);
+}
+
+export async function getStakeOnChain(workerAddress) {
+  const stake = await simulateReadOnly('get_stake', [addressArg(workerAddress)]);
+  return BigInt(stake ?? 0);
+}
+
+export async function getBalanceOnChain(payerAddress) {
+  const balance = await simulateReadOnly('get_balance', [addressArg(payerAddress)]);
+  return BigInt(balance ?? 0);
 }
 
 export async function readWorker(workerAddress) {
