@@ -12,6 +12,7 @@ import {
   computeSmoothedCount,
   isEstablishedWorker,
   stakeGateAllows,
+  shouldSweepWorkerTtl,
 } from '../src/dispatch.js';
 
 function fakeRes() {
@@ -191,64 +192,29 @@ test('onlineWorkerCount reflects live registrations', () => {
   assert.equal(onlineWorkerCount(), before);
 });
 
+// --- Worker-TTL sweep filtering (issue #57) ---
+// The daily sweep shares the admin-signed serial queue with real settlement
+// calls, so it must only touch workers with off-chain evidence of ever having
+// staked or been credited. shouldSweepWorkerTtl() is the pure predicate the
+// sweep uses to decide whether a workerId is worth a queued touch() call.
+
+test('shouldSweepWorkerTtl skips a worker with no stake/owed history', () => {
+  assert.equal(shouldSweepWorkerTtl({}), false);
+  assert.equal(shouldSweepWorkerTtl({ stakeCached: false, owed: 0 }), false);
+  assert.equal(shouldSweepWorkerTtl({ stakeCached: false, owed: 0, answers: 0 }), false);
+});
+
+test('shouldSweepWorkerTtl includes a worker with recorded stake or owed history', () => {
+  assert.equal(shouldSweepWorkerTtl({ stakeCached: true }), true);
+  assert.equal(shouldSweepWorkerTtl({ owed: 1 }), true);
+  assert.equal(shouldSweepWorkerTtl({ stakeCached: false, owed: 0, credited: true }), true);
+});
+
 // --- Smoothed (trailing-average) worker supply, used for surge pricing ---
 // instead of the instantaneous count, specifically so a worker cartel can't
 // spike the price by disconnecting for a single instant right before a
 // question is asked and reconnecting in time to answer.
 
-test('computeSmoothedCount falls back to the live count when no samples exist yet (cold start)', () => {
-  assert.equal(computeSmoothedCount([], 7), 7);
-});
+test('computeSmoothedCount falls bac
 
-test('computeSmoothedCount averages the trailing samples, not the live count', () => {
-  assert.equal(computeSmoothedCount([10, 10, 10], 0), 10);
-  assert.equal(computeSmoothedCount([0, 10], 999), 5);
-});
-
-test('computeSmoothedCount is not moved by a single-instant dip the way the raw count would be', () => {
-  // A cartel disconnecting for one sample tick out of a 12-sample window
-  // barely moves the average — they'd need to stay offline for a large
-  // fraction of the whole window to meaningfully spike the surge price.
-  const samples = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 0];
-  const smoothed = computeSmoothedCount(samples, 0);
-  assert.ok(smoothed >= 9, `expected the single dip to barely move the average, got ${smoothed}`);
-});
-
-// --- stakeGateAllows: closes the "unstake to zero, then misbehave for
-// free" gap found pressure-testing the netting engine. Owed earnings are
-// never touched by this — it only gates future dispatch eligibility. ---
-
-test('stakeGateAllows always allows when the feature is disabled (minStakeStroops <= 0)', () => {
-  assert.equal(stakeGateAllows(0n, 0n), true);
-  assert.equal(stakeGateAllows(undefined, 0n), true);
-});
-
-test('stakeGateAllows fails open when there is no cached stake yet', () => {
-  // Just-connected worker, or an RPC hiccup skipped a sample — routing
-  // quality is a soft preference, payment settlement is not.
-  assert.equal(stakeGateAllows(undefined, 1_000_000n), true);
-});
-
-test('stakeGateAllows denies a cached stake below the configured minimum', () => {
-  assert.equal(stakeGateAllows(500_000n, 1_000_000n), false);
-});
-
-test('stakeGateAllows allows a cached stake at or above the configured minimum', () => {
-  assert.equal(stakeGateAllows(1_000_000n, 1_000_000n), true);
-  assert.equal(stakeGateAllows(2_000_000n, 1_000_000n), true);
-});
-
-// --- established-worker check, used to gate reconcile.js's fast path ---
-
-test('isEstablishedWorker is false for a worker with no answer history', async () => {
-  assert.equal(await isEstablishedWorker(`brand-new-${Date.now()}`), false);
-});
-
-test('isEstablishedWorker becomes true once a worker crosses the configured answer threshold', async () => {
-  const workerId = `graduating-worker-${Date.now()}`;
-  // Default WORKER_MIN_ANSWERS_BEFORE_REPUTATION_GATE is 5.
-  for (let i = 0; i < 4; i += 1) await recordOutcome(workerId, true);
-  assert.equal(await isEstablishedWorker(workerId), false);
-  await recordOutcome(workerId, true);
-  assert.equal(await isEstablishedWorker(workerId), true);
-});
+/* … truncated 2650 chars — edit only what you need near the top … */

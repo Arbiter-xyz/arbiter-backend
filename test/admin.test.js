@@ -57,6 +57,25 @@ test('listWorkers reports reputation for a non-address workerId without touching
   assert.equal(row.stake, '0.0000000'); // non-address id: chain reads are skipped, defaults to 0
 });
 
+test('listWorkers treats a 56-char G-prefixed but invalid-checksum id as a non-address', async () => {
+  // 56 chars, starts with 'G', but not a valid base32/checksum Ed25519 public key.
+  const pseudoAddress = `G${'A'.repeat(55)}`;
+  assert.equal(pseudoAddress.length, 56);
+  assert.ok(pseudoAddress.startsWith('G'));
+
+  await recordOutcome(pseudoAddress, true);
+
+  const workers = await listWorkers();
+  const row = workers.find((w) => w.workerId === pseudoAddress);
+  assert.ok(row, 'worker with a recorded outcome should appear in listWorkers');
+  assert.equal(row.totalAnswers, 1);
+  assert.equal(row.matched, 1);
+  // Invalid checksum: StrKey.isValidEd25519PublicKey() is false, so the
+  // on-chain stake read is skipped and defaults to 0 rather than being
+  // attempted and silently swallowed by the surrounding .catch(() => 0n).
+  assert.equal(row.stake, '0.0000000');
+});
+
 test('listPayers aggregates a payer\'s tracked questions', async () => {
   const payerAddress = uniqueId('GPAYER');
   const questionId = uniqueId('q');
@@ -68,6 +87,24 @@ test('listPayers aggregates a payer\'s tracked questions', async () => {
   assert.ok(row, 'payer should appear in listPayers');
   assert.equal(row.totalTracked, 1);
   assert.equal(row.settled, 1);
+});
+
+test('listPayers paginates the tracked payer index', async () => {
+  const payerAddresses = [];
+  for (let i = 0; i < 5; i += 1) {
+    const payerAddress = uniqueId('GPAYER-page');
+    const questionId = uniqueId('q');
+    await createJob(questionId, { amountStroops: '1000000' });
+    await recordPayerQuestion(payerAddress, questionId);
+    payerAddresses.push(payerAddress);
+  }
+
+  const page = await listPayers({ limit: 2, offset: 0 });
+  assert.ok(Array.isArray(page), 'listPayers should return an array');
+  assert.ok(page.length <= 2, `expected at most 2 payers, got ${page.length}`);
+  for (const row of page) {
+    assert.ok(payerAddresses.includes(row.payerAddress), `unexpected payer ${row.payerAddress} in page`);
+  }
 });
 
 test('getFeeRevenue sums the platform\'s 20% cut only over settled+resolved jobs', async () => {
