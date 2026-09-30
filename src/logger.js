@@ -21,9 +21,64 @@ import { config } from './config.js';
 // worker/payer session token sent via `Authorization` lands verbatim in
 // every request log line, worse in LOG_FORMAT=json production mode
 // feeding an external aggregator most operators can't fully lock down.
-// Exported standalone so the redaction behavior is directly testable
-// against a real pino instance without needing the app's own transport.
-export const REDACT_CONFIG = { paths: ['req.headers.authorization', 'req.headers.cookie'], censor: '[redacted]' };
+// The admin second-factor code (X-Admin-TOTP) is a live credential for
+// the same reason and gets the same treatment — a leaked log line must
+// never be enough to replay a valid 2FA code. Exported standalone so the
+// redaction behavior is directly testable against a real pino instance
+// without needing the app's own transport.
+export const REDACT_CONFIG = {
+  paths: ['req.headers.authorization', 'req.headers.cookie', 'req.headers["x-admin-totp"]'],
+  censor: '[redacted]',
+};
+
+// #132: session recording/replay for admin console actions. This backend
+// has no admin console frontend, so "session replay" here means capturing
+// the ordered sequence of admin API calls (with redacted request context)
+// that can be replayed as a readable timeline for debugging tickets — not
+// UI pixels/mouse movements, which would live in a frontend repo. The
+// recording reuses #129's audit log rather than a parallel mechanism: the
+// same redaction rules that keep Authorization/cookie headers out of
+// request logs are applied to the recorded request context so a recorded
+// session can never leak the credentials that authorized it.
+//
+// Redaction is applied to a plain object (not a pino instance) so the
+// audit/recording layer can sanitize request context before persisting it,
+// keeping the recorded sequence consistent with REDACT_CONFIG above.
+const REDACTED_HEADER_KEYS = ['authorization', 'cookie'];
+
+/**
+ * Returns a shallow copy of `headers` with sensitive header values replaced
+ * by the same censor used in REDACT_CONFIG. Header lookup is
+ * case-insensitive (Node lowercases incoming header names, but callers may
+ * pass either casing) so Authorization/Cookie can't slip through under a
+ * different case. Used when recording admin request context for session
+ * replay so recorded sessions are redacted identically to request logs.
+ */
+export function redactHeaders(headers = {}) {
+  const out = {};
+  for (const [key, value] of Object.entries(headers)) {
+    out[key] = REDACTED_HEADER_KEYS.includes(key.toLowerCase()) ? REDACT_CONFIG.censor : value;
+  }
+  return out;
+}
+
+/**
+ * Builds the redacted request context recorded for one admin action in a
+ * session. Keeps the fields needed to reconstruct the sequence of admin
+ * calls (method, path, query, redacted headers, body) while stripping the
+ * credentials that authorized the call. `body` is passed through as-is by
+ * the caller after any endpoint-specific redaction; headers are always
+ * redacted here so the recording can't diverge from REDACT_CONFIG.
+ */
+export function recordRequestContext(req) {
+  return {
+    method: req.method,
+    path: req.originalUrl || req.url,
+    query: req.query || {},
+    headers: redactHeaders(req.headers),
+    body: req.body ?? null,
+  };
+}
 
 export const logger = pino({
   level: config.logLevel,
@@ -54,4 +109,18 @@ export const httpLogger = pinoHttp({
  * lifecycle is trivially greppable/filterable by that one field. */
 export function jobLogger(questionId) {
   return logger.child({ questionId: String(questionId) });
+}
+
+/**
+ * Logger for the scheduled synthetic monitor (#111). Every line carries
+ * `synthetic: true` so a synthetic run's lifecycle (dispatch -> reconcile
+ * -> settle) is trivially separable from real customer traffic in logs
+ * and alerting — a failed synthetic run (timeout, refund, error) is
+ * distinguishable from a successful one without being confused with a
+ * real incident. The synthetic monitor follows the same real paid
+ * /oracle path as demo-agent/ask.js, so it reuses jobLogger()'s
+ * questionId correlation and just adds the synthetic tag on top.
+ */
+export function syntheticLogger(questionId) {
+  return jobLogger(questionId).child({ synthetic: true });
 }
