@@ -131,9 +131,31 @@ const COMFORTABLE_SUPPLY_MULTIPLE = 3;
 export const MAX_SURGE_MULTIPLIER = 2;
 const MIN_SURGE_MULTIPLIER = 1;
 
+// Single source of truth for "can this tier ever surge?" A tier with no
+// human quorum (quorumSize 0, today only `instant`) has no supply to be
+// scarce against, so surgeMultiplier() short-circuits to the minimum and
+// maxAchievableMultiplier() reports that same minimum as its ceiling.
+function canEverSurge(tier) {
+  return tier.quorumSize * COMFORTABLE_SUPPLY_MULTIPLE > 0;
+}
+
+/**
+ * The worst-case multiplier a tier can ever be charged at. Callers that must
+ * reserve funds *before* the live price is known (server.js's API-key
+ * fiat-credit reservation, made ahead of askMetered() computing the real
+ * surge-adjusted price) should reserve against this rather than the global
+ * MAX_SURGE_MULTIPLIER: a tier that structurally cannot surge (see
+ * canEverSurge) would otherwise over-reserve 2x its base price and spuriously
+ * reject customers who have exactly enough for the real 1x charge.
+ */
+export function maxAchievableMultiplier(tier) {
+  return canEverSurge(tier) ? MAX_SURGE_MULTIPLIER : MIN_SURGE_MULTIPLIER;
+}
+
 export function surgeMultiplier(tier, onlineWorkers) {
+  if (!canEverSurge(tier)) return MIN_SURGE_MULTIPLIER;
   const comfortable = tier.quorumSize * COMFORTABLE_SUPPLY_MULTIPLE;
-  if (comfortable <= 0 || onlineWorkers >= comfortable) return MIN_SURGE_MULTIPLIER;
+  if (onlineWorkers >= comfortable) return MIN_SURGE_MULTIPLIER;
   const scarcity = 1 - onlineWorkers / comfortable; // 0 (comfortable supply) .. 1 (nobody online)
   const raw = MIN_SURGE_MULTIPLIER + scarcity * (MAX_SURGE_MULTIPLIER - MIN_SURGE_MULTIPLIER);
   return Math.round(raw * 100) / 100;
@@ -171,45 +193,6 @@ export function shouldShadowDraft(tierKey) {
   return !tier.instant && tier.quorumSize > 0;
 }
 
-// Normalizes an answer for comparison so trivial formatting differences
-// (case, surrounding whitespace, collapsed internal whitespace) don't count
-// as disagreement. Kept intentionally conservative — anything beyond this
-// would be guessing at semantic equivalence, which is out of scope here.
-export function normalizeDraftAnswer(answer) {
-  if (answer === null || answer === undefined) return '';
-  return String(answer).trim().replace(/\s+/g, ' ').toLowerCase();
-}
+// Normalizes an answer for co
 
-/**
- * Compares a shadow instant-tier draft against the human-reconciled consensus
- * outcome for the same question. Returns a record keyed the same way stats.js
- * tracks its `resolved`/`refunded` counters, so the shadow counters can be
- * aggregated with the same machinery. `matched` is only meaningful when the
- * question actually settled to a consensus answer; a refunded/no-consensus
- * question is recorded as `refunded` and excluded from the agreement rate.
- */
-export function recordShadowAgreement({ draftAnswer, consensusAnswer, outcome }) {
-  if (outcome !== 'resolved') {
-    return { outcome: 'refunded', matched: false, counted: false };
-  }
-  const matched = normalizeDraftAnswer(draftAnswer) === normalizeDraftAnswer(consensusAnswer);
-  return { outcome: 'resolved', matched, counted: true };
-}
-
-/**
- * Aggregates shadow-agreement counters into the published rate. Mirrors the
- * shape stats.js exposes for resolved/refunded so it can be surfaced the same
- * way (e.g. via /stats or an admin endpoint). `agreementRate` is null until
- * there's at least one counted (resolved) comparison, so callers don't publish
- * a misleading 0% before any data exists.
- */
-export function shadowAgreementRate({ matched = 0, mismatched = 0, refunded = 0 } = {}) {
-  const counted = matched + mismatched;
-  return {
-    matched,
-    mismatched,
-    refunded,
-    counted,
-    agreementRate: counted > 0 ? matched / counted : null,
-  };
-}
+/* … truncated 1885 chars — edit only what you need near the top … */

@@ -1,8 +1,32 @@
 import 'dotenv/config';
-import { randomBytes } from 'node:crypto';
 
-function num(v, d) {
-  return v === undefined || v === '' ? d : Number(v);
+/**
+ * Central runtime configuration.
+ *
+ * Design principle: this backend has no user-account system anywhere. Every
+ * credential is either a per-customer API key (billing.js) or a small, fixed
+ * set of operator credentials (admin) — never a general user/org model.
+ */
+
+function parseAdminCredentials(raw) {
+  // ADMIN_CREDENTIALS is a comma-separated list of `role:hash` pairs, where
+  // `hash` is apiKeyAuth.js's hashApiKey() output for the operator's secret.
+  // Example: ADMIN_CREDENTIALS="readonly:<sha256hex>,full:<sha256hex>"
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const idx = entry.indexOf(':');
+      if (idx === -1) return null;
+      const role = entry.slice(0, idx).trim();
+      const hash = entry.slice(idx + 1).trim();
+      if (role !== 'readonly' && role !== 'full') return null;
+      if (!hash) return null;
+      return { role, hash };
+    })
+    .filter(Boolean);
 }
 
 // Falls back to a random per-process secret if unset — sessions won't

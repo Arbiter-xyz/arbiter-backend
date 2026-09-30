@@ -2,6 +2,30 @@ import { Keypair, TransactionBuilder, Contract, Account, Address, nativeToScVal,
 import { config } from './config.js';
 import { withRetry } from './retry.js';
 
+/** Chaos fault injection: env-gated, inert unless CHAOS_FAULT is set to a
+ * recognized scenario. Follows config.js's "everything is an env var with a
+ * safe default" convention — the default (unset) leaves every code path
+ * byte-for-byte identical to before this existed. Never reachable in
+ * production: config.chaosFault is only honored when config.chaosEnabled is
+ * true, which itself requires an explicit env opt-in. */
+function chaosFault() {
+  if (!config.chaosEnabled) return null;
+  return config.chaosFault || null;
+}
+
+/** Wraps a Soroban RPC call so a chaos scenario can inject a transient
+ * failure at exactly the seam retry.js already wraps. When no fault is
+ * configured this is a pass-through with zero behavioral change. */
+async function withChaosFault(operation, fn) {
+  const fault = chaosFault();
+  if (fault === `rpc-timeout:${operation}` || fault === `rpc-timeout:${operation}:once`) {
+    const err = new Error(`chaos: injected RPC timeout during ${operation}`);
+    err.code = 'CHAOS_INJECTED_TIMEOUT';
+    throw err;
+  }
+  return fn();
+}
+
 let server = null;
 export function getServer() {
   if (!server) {
@@ -88,15 +112,15 @@ async function runInvokeAsAdmin(method, scValArgs) {
         .setTimeout(60)
         .build();
 
-      const prepared = await srv.prepareTransaction(tx);
+      const prepared = await withChaosFault(`prepareTransaction:${method}`, () => srv.prepareTransaction(tx));
       prepared.sign(admin);
 
-      const sendResult = await srv.sendTransaction(prepared);
+      const sendResult = await withChaosFault(`sendTransaction:${method}`, () => srv.sendTransaction(prepared));
       if (sendResult.status === 'ERROR') {
         throw new Error(`submit failed for ${method}: ${JSON.stringify(sendResult.errorResult ?? sendResult)}`);
       }
 
-      const finalResult = await srv.pollTransaction(sendResult.hash);
+      const finalResult = await withChaosFault(`pollTransaction:${method}`, () => srv.pollTransaction(sendResult.hash));
       if (finalResult.status !== 'SUCCESS') {
         throw new Error(`${method} transaction ${sendResult.hash} did not succeed: ${finalResult.status}`);
       }
@@ -214,7 +238,7 @@ async function simulateReadOnly(method, scValArgs = []) {
 
       const tx = new TransactionBuilder(simSource, { fee: '100', networkPassphrase: config.networkPassphrase })
         .addOperation(contract.call(method, ...scValArgs))
-        .setTimeout(30)
+        .setTimeout(60)
         .build();
 
       const sim = await srv.simulateTransaction(tx);
