@@ -1,44 +1,56 @@
 import { StellarToml } from '@stellar/stellar-sdk';
-import { config } from './config.js';
+import { withRetry } from './retry.js';
+import { logger } from './logger.js';
 
 /**
- * Arbiter is a CLIENT of the configured anchor's stellar.toml — never a
- * money transmitter itself. This module's only job is resolving and
- * caching that public config so the frontend doesn't need to CORS-fetch
- * an arbitrary third-party domain's .well-known/stellar.toml directly
- * (some anchors don't set permissive CORS on that file, even though they
- * do on the SEP-10/24/12 endpoints themselves, which exist specifically
- * to be called from a browser).
- *
- * Deliberately does NOT proxy SEP-10 challenge/sign, SEP-24 interactive
- * deposit/withdraw, or SEP-12 customer status: those are all gated by a
- * JWT that only the account holder can obtain (by signing the SEP-10
- * challenge themselves), so this backend has no authority to fetch them
- * on a user's behalf. The frontend calls those endpoints directly against
- * the anchor using the config this module resolves — see app/src/anchor.js.
+ * Bounded on purpose: this is the one external call in the codebase that
+ * previously relied on the Stellar SDK's global timeout default of 0
+ * (unbounded), so a slow or hanging `ANCHOR_HOME_DOMAIN` could stall
+ * `GET /anchor/config` indefinitely. A `.well-known/stellar.toml` fetch is
+ * tiny, so a few seconds is plenty; the caching layer below means a
+ * transient failure does not need to be low-latency-recovered, but a
+ * retry matches the convention every other read-only chain-adjacent call
+ * in this codebase already follows.
  */
+const TOML_FETCH_TIMEOUT_MS = 5_000;
+const TOML_FETCH_ATTEMPTS = 3;
 
-const CACHE_TTL_MS = 10 * 60 * 1000;
-let cached = null; // { config, expiresAt }
+const CACHE_TTL_MS = 5 * 60 * 1000;
 
-export function isAnchorConfigured() {
-  return Boolean(config.anchor.homeDomain);
-}
+let cache = { value: null, expiresAt: 0 };
 
-export async function getAnchorConfig() {
-  if (!isAnchorConfigured()) return null;
-  if (cached && cached.expiresAt > Date.now()) return cached.config;
+/**
+ * Fetch and cache the anchor's stellar.toml. The resolve call is wrapped in
+ * `withRetry` (which applies `withTimeout`) so a hanging third-party domain
+ * rejects within the configured bound instead of hanging the request.
+ */
+export async function getAnchorConfig(config) {
+  const now = Date.now();
+  if (cache.value && cache.expiresAt > now) {
+    return cache.value;
+  }
 
-  const toml = await StellarToml.Resolver.resolve(config.anchor.homeDomain);
-  const resolved = {
+  const toml = await withRetry(
+    () => StellarToml.Resolver.resolve(config.anchor.homeDomain),
+    {
+      attempts: TOML_FETCH_ATTEMPTS,
+      timeoutMs: TOML_FETCH_TIMEOUT_MS,
+      label: 'stellar.toml resolve',
+    },
+  );
+
+  const value = {
     homeDomain: config.anchor.homeDomain,
-    signingKey: toml.SIGNING_KEY || null,
-    webAuthEndpoint: toml.WEB_AUTH_ENDPOINT || null,
-    transferServerSep24: toml.TRANSFER_SERVER_SEP0024 || null,
-    kycServer: toml.KYC_SERVER || null,
-    quoteServer: toml.ANCHOR_QUOTE_SERVER || null,
+    signingKey: toml?.SIGNING_KEY ?? null,
+    webAuthEndpoint: toml?.WEB_AUTH_ENDPOINT ?? null,
+    transferServer: toml?.TRANSFER_SERVER_SEP0024 ?? toml?.TRANSFER_SERVER ?? null,
   };
 
-  cached = { config: resolved, expiresAt: Date.now() + CACHE_TTL_MS };
-  return resolved;
+  cache = { value, expiresAt: now + CACHE_TTL_MS };
+  logger.info({ homeDomain: config.anchor.homeDomain }, 'anchor config resolved');
+  return value;
+}
+
+export function clearAnchorConfigCache() {
+  cache = { value: null, expiresAt: 0 };
 }

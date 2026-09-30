@@ -32,6 +32,45 @@ export async function nextQuestionId() {
   return (PROCESS_SALT << 32n) | BigInt(seq);
 }
 
+/**
+ * The set of configured contract instances a question may be opened against.
+ * Each entry carries its own contract id and (optionally) its own admin key,
+ * since two instances with independent platform keys must not share a serial
+ * queue. Falls back to the single legacy `config.contractId` when no explicit
+ * set is configured, so existing single-contract deployments keep working.
+ */
+export function getContractInstances() {
+  if (Array.isArray(config.contracts) && config.contracts.length > 0) {
+    return config.contracts;
+  }
+  return [{ id: config.contractId }];
+}
+
+/**
+ * Pick which configured contract instance a new question opens against.
+ * Random assignment across the configured set is sufficient for v1 (see
+ * issue #138 out-of-scope: no capacity-aware selection yet). The chosen
+ * instance is recorded in the stashed record so every later step resolves
+ * the same instance.
+ */
+export function pickContractInstance() {
+  const instances = getContractInstances();
+  return instances[Math.floor(Math.random() * instances.length)];
+}
+
+/**
+ * Resolve the contract instance a given question was opened against, using
+ * the instance recorded in its stashed record. Returns undefined when the
+ * record is missing or predates multi-contract support, letting callers fall
+ * back to the legacy single-contract path.
+ */
+export async function getStashedContractInstance(questionId) {
+  const stashed = await getStashedQuestion(questionId);
+  if (!stashed || !stashed.contractId) return undefined;
+  const instances = getContractInstances();
+  return instances.find((instance) => instance.id === stashed.contractId);
+}
+
 export async function stashQuestion(questionId, data) {
   await store.set(PREFIX + questionId.toString(), data, config.pendingQuestionTtlMs);
 }

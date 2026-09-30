@@ -1,8 +1,32 @@
 import 'dotenv/config';
-import { randomBytes } from 'node:crypto';
 
-function num(v, d) {
-  return v === undefined || v === '' ? d : Number(v);
+/**
+ * Central runtime configuration.
+ *
+ * Design principle: this backend has no user-account system anywhere. Every
+ * credential is either a per-customer API key (billing.js) or a small, fixed
+ * set of operator credentials (admin) — never a general user/org model.
+ */
+
+function parseAdminCredentials(raw) {
+  // ADMIN_CREDENTIALS is a comma-separated list of `role:hash` pairs, where
+  // `hash` is apiKeyAuth.js's hashApiKey() output for the operator's secret.
+  // Example: ADMIN_CREDENTIALS="readonly:<sha256hex>,full:<sha256hex>"
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const idx = entry.indexOf(':');
+      if (idx === -1) return null;
+      const role = entry.slice(0, idx).trim();
+      const hash = entry.slice(idx + 1).trim();
+      if (role !== 'readonly' && role !== 'full') return null;
+      if (!hash) return null;
+      return { role, hash };
+    })
+    .filter(Boolean);
 }
 
 // Falls back to a random per-process secret if unset — sessions won't
@@ -77,8 +101,17 @@ export const contractCompatibility = Object.freeze({
 export const config = Object.freeze({
   port: num(process.env.PORT, 4000),
   horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
-  sorobanRpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org',
+  // Primary RPC URL — kept for backward compatibility with existing callers
+  // that read config.sorobanRpcUrl directly. Equals sorobanRpcUrls[0].
+  sorobanRpcUrl: sorobanRpcUrls[0],
+  // Full ordered list of configured RPC endpoints (primary first).
+  sorobanRpcUrls: Object.freeze(sorobanRpcUrls),
   networkPassphrase: process.env.NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015',
+
+  // Which deployment this process is (#150): 'demo' (disposable) or
+  // 'sandbox' (long-lived developer sandbox). Surfaced so /health and the
+  // README can distinguish the two environments unambiguously.
+  deploymentProfile,
 
   usdc: Object.freeze({
     sacId: process.env.USDC_SAC_ID || '',
@@ -100,36 +133,52 @@ export const config = Object.freeze({
   // after ledger N"); the contract enforces its own stored value regardless.
   timeoutLedgers: num(process.env.TIMEOUT_LEDGERS, 100),
 
-  minConfidence: num(process.env.MIN_CONFIDENCE, 0.6),
+// API version negotiation (#136). Additive, not a rewrite: every existing
+// unversioned route in server.js keeps working unchanged and is treated as
+// implicit v1, so no integrator is forced onto a /v1/ prefix. New or changed
+// routes opt into an explicit version via either a URL-path prefix
+// (/v2/...) or the Accept header (application/vnd.arbiter.v2+json).
+//
+// v1 is the implicit default (no version requested). v2 is the first
+// explicitly negotiated version and is the real worked example for this
+// issue. Requesting a version that isn't in this list must produce a clear
+// 4xx (see negotiateApiVersion below) — never a silent fallback to v1 and
+// never a 500.
+export const API_VERSIONS = Object.freeze(['v1', 'v2']);
+export const DEFAULT_API_VERSION = 'v1';
 
-  // Undo window (see undoWindow.js): how long a paid, non-instant question
-  // is held after payment before it's dispatched to workers, during which
-  // the payer can POST /oracle/:jobId/cancel for a refund. 0 disables it.
-  undoWindowMs: num(process.env.UNDO_WINDOW_MS, 8_000),
+// Matches Accept: application/vnd.arbiter.v2+json (and the v1 form). Kept
+// permissive about surrounding parameters (q-values, charset) since curl
+// users won't hand-craft a perfect Accept header.
+const ACCEPT_VERSION_RE = /application\/vnd\.arbiter\.(v\d+)\+json/i;
 
-  anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
-  anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-sonnet-5',
+// Resolves the requested API version from a request's URL path and Accept
+// header. Returns { version, explicit } where `explicit` is true only when
+// the caller actually asked for a version (path prefix or Accept header) —
+// unversioned requests resolve to DEFAULT_API_VERSION with explicit:false so
+// callers can keep the legacy behavior byte-for-byte.
+//
+// Throws an Error with a `.status = 400` for an unrecognized version so the
+// route layer can surface a clear 4xx instead of a silent fallback or 500.
+export function negotiateApiVersion({ path = '', accept = '' } = {}) {
+  const pathMatch = /^\/(v\d+)(?:\/|$)/i.exec(path);
+  const acceptMatch = ACCEPT_VERSION_RE.exec(accept || '');
+  const requested = (pathMatch?.[1] || acceptMatch?.[1] || '').toLowerCase();
 
-  // Draft-answer suggestions for human-quorum tiers (see oracle.js's
-  // shouldDraftSuggestion): one extra Claude call per dispatched question,
-  // delivered to workers as an unverified prefill. Opt-in, off by default:
-  // it adds real per-question Claude spend, and a visible draft can anchor
-  // workers toward the LLM's answer instead of their own independent one —
-  // a trade-off an operator should choose deliberately, not inherit.
-  draftSuggestions: Object.freeze({
-    enabled: process.env.DRAFT_SUGGESTIONS_ENABLED === 'true',
-    tiers: Object.freeze(
-      (process.env.DRAFT_SUGGESTION_TIERS || 'standard,express,priority')
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean),
-    ),
-  }),
+  if (!requested) return { version: DEFAULT_API_VERSION, explicit: false };
 
-  pendingQuestionTtlMs: num(process.env.PENDING_QUESTION_TTL_MS, 600_000),
-  jobResultTtlMs: num(process.env.JOB_RESULT_TTL_MS, 3_600_000),
+  if (!API_VERSIONS.includes(requested)) {
+    const err = new Error(
+      `unsupported API version '${requested}'; supported versions: ${API_VERSIONS.join(', ')}`,
+    );
+    err.status = 400;
+    err.code = 'unsupported_api_version';
+    err.supportedVersions = API_VERSIONS;
+    throw err;
+  }
 
-  redisUrl: process.env.REDIS_URL || '',
+  return { version: requested, explicit: true };
+}
 
   // Cross-instance quorum collection (#160). When more than one backend
   // instance is running, a question's collector lives in the memory of
@@ -157,22 +206,60 @@ export const config = Object.freeze({
   // (wide open) for local dev — lock this down for any real deployment.
   allowedOrigins: (process.env.ALLOWED_ORIGINS || '*').split(',').map((s) => s.trim()).filter(Boolean),
 
-  // 'json' for real deployments (log aggregators parse JSON lines
-  // directly); anything else pretty-prints for local dev readability.
-  logFormat: process.env.LOG_FORMAT || 'pretty',
-  logLevel: process.env.LOG_LEVEL || 'info',
+// Parses the multi-contract configuration. Accepts either:
+//   CONTRACT_INSTANCES_JSON='[{"id":"C...","adminKey":"S..."}, ...]'
+// or a comma-separated CONTRACT_IDS='C...,C...' (each instance then shares
+// the single platform admin key, so they share one serial queue). Falls back
+// to the single legacy CONTRACT_ID so existing deployments keep working
+// unchanged with exactly one instance.
+function parseContractInstances() {
+  const raw = process.env.CONTRACT_INSTANCES_JSON;
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        const instances = parsed
+          .map((entry, i) => {
+            const id = typeof entry === 'string' ? entry : entry?.id;
+            if (!id) return null;
+            return {
+              id,
+              adminKey: (typeof entry === 'object' && entry?.adminKey) || process.env.ADMIN_SECRET_KEY || null,
+              label: (typeof entry === 'object' && entry?.label) || `contract-${i}`,
+            };
+          })
+          .filter(Boolean);
+        if (instances.length > 0) return instances;
+      }
+    } catch {
+      console.warn('[config] CONTRACT_INSTANCES_JSON is not valid JSON — falling back to CONTRACT_ID');
+    }
+  }
 
-  // Response security headers (see securityHeaders.js). CSP_CONNECT_SRC is a
-  // comma-separated list of extra origins the frontend may fetch()/stream
-  // from — only needed when the UI is hosted on a different origin than
-  // this API. HSTS_ENABLED=false turns off Strict-Transport-Security.
-  securityHeaders: Object.freeze({
-    connectSrc: (process.env.CSP_CONNECT_SRC || '').split(',').map((s) => s.trim()).filter(Boolean),
-    hsts: process.env.HSTS_ENABLED !== 'false',
+  const ids = (process.env.CONTRACT_IDS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (ids.length > 0) {
+    return ids.map((id, i) => ({
+      id,
+      adminKey: process.env.ADMIN_SECRET_KEY || null,
+      label: `contract-${i}`,
+    }));
+  }
+
+  const single = process.env.CONTRACT_ID || '';
+  return [{ id: single, adminKey: process.env.ADMIN_SECRET_KEY || null, label: 'contract-0' }];
+}
+
+  // Rate-limit ceilings (#150). Reuses the existing rateLimit.js machinery;
+  // the sandbox profile gets a more generous default than the demo profile
+  // since it absorbs sustained integrator traffic. Both windowMs and max
+  // remain individually overridable via env for either profile.
+  rateLimits: Object.freeze({
+    windowMs: num(process.env.RATE_LIMIT_WINDOW_MS, rateLimitDefaults.windowMs),
+    max: num(process.env.RATE_LIMIT_MAX, rateLimitDefaults.max),
   }),
-
-  maxQuestionLength: num(process.env.MAX_QUESTION_LENGTH, 2000),
-  maxAnswerLength: num(process.env.MAX_ANSWER_LENGTH, 2000),
 
   worker: Object.freeze({
     rateLimitMaxConnections: num(process.env.WORKER_RATE_LIMIT_MAX_CONNECTIONS, 5),

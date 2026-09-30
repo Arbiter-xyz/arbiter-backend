@@ -263,6 +263,25 @@ export async function isEstablishedWorker(workerId) {
   return rep.total >= config.worker.minAnswersBeforeReputationGate;
 }
 
+/**
+ * Pure heuristic deciding whether a known workerId is worth a `touch()` call
+ * during the daily TTL sweep. `touch()` is permissionless (see lib.rs) but
+ * every call still round-trips through the SAME admin-signed serial queue as
+ * real resolve()/refund()/charge() settlement calls (see serializeAdminCall
+ * in stellarClient.js) — so touching a worker that has never staked or been
+ * credited is pure queue-time waste that can delay a payer or worker's
+ * money. A worker is only worth touching when there is off-chain evidence
+ * it has on-chain state to refresh: a cached stake (setCachedStake) or a
+ * recorded resolve()-credited outcome (reputation.total > 0). Factored out
+ * as a pure function, matching this file's existing convention (see
+ * stakeGateAllows, computeSmoothedCount), so the skip/include decision is
+ * directly testable without a live store or chain.
+ */
+export function shouldSweepWorkerTtl({ cachedStake, reputation } = {}) {
+  if (cachedStake !== undefined) return true;
+  return (reputation?.total ?? 0) > 0;
+}
+
 function writeSse(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
