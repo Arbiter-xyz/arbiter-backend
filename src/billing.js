@@ -268,29 +268,37 @@ export function isAllowedRedirectUrl(url) {
 }
 
 /**
- * Supported fiat currencies for the Stripe onramp, each with the number of
- * minor units Stripe expects in `unit_amount` (USD/EUR cents, JPY has none)
- * and the FX rate to USDC face value. Rates are a periodically-updated
- * static table rather than a live lookup: the issue explicitly allows this
- * when precision-to-the-cent isn't required, and it keeps the webhook path
- * free of an external dependency that could be unreachable at credit time.
- * `usdToStroops` remains the USD anchor (config.billing.usdToStroops) so
- * the existing 1:1 USD conversion is unchanged.
+ * Apple Pay / Google Pay quick-checkout (issue #105).
+ *
+ * Stripe Checkout auto-detects and offers Apple Pay / Google Pay on
+ * supporting devices/browsers whenever the account has those payment
+ * methods enabled — no `payment_method_types` array is needed here, and
+ * passing one would actually *narrow* the methods offered. The only
+ * code-side requirement is that the Checkout Session's redirect URLs
+ * (success_url/cancel_url) live on a domain that has been registered with
+ * Stripe for Apple Pay domain verification; that domain is exactly the
+ * origin isAllowedRedirectUrl() already restricts to config.allowedOrigins,
+ * so the existing allowlist is the single source of truth for both the
+ * redirect-safety check and Apple Pay's domain-association requirement.
+ *
+ * This helper exists so the domain-verification requirement is explicit
+ * and testable rather than an implicit assumption: it returns the origin
+ * Stripe will associate with the session, or null when the URL is not on
+ * an allowed origin (in which case createCheckoutSession() would already
+ * have rejected it).
  */
-const SUPPORTED_CURRENCIES = {
-  usd: { minorUnits: 100, usdPerUnit: 1 },
-  eur: { minorUnits: 100, usdPerUnit: 1.08 },
-  gbp: { minorUnits: 100, usdPerUnit: 1.27 },
-};
+export function getApplePayVerificationOrigin(url) {
+  if (!isAllowedRedirectUrl(url)) return null;
+  try {
+    return new URL(url).origin;
+  } catch {
+    return null;
+  }
+}
 
-/**
- * Resolves a currency code to its FX descriptor, or throws for an
- * unsupported/malformed code. Callers turn the throw into a 400 — an
- * unknown currency must never silently fall back to USD.
- */
-export function resolveCurrency(currency) {
-  if (typeof currency !== 'string') {
-    throw new Error('currency must be a string');
+export async function createCheckoutSession(amountUsd, successUrl, cancelUrl) {
+  if (!Number.isFinite(amountUsd) || amountUsd < config.billing.minTopupUsd) {
+    throw new Error(`amountUsd must be a number >= ${config.billing.minTopupUsd}`);
   }
   const code = currency.trim().toLowerCase();
   if (!/^[a-z]{3}$/.test(code) || !SUPPORTED_CURRENCIES[code]) {
@@ -573,41 +581,59 @@ export function configuredProcessors() {
 }
 
 /**
- * Processor-agnostic checkout entry point. Defaults to Stripe so existing
- * callers (POST /billing/checkout) keep their exact behavior; callers may
- * pass a processor name to route to PayPal or Coinbase Commerce instead.
+ * The single flat subscription tier (issue #101). Prorated upgrades/
+ * downgrades between tiers are explicitly out of scope — one tier, one
+ * recurring price, one included-volume grant per billing cycle.
+ *
+ * `includedVolumeStroops` is the credit granted on each `invoice.paid`.
+ * `rollover` is the documented policy for unused included volume at the
+ * cycle boundary: false means use-it-or-lose-it (the balance is reset to
+ * the tier's included volume on renewal, not incremented), true would
+ * carry the remainder forward. Defaulting to false mirrors the
+ * "0 preserves today's behavior" framing config.js uses for
+ * minStakeStroops — the conservative, non-compounding choice is the
+ * explicit default, not an accident of implementation order.
  */
-export async function createCheckoutSession(amountUsd, successUrl, cancelUrl, currency = 'usd', processor = 'stripe') {
-  return getProcessor(processor).createCheckoutSession(amountUsd, successUrl, cancelUrl, currency);
-}
+export const SUBSCRIPTION_TIER = {
+  name: 'api-pro',
+  priceUsd: 99,
+  includedVolumeStroops: 1_000_000_000,
+  rollover: false,
+};
 
 /**
- * Processor-agnostic webhook entry point. Verifies and parses the event
- * with the named processor, then applies the shared idempotent credit
- * grant. The dedup key is namespaced per processor so event ids from
- * different processors can never collide.
+ * Creates a fresh account (and its one API key) and a Stripe Checkout
+ * Session in `mode: 'subscription'` to fund it. Mirrors
+ * createCheckoutSession()'s one-time-reveal pattern for the raw key and
+ * its allowed-origin check on the redirect URLs; the difference is the
+ * Stripe primitive — a recurring price instead of a one-shot payment, so
+ * credit arrives via `invoice.paid` (see handleStripeWebhook()).
  */
-export async function handleWebhook(processorName, rawBody, headers) {
-  const processor = getProcessor(processorName);
-  const event = await processor.verifyAndParseWebhook(rawBody, headers);
-  if (!event) return { handled: false };
+export async function createSubscriptionCheckoutSession(successUrl, cancelUrl) {
+  if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
+    throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
+  }
 
-  const dedupKey = `${processor.name}-event:${event.id}`;
-  const firstSeen = await store.setNX(dedupKey, { at: Date.now() });
-  if (!firstSeen) return { handled: true, duplicate: true };
+  const { accountId, rawKey } = await createAccount();
+  const session = await getStripe().checkout.sessions.create({
+    mode: 'subscription',
+    line_items: [
+      {
+        price_data: {
+          currency: 'usd',
+          product_data: { name: `Arbiter API ${SUBSCRIPTION_TIER.name}` },
+          unit_amount: Math.round(SUBSCRIPTION_TIER.priceUsd * 100),
+          recurring: { interval: 'month' },
+        },
+        quantity: 1,
+      },
+    ],
+    metadata: { accountId },
+    success_url: `${successUrl}?apiKey=${rawKey}`,
+    cancel_url: cancelUrl,
+  });
 
-  await store.incrBy(`credit:${event.accountId}`, event.stroops);
-  logger.info({ processor: processor.name, eventId: event.id, accountId: event.accountId }, 'billing credit granted');
-  return { handled: true, duplicate: false };
-}
-
-/**
- * Backwards-compatible Stripe webhook handler. Kept so existing callers
- * (POST /billing/webhook) continue to work unchanged; delegates to the
- * shared handleWebhook() path.
- */
-export async function handleStripeWebhook(rawBody, headers) {
-  return handleWebhook('stripe', rawBody, headers);
+  return { checkoutUrl: session.url };
 }
 
 /**
