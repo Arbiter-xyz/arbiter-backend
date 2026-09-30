@@ -213,29 +213,37 @@ export function isAllowedRedirectUrl(url) {
 }
 
 /**
- * Supported fiat currencies for the Stripe onramp, each with the number of
- * minor units Stripe expects in `unit_amount` (USD/EUR cents, JPY has none)
- * and the FX rate to USDC face value. Rates are a periodically-updated
- * static table rather than a live lookup: the issue explicitly allows this
- * when precision-to-the-cent isn't required, and it keeps the webhook path
- * free of an external dependency that could be unreachable at credit time.
- * `usdToStroops` remains the USD anchor (config.billing.usdToStroops) so
- * the existing 1:1 USD conversion is unchanged.
+ * Apple Pay / Google Pay quick-checkout (issue #105).
+ *
+ * Stripe Checkout auto-detects and offers Apple Pay / Google Pay on
+ * supporting devices/browsers whenever the account has those payment
+ * methods enabled — no `payment_method_types` array is needed here, and
+ * passing one would actually *narrow* the methods offered. The only
+ * code-side requirement is that the Checkout Session's redirect URLs
+ * (success_url/cancel_url) live on a domain that has been registered with
+ * Stripe for Apple Pay domain verification; that domain is exactly the
+ * origin isAllowedRedirectUrl() already restricts to config.allowedOrigins,
+ * so the existing allowlist is the single source of truth for both the
+ * redirect-safety check and Apple Pay's domain-association requirement.
+ *
+ * This helper exists so the domain-verification requirement is explicit
+ * and testable rather than an implicit assumption: it returns the origin
+ * Stripe will associate with the session, or null when the URL is not on
+ * an allowed origin (in which case createCheckoutSession() would already
+ * have rejected it).
  */
-const SUPPORTED_CURRENCIES = {
-  usd: { minorUnits: 100, usdPerUnit: 1 },
-  eur: { minorUnits: 100, usdPerUnit: 1.08 },
-  gbp: { minorUnits: 100, usdPerUnit: 1.27 },
-};
+export function getApplePayVerificationOrigin(url) {
+  if (!isAllowedRedirectUrl(url)) return null;
+  try {
+    return new URL(url).origin;
+  } catch {
+    return null;
+  }
+}
 
-/**
- * Resolves a currency code to its FX descriptor, or throws for an
- * unsupported/malformed code. Callers turn the throw into a 400 — an
- * unknown currency must never silently fall back to USD.
- */
-export function resolveCurrency(currency) {
-  if (typeof currency !== 'string') {
-    throw new Error('currency must be a string');
+export async function createCheckoutSession(amountUsd, successUrl, cancelUrl) {
+  if (!Number.isFinite(amountUsd) || amountUsd < config.billing.minTopupUsd) {
+    throw new Error(`amountUsd must be a number >= ${config.billing.minTopupUsd}`);
   }
   const code = currency.trim().toLowerCase();
   if (!/^[a-z]{3}$/.test(code) || !SUPPORTED_CURRENCIES[code]) {
