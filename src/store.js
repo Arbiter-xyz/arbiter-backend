@@ -220,13 +220,12 @@ async function createStore() {
   }
   try {
     const { default: Redis } = await import('ioredis');
-    const client = new Redis(config.redisUrl, { lazyConnect: true, maxRetriesPerRequest: 1 });
-    await client.connect();
-    client.on('error', (err) => logger.error({ err }, 'redis error'));
-    logger.info('connected to Redis — state survives restarts and can be shared across instances');
+    const client = new Redis(config.redisUrl, { lazyConnect: false });
+    await client.ping();
+    logger.info('Connected to Redis store');
     return new RedisStore(client);
   } catch (err) {
-    logger.error({ err }, 'failed to connect to Redis — falling back to in-memory store');
+    logger.warn({ err }, 'Redis unavailable — falling back to in-memory store (single-instance only)');
     return new MemoryStore();
   }
 }
