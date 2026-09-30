@@ -43,3 +43,20 @@ test('calls next() for the correct bearer token', () => {
   assert.equal(state.nextCalled, true);
   assert.equal(state.statusCode, null);
 });
+
+test('accepts each of multiple configured admin tokens independently', () => {
+  const tokens = ['tokenA', 'tokenB'];
+  for (const token of tokens) {
+    const { req, res, next, state } = mockReqRes(`Bearer ${token}`);
+    requireAdmin(req, res, next);
+    assert.equal(state.nextCalled, true, `expected ${token} to authenticate`);
+    assert.equal(state.statusCode, null);
+  }
+});
+
+test('rejects a token that is not in the configured list', () => {
+  const { req, res, next, state } = mockReqRes('Bearer unlisted-token');
+  requireAdmin(req, res, next);
+  assert.equal(state.statusCode, 401);
+  assert.equal(state.nextCalled, false);
+});

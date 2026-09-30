@@ -147,3 +147,59 @@ export function verifySessionToken(token) {
     return null;
   }
 }
+
+/**
+ * GDPR data-export/erasure support (issue #126).
+ *
+ * A payer or worker can only export or erase data for an address they
+ * have actually proven control of. This reuses the exact same
+ * challenge/response session mechanism as the rest of the app
+ * (`verifySessionToken`), so an attacker who merely names someone else's
+ * address in a request body cannot read or delete that address's data —
+ * the same impersonation-rejection guarantee `workerAuth.test.js`
+ * already covers for POST /app/answer.
+ *
+ * Returns the authenticated address on success, or null when the token
+ * is missing, malformed, expired, or scoped to a different address than
+ * the one being requested. Callers should respond 401 on null rather
+ * than leaking which of those cases applied.
+ */
+export function authorizeDataSubject(token, requestedAddress) {
+  const authenticated = verifySessionToken(token);
+  if (!authenticated) return null;
+  if (typeof requestedAddress !== 'string' || authenticated !== requestedAddress) return null;
+  return authenticated;
+}
+
+/**
+ * The off-chain stores this backend keeps per address, enumerated in one
+ * place so export and erasure (and, later, the retention-policy engine
+ * from #128) share the same list instead of drifting apart. Each entry
+ * names the store module and the key prefix it uses for address-scoped
+ * records. On-chain contract state (resolved questions, stake, owed
+ * balances) is deliberately absent — it is not ours to delete and cannot
+ * be, so it must never appear here as if it were erasable.
+ */
+export const OFF_CHAIN_STORES = [
+  { store: 'payerIndex', prefix: 'payer-questions:', description: 'Payer question index' },
+  { store: 'dispatch', prefix: 'rep:', description: 'Worker reputation history' },
+  { store: 'push', prefix: 'push-sub:', description: 'Push notification subscriptions' },
+  { store: 'anchorRecords', prefix: 'anchor-tx:', description: 'Self-reported SEP-24/SEP-12 anchor transactions' },
+  { store: 'anchorRecords', prefix: 'anchor-kyc:', description: 'Self-reported SEP-12 KYC status' },
+  { store: 'workerAuth', prefix: CHALLENGE_PREFIX, description: 'Outstanding auth challenges' },
+];
+
+/**
+ * The parts of a data subject's footprint that live on-chain and are
+ * therefore permanent. Returned verbatim in erasure responses so the
+ * caller is told plainly what was *not* deleted, rather than being left
+ * to assume erasure was total. Mirrors the honesty of
+ * `anchorRecords.js`'s own "self-reported cache, not ground truth"
+ * disclaimer.
+ */
+export const ON_CHAIN_PERMANENT = [
+  'Resolved question answers and their consensus outcome',
+  'Staked balances and slashing history',
+  'Owed/withdrawable balances',
+  'Any transaction history recorded on the Stellar ledger',
+];

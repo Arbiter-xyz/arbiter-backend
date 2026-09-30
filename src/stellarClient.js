@@ -2,6 +2,30 @@ import { Keypair, TransactionBuilder, Contract, Account, Address, nativeToScVal,
 import { config } from './config.js';
 import { withRetry } from './retry.js';
 
+/** Chaos fault injection: env-gated, inert unless CHAOS_FAULT is set to a
+ * recognized scenario. Follows config.js's "everything is an env var with a
+ * safe default" convention — the default (unset) leaves every code path
+ * byte-for-byte identical to before this existed. Never reachable in
+ * production: config.chaosFault is only honored when config.chaosEnabled is
+ * true, which itself requires an explicit env opt-in. */
+function chaosFault() {
+  if (!config.chaosEnabled) return null;
+  return config.chaosFault || null;
+}
+
+/** Wraps a Soroban RPC call so a chaos scenario can inject a transient
+ * failure at exactly the seam retry.js already wraps. When no fault is
+ * configured this is a pass-through with zero behavioral change. */
+async function withChaosFault(operation, fn) {
+  const fault = chaosFault();
+  if (fault === `rpc-timeout:${operation}` || fault === `rpc-timeout:${operation}:once`) {
+    const err = new Error(`chaos: injected RPC timeout during ${operation}`);
+    err.code = 'CHAOS_INJECTED_TIMEOUT';
+    throw err;
+  }
+  return fn();
+}
+
 let server = null;
 export function getServer() {
   if (!server) {
@@ -10,11 +34,73 @@ export function getServer() {
   return server;
 }
 
+/** Comma-separated list of configured RPC URLs, mirroring
+ * config.allowedOrigins' comma-split parsing convention. The first entry is
+ * the primary; the rest are ordered failover candidates. A single-URL
+ * configuration yields a one-element list, so no failover path is ever
+ * exercised. */
+function getRpcUrls() {
+  return String(config.sorobanRpcUrl || '')
+    .split(',')
+    .map((u) => u.trim())
+    .filter(Boolean);
+}
+
+const failoverServers = new Map();
+function getServerForUrl(url) {
+  if (!failoverServers.has(url)) {
+    failoverServers.set(url, new rpc.Server(url, { allowHttp: url.startsWith('http://') }));
+  }
+  return failoverServers.get(url);
+}
+
+/** Runs `fn(srv)` against the primary server, and if it throws (e.g. a
+ * withRetry-exhausted failure against a degraded provider), retries once
+ * against each subsequent configured URL before giving up. Failover happens
+ * only *before* a call starts — `fn` is re-invoked from scratch against the
+ * next server, never resumed mid-flight — so a mid-submission failover can
+ * never race the sequence number createSerialQueue() serializes over. */
+async function withServerFailover(fn) {
+  const urls = getRpcUrls();
+  let lastErr;
+  for (let i = 0; i < urls.length; i++) {
+    const srv = i === 0 ? getServer() : getServerForUrl(urls[i]);
+    try {
+      return await fn(srv);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
 let adminKeypair = null;
 export function getAdminKeypair() {
   if (!config.platformSecret) throw new Error('PLATFORM_SECRET not configured');
   if (!adminKeypair) adminKeypair = Keypair.fromSecret(config.platformSecret);
   return adminKeypair;
+}
+
+/** Live-reloadable contract id. `config.contractId` is frozen at module load,
+ * so a redeployment would otherwise require a full process restart. Every
+ * call site reads through this accessor instead of the frozen value, and
+ * rotateContractId() swaps it in place. */
+let currentContractId = config.contractId;
+
+export function getContractId() {
+  return currentContractId;
+}
+
+/** Rotates the active contract id without a restart. The serial admin-call
+ * queue guarantees any in-flight call already queued against the old id
+ * finishes (or fails) before a newly-queued call reads the rotated id — see
+ * createSerialQueue() below. */
+export function rotateContractId(newContractId) {
+  if (!newContractId || typeof newContractId !== 'string') {
+    throw new Error('rotateContractId requires a non-empty contract id string');
+  }
+  currentContractId = newContractId;
+  return currentContractId;
 }
 
 export function u64Arg(value) {
@@ -52,35 +138,41 @@ export function vecOfAddresses(addresses) {
  * attempts / 10s each — this sits in the critical path of settling a
  * question, so it must fail fast enough to still hit the fail-closed
  * refund fallback promptly, not retry indefinitely.
+ *
+ * Failover is layered *outside* withRetry: the whole retried flow is
+ * re-run against the next configured URL only after the primary's retries
+ * are exhausted, so a failover attempt always starts with its own fresh
+ * getAccount() read against the server that will actually submit it.
  */
 async function runInvokeAsAdmin(method, scValArgs) {
-  return withRetry(
-    async () => {
-      const srv = getServer();
-      const admin = getAdminKeypair();
-      const account = await srv.getAccount(admin.publicKey());
-      const contract = new Contract(config.contractId);
+  return withServerFailover((srv) =>
+    withRetry(
+      async () => {
+        const admin = getAdminKeypair();
+        const account = await srv.getAccount(admin.publicKey());
+        const contract = new Contract(config.contractId);
 
-      const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
-        .addOperation(contract.call(method, ...scValArgs))
-        .setTimeout(60)
-        .build();
+        const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
+          .addOperation(contract.call(method, ...scValArgs))
+          .setTimeout(60)
+          .build();
 
-      const prepared = await srv.prepareTransaction(tx);
-      prepared.sign(admin);
+        const prepared = await srv.prepareTransaction(tx);
+        prepared.sign(admin);
 
-      const sendResult = await srv.sendTransaction(prepared);
-      if (sendResult.status === 'ERROR') {
-        throw new Error(`submit failed for ${method}: ${JSON.stringify(sendResult.errorResult ?? sendResult)}`);
-      }
+        const sendResult = await srv.sendTransaction(prepared);
+        if (sendResult.status === 'ERROR') {
+          throw new Error(`submit failed for ${method}: ${JSON.stringify(sendResult.errorResult ?? sendResult)}`);
+        }
 
-      const finalResult = await srv.pollTransaction(sendResult.hash);
-      if (finalResult.status !== 'SUCCESS') {
-        throw new Error(`${method} transaction ${sendResult.hash} did not succeed: ${finalResult.status}`);
-      }
-      return { hash: sendResult.hash, result: finalResult };
-    },
-    { attempts: 2, timeoutMs: 10_000, baseDelayMs: 300, label: `invokeAsAdmin(${method})` },
+        const finalResult = await srv.pollTransaction(sendResult.hash);
+        if (finalResult.status !== 'SUCCESS') {
+          throw new Error(`${method} transaction ${sendResult.hash} did not succeed: ${finalResult.status}`);
+        }
+        return { hash: sendResult.hash, result: finalResult };
+      },
+      { attempts: 2, timeoutMs: 10_000, baseDelayMs: 300, label: `invokeAsAdmin(${method})` },
+    ),
   );
 }
 
@@ -112,7 +204,12 @@ async function runInvokeAsAdmin(method, scValArgs) {
  * The queueing itself is Stellar-agnostic, so it's factored out as its own
  * function and exported — directly testable without mocking the RPC layer
  * at all, the same reason computeSmoothedCount/stakeGateAllows/
- * surgeMultiplier exist as pure functions elsewhere in this codebase. */
+ * surgeMultiplier exist as pure functions elsewhere in this codebase.
+ *
+ * Rotation safety: because every admin call is chained onto `tail`, a call
+ * queued before rotateContractId() runs to completion (reading the old id
+ * via getContractId()) before any call queued after rotation starts — so
+ * rotation can never retarget an in-flight call mid-flight. */
 export function createSerialQueue() {
   let tail = Promise.resolve();
   return function serialize(fn) {
@@ -129,6 +226,13 @@ const serializeAdminCall = createSerialQueue();
 
 function invokeAsAdmin(method, scValArgs) {
   return serializeAdminCall(() => runInvokeAsAdmin(method, scValArgs));
+}
+
+/** Rotates the contract id only after every admin call already queued
+ * against the old id has drained. Enqueues the swap on the same serial
+ * chain, so it takes effect strictly between calls — never mid-flight. */
+export function rotateContractIdAfterDrain(newContractId) {
+  return serializeAdminCall(() => rotateContractId(newContractId));
 }
 
 export async function resolveQuestion(questionId, matchingWorkerAddresses, losingWorkerAddresses = []) {
