@@ -20,10 +20,15 @@ import { logger } from './logger.js';
  * dispatch.js's live SSE registry — a real multi-instance deployment would
  * need this rebuilt from the shared store on startup, or moved into it
  * directly with a way to query by category, which store.js doesn't
- * support today (get/set/delete/incr only, no listing).
+ * support today (get/set/delete/incr only, no listing). To keep the
+ * in-process index from going blank on every restart, a durable id index
+ * (SUB_INDEX_KEY, same pattern as dispatch.js's WORKER_INDEX_KEY) is
+ * written alongside each subscription and replayed into the in-process
+ * map on startup via rebuildSubscribedWorkers().
  */
 
 const SUB_PREFIX = 'push-sub:';
+const SUB_INDEX_KEY = 'push-sub-index';
 const subscribedWorkers = new Map(); // workerId -> Set<normalized category> (empty = all categories)
 
 let vapidConfigured = false;
@@ -47,18 +52,56 @@ function normalizeCategories(categories = []) {
   return new Set(categories.map((c) => String(c).trim().toLowerCase()).filter(Boolean));
 }
 
+async function readSubIndex() {
+  const ids = await store.get(SUB_INDEX_KEY);
+  return Array.isArray(ids) ? ids : [];
+}
+
+async function addToSubIndex(workerId) {
+  const ids = await readSubIndex();
+  if (!ids.includes(workerId)) {
+    ids.push(workerId);
+    await store.set(SUB_INDEX_KEY, ids);
+  }
+}
+
+async function removeFromSubIndex(workerId) {
+  const ids = await readSubIndex();
+  const next = ids.filter((id) => id !== workerId);
+  if (next.length !== ids.length) await store.set(SUB_INDEX_KEY, next);
+}
+
 export async function saveSubscription(workerId, subscription, categories = []) {
   await store.set(SUB_PREFIX + workerId, { subscription, categories });
+  await addToSubIndex(workerId);
   subscribedWorkers.set(workerId, normalizeCategories(categories));
 }
 
 export async function removeSubscription(workerId) {
   await store.delete(SUB_PREFIX + workerId);
+  await removeFromSubIndex(workerId);
   subscribedWorkers.delete(workerId);
 }
 
 export async function hasSubscription(workerId) {
   return (await store.get(SUB_PREFIX + workerId)) !== null;
+}
+
+/** Rebuilds the in-process subscribedWorkers index from the durable
+ * SUB_PREFIX records via SUB_INDEX_KEY. Called on startup so a fresh
+ * process (no saveSubscription() calls yet) still returns previously-
+ * subscribed workers from getPushEligibleWorkerIds(). */
+export async function rebuildSubscribedWorkers() {
+  const ids = await readSubIndex();
+  const live = [];
+  for (const workerId of ids) {
+    const record = await store.get(SUB_PREFIX + workerId);
+    if (!record) continue;
+    subscribedWorkers.set(workerId, normalizeCategories(record.categories));
+    live.push(workerId);
+  }
+  if (live.length !== ids.length) await store.set(SUB_INDEX_KEY, live);
+  return live.length;
 }
 
 /** Worker ids with a push subscription matching `category` (or all of
