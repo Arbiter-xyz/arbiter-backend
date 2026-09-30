@@ -262,64 +262,61 @@ function parseContractInstances() {
   return [{ id: single, adminKey: process.env.ADMIN_SECRET_KEY || null, label: 'contract-0' }];
 }
 
-const contractInstances = parseContractInstances();
+  // Subscription billing tier (#101). A single flat tier for now — prorated
+  // upgrades/downgrades between tiers are explicitly out of scope. The
+  // included volume is credited to the account's stroops balance on each
+  // `invoice.paid` webhook (see billing.js's handleStripeWebhook), so it
+  // flows through the same reserveCredit()/settleReservation() ledger as
+  // one-shot credit and falls back to the existing insufficient-credit 402
+  // path in POST /oracle once exhausted mid-cycle.
+  subscription: Object.freeze({
+    // Stripe Price id for the recurring tier. Empty disables the subscribe
+    // endpoint (returns 503) rather than creating a session Stripe would
+    // reject — same "unset means off" posture as contractId/platformSecret.
+    priceId: process.env.SUBSCRIPTION_PRICE_ID || '',
+    // Included volume per billing cycle, in stroops, credited on invoice.paid.
+    includedVolumeStroops: BigInt(process.env.SUBSCRIPTION_INCLUDED_VOLUME_STROOPS || '0'),
+    // Rollover policy for unused included volume at cycle end. Default false
+    // (use-it-or-lose-it): each invoice.paid credits exactly
+    // includedVolumeStroops, so a subscriber who under-consumes doesn't
+    // accumulate an unbounded balance that later bypasses the metered
+    // overage path. Set true to carry the remaining balance forward instead.
+    // Like worker.minStakeStroops' "0 preserves today's behavior" framing,
+    // this is an explicit, documented policy — not an accident of the order
+    // in which invoice.paid happens to run.
+    rolloverUnusedVolume: process.env.SUBSCRIPTION_ROLLOVER_UNUSED_VOLUME === 'true',
+  }),
 
-// Live, mutable set of active contract instances. Kept as a plain array so
-// `getContractInstances()` always reflects the current set (rotation of the
-// whole set is a single assignment, same atomicity argument as #137).
-let liveContractInstances = contractInstances;
+  worker: Object.freeze({
+    rateLimitMaxConnections: num(process.env.WORKER_RATE_LIMIT_MAX_CONNECTIONS, 5),
+    rateLimitWindowMs: num(process.env.WORKER_RATE_LIMIT_WINDOW_MS, 60_000),
+    minAnswersBeforeReputationGate: num(process.env.WORKER_MIN_ANSWERS_BEFORE_REPUTATION_GATE, 5),
+    minMatchRatio: num(process.env.WORKER_MIN_MATCH_RATIO, 0.2),
+    // Once a worker crosses minAnswersBeforeReputationGate (has real accrued
+    // earnings/reputation on the line), they must maintain at least this much
+    // on-chain stake to keep receiving new questions — closes the "unstake to
+    // zero, then misbehave for free" gap found pressure-testing the netting
+    // engine. Past Owed earnings are never touched by this; it only gates
+    // future dispatch eligibility. 0 (default) preserves today's behavior.
+    minStakeStroops: BigInt(process.env.WORKER_MIN_STAKE_STROOPS || '0'),
+  }),
 
-// Backward-compatible single active contract id: the first configured
-// instance. `getContractId()`/`rotateContractId()` from #137 keep operating
-// on this value so existing single-contract call sites are untouched.
-let liveContractId = contractInstances[0]?.id || '';
+  // Every one of these endpoints either costs the platform a real network
+  // fee per call (/sponsor/*) or writes unbounded state (/oracle), so all
+  // get a per-IP rate limit, not just the SSE connection endpoint.
+  rateLimits: Object.freeze({
+    oracle: Object.freeze({
+      max: num(process.env.ORACLE_RATE_LIMIT_MAX, 20),
+      windowMs: num(process.env.ORACLE_RATE_LIMIT_WINDOW_MS, 60_000),
+    }),
+    sponsor: Object.freeze({
+      max: num(process.env.SPONSOR_RATE_LIMIT_MAX, 10),
+      windowMs: num(process.env.SPONSOR_RATE_LIMIT_WINDOW_MS, 60_000),
+    }),
+    answer: Object.freeze({
+      max: num(process.env.ANSWER_RATE_LIMIT_MAX, 60),
+      windowMs: num(process.env.ANSWER_RATE_LIMIT_WINDOW_MS, 60_000),
+    }),
+    //
 
-export function getContractId() {
-  return liveContractId;
-}
-
-export function rotateContractId(nextId) {
-  const previous = liveContractId;
-  liveContractId = nextId;
-  // Keep the instance set consistent with a single-contract rotation: the
-  // rotated id becomes the primary instance, preserving its admin key.
-  const primary = liveContractInstances[0];
-  liveContractInstances = [
-    { id: nextId, adminKey: primary?.adminKey || null, label: primary?.label || 'contract-0' },
-    ...liveContractInstances.slice(1),
-  ];
-  return previous;
-}
-
-// Returns the currently configured contract instances. Each entry is
-// { id, adminKey, label }. Never empty in practice (falls back to a single
-// entry, possibly with an empty id, matching the legacy CONTRACT_ID shape).
-export function getContractInstances() {
-  return liveContractInstances;
-}
-
-// Resolves a contract instance by id, or null if it isn't configured. Used
-// by every later step (verify/dispatch/resolve/refund) to look up the
-// instance a question was opened against from its stashed record.
-export function getContractInstance(id) {
-  return liveContractInstances.find((c) => c.id === id) || null;
-}
-
-// Random/round-robin instance selection for a newly opened question. v1 is
-// deliberately random across configured instances — no capacity awareness
-// (explicitly out of scope per #138). Returns the chosen instance, or null
-// when no instance is configured.
-export function selectContractInstance() {
-  const instances = liveContractInstances.filter((c) => c.id);
-  if (instances.length === 0) return null;
-  return instances[Math.floor(Math.random() * instances.length)];
-}
-
-export const config = Object.freeze({
-  port: num(process.env.PORT, 3000),
-  contractId: liveContractId,
-  networkPassphrase: process.env.NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015',
-  rpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org',
-  sessionSecret: SESSION_SECRET,
-  apiChangelog: parseApiChangelog(process.env.API_CHANGELOG_JSON),
-});
+/* … truncated 5869 chars — edit only what you need near the top … */
