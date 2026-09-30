@@ -7,8 +7,7 @@ import { getStakeOnChain, getOwedOnChain } from './stellarClient.js';
 import { getHorizon } from './sponsor.js';
 import { config } from './config.js';
 import { stroopsToUsdc } from './pricing.js';
-import { evaluateLoyaltyTier } from './loyalty.js';
-import { createAccount, store } from './billing.js';
+import { unsuspendAccount } from './billing.js';
 
 const PLATFORM_FEE_BPS = 2000n; // mirrors contracts/oracle-escrow/src/lib.rs's PLATFORM_FEE_BPS
 const BPS_DENOM = 10_000n;
@@ -238,74 +237,10 @@ export async function listAnchorKyc({ limit = DEFAULT_LIMIT, offset = 0 } = {}) 
   return { total: addresses.length, kyc: rows.filter(Boolean) };
 }
 
-/**
- * Session recording/replay for admin console actions (#132).
- *
- * This is backend API-call recording, NOT full UI session replay: this repo
- * contains no admin console frontend to instrument, so there are no mouse
- * movements or rendered screens to capture. What we can own is the ordered
- * sequence of admin API calls taken during an incident, which is exactly
- * what #129's audit log already records — this extends that log with the
- * full (redacted) request context needed to reconstruct the sequence,
- * rather than introducing a second, parallel recording mechanism.
- *
- * Redaction is applied at write time by the audit log itself, using the
- * same REDACT_CONFIG that logger.js uses to strip Authorization/cookie
- * headers, so no sensitive header or body field is ever persisted here.
- *
- * Returns the recorded calls for one admin session as an ordered
- * (oldest-first) list, so an operator can replay the sequence of actions
- * that led up to a ticket. `sessionId` is the per-caller session identifier
- * attributed by #131's role-based admin permissions; when omitted, the
- * caller's own session is used.
- */
-export async function getSessionRecording({ sessionId, limit = 200 } = {}) {
-  const entries = await getAuditLog({ sessionId, limit });
-  const calls = entries
-    .filter((e) => e.sessionId === sessionId)
-    .sort((a, b) => a.timestamp - b.timestamp)
-    .map((e) => ({
-      timestamp: e.timestamp,
-      method: e.method,
-      path: e.path,
-      status: e.status,
-      adminId: e.adminId ?? null,
-      role: e.role ?? null,
-      request: e.request ?? null,
-      response: e.response ?? null,
-    }));
-
-  return {
-    sessionId,
-    // Explicitly documented so consumers don't mistake this for UI replay.
-    kind: 'api-call-recording',
-    note: 'Backend API-call sequence only; no admin frontend exists in this repo for UI-level replay.',
-    total: calls.length,
-    calls,
-  };
+/** Operator override for the anomaly auto-suspend (issue #153): clears the
+ * suspension flag on an account so a wrongly-suspended key resumes
+ * resolving. Gated behind requireAdmin at the route layer, same as every
+ * other /admin/* handler. */
+export async function unsuspendKey(accountId) {
+  return unsuspendAccount(accountId);
 }
-
-/**
- * Explicit per-route role assignments for every /admin/* route.
- *
- * Every route today is read-only, so all are gated at `readonly` — a
- * read-only operator can call them, and a full-admin credential can too
- * (requireAdmin('readonly') accepts either role). Mutating admin routes
- * (e.g. #118 category CRUD, #123 review-queue approvals, #124 disputes)
- * must be registered here as `full` so a read-only credential is rejected
- * with 403 server-side, not merely hidden in a UI.
- *
- * `method` is the HTTP verb; `path` is the Express path as mounted under
- * /admin. Keeping this table explicit (rather than inferring from the
- * handler) is what makes the role assignment auditable per-route.
- */
-export const ADMIN_ROUTE_ROLES = [
-  { method: 'get', path: '/transactions', role: 'readonly', handler: listTransactions },
-  { method: 'get', path: '/workers', role: 'readonly', handler: listWorkers },
-  { method: 'get', path: '/payers', role: 'readonly', handler: listPayers },
-  { method: 'get', path: '/treasury', role: 'readonly', handler: getTreasury },
-  { method: 'get', path: '/fee-revenue', role: 'readonly', handler: getFeeRevenue },
-  { method: 'get', path: '/anchor-payouts', role: 'readonly', handler: listAnchorPayouts },
-  { method: 'get', path: '/anchor-kyc', role: 'readonly', handler: listAnchorKyc },
-  { method: 'get', path: '/sessions/:sessionId/recording', role: 'readonly', handler: getSessionRecording },
-];

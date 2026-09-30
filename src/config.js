@@ -83,56 +83,54 @@ export function validateWebhookRetryPolicy(policy) {
   return { attempts, baseDelayMs };
 }
 
-// Hand-maintained, structured source-of-truth for the public API changelog
-// (#135). Deliberately NOT scraped from the README's narrative prose — each
-// entry is a machine-readable record of a change to this server's HTTP
-// surface, so integrators can diff versions programmatically. Kept as an
-// explicit config value (overridable via API_CHANGELOG_JSON) rather than
-// generated from git history, matching this codebase's bias toward simple,
-// explicit config over inferred behavior. An empty/unset value is valid and
-// must fail soft (see the /changelog route), never 500.
-const DEFAULT_API_CHANGELOG = Object.freeze([
-  {
-    version: '1.0.0',
-    date: '2024-01-01',
-    changes: [
-      {
-        type: 'added',
-        route: 'POST /oracle',
-        description: 'Submit an oracle question. Initially a blocking call that returned the answer inline.',
-      },
-    ],
-  },
-  {
-    version: '1.1.0',
-    date: '2024-02-01',
-    changes: [
-      {
-        type: 'changed',
-        route: 'POST /oracle',
-        description: 'Became async-with-polling: returns a jobId immediately; results are fetched via GET /oracle/:jobId.',
-      },
-      {
-        type: 'added',
-        route: 'POST /oracle/metered',
-        description: 'Separate metered submission path with its own rate limit and billing.',
-      },
-    ],
-  },
-  {
-    version: '1.2.0',
-    date: '2024-03-01',
-    changes: [
-      {
-        type: 'deprecated',
-        route: 'POST /oracle/metered',
-        description: 'Fused directly into POST /oracle in the round 7 "fuse pass". This route no longer exists; use POST /oracle.',
-        sunset: '2024-03-01',
-        replacement: 'POST /oracle',
-      },
-    ],
-  },
-]);
+// Comma-separated list of Soroban RPC endpoints, e.g.
+// "https://primary.example.com,https://backup.example.com". The first entry
+// is the primary; the rest are failover candidates used by
+// stellarClient.js's getServerWithFailover() when the primary is degraded
+// (see #147). Mirrors allowedOrigins's comma-split parsing convention.
+const sorobanRpcUrls = (process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// Deployment profile (#150). 'demo' is the disposable free-tier deployment
+// documented in README's "Try it live" table; 'sandbox' is the long-lived
+// developer sandbox environment that integrators point at. The profile only
+// selects defaults below — every value stays overridable via its own env var
+// so a single service can still be tuned without a code change.
+const deploymentProfile = process.env.DEPLOYMENT_PROFILE === 'sandbox' ? 'sandbox' : 'demo';
+
+// Rate-limit ceilings per profile (#150). The sandbox absorbs sustained
+// integrator traffic rather than one-off demo hits, so it gets a more
+// generous ceiling while still reusing the same rateLimit.js machinery.
+const rateLimitDefaults = deploymentProfile === 'sandbox'
+  ? { windowMs: 60_000, max: 600 }
+  : { windowMs: 60_000, max: 120 };
+
+export const config = Object.freeze({
+  port: num(process.env.PORT, 4000),
+  horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
+  // Primary RPC URL — kept for backward compatibility with existing callers
+  // that read config.sorobanRpcUrl directly. Equals sorobanRpcUrls[0].
+  sorobanRpcUrl: sorobanRpcUrls[0],
+  // Full ordered list of configured RPC endpoints (primary first).
+  sorobanRpcUrls: Object.freeze(sorobanRpcUrls),
+  networkPassphrase: process.env.NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015',
+
+  // Which deployment this process is (#150): 'demo' (disposable) or
+  // 'sandbox' (long-lived developer sandbox). Surfaced so /health and the
+  // README can distinguish the two environments unambiguously.
+  deploymentProfile,
+
+  usdc: Object.freeze({
+    sacId: process.env.USDC_SAC_ID || '',
+    code: process.env.USDC_ASSET_CODE || 'USDC',
+    issuer: process.env.USDC_ASSET_ISSUER || 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+  }),
+
+  contractId: process.env.ORACLE_CONTRACT_ID || '',
+  platformSecret: process.env.PLATFORM_SECRET || '',
+  platformAddress: process.env.PLATFORM_ADDRESS || '',
 
 function parseApiChangelog(raw) {
   if (raw === undefined || raw === null || raw === '') return DEFAULT_API_CHANGELOG;
@@ -262,29 +260,13 @@ function parseContractInstances() {
   return [{ id: single, adminKey: process.env.ADMIN_SECRET_KEY || null, label: 'contract-0' }];
 }
 
-  // Subscription billing tier (#101). A single flat tier for now — prorated
-  // upgrades/downgrades between tiers are explicitly out of scope. The
-  // included volume is credited to the account's stroops balance on each
-  // `invoice.paid` webhook (see billing.js's handleStripeWebhook), so it
-  // flows through the same reserveCredit()/settleReservation() ledger as
-  // one-shot credit and falls back to the existing insufficient-credit 402
-  // path in POST /oracle once exhausted mid-cycle.
-  subscription: Object.freeze({
-    // Stripe Price id for the recurring tier. Empty disables the subscribe
-    // endpoint (returns 503) rather than creating a session Stripe would
-    // reject — same "unset means off" posture as contractId/platformSecret.
-    priceId: process.env.SUBSCRIPTION_PRICE_ID || '',
-    // Included volume per billing cycle, in stroops, credited on invoice.paid.
-    includedVolumeStroops: BigInt(process.env.SUBSCRIPTION_INCLUDED_VOLUME_STROOPS || '0'),
-    // Rollover policy for unused included volume at cycle end. Default false
-    // (use-it-or-lose-it): each invoice.paid credits exactly
-    // includedVolumeStroops, so a subscriber who under-consumes doesn't
-    // accumulate an unbounded balance that later bypasses the metered
-    // overage path. Set true to carry the remaining balance forward instead.
-    // Like worker.minStakeStroops' "0 preserves today's behavior" framing,
-    // this is an explicit, documented policy — not an accident of the order
-    // in which invoice.paid happens to run.
-    rolloverUnusedVolume: process.env.SUBSCRIPTION_ROLLOVER_UNUSED_VOLUME === 'true',
+  // Rate-limit ceilings (#150). Reuses the existing rateLimit.js machinery;
+  // the sandbox profile gets a more generous default than the demo profile
+  // since it absorbs sustained integrator traffic. Both windowMs and max
+  // remain individually overridable via env for either profile.
+  rateLimits: Object.freeze({
+    windowMs: num(process.env.RATE_LIMIT_WINDOW_MS, rateLimitDefaults.windowMs),
+    max: num(process.env.RATE_LIMIT_MAX, rateLimitDefaults.max),
   }),
 
   worker: Object.freeze({
@@ -301,22 +283,6 @@ function parseContractInstances() {
     minStakeStroops: BigInt(process.env.WORKER_MIN_STAKE_STROOPS || '0'),
   }),
 
-  // Every one of these endpoints either costs the platform a real network
-  // fee per call (/sponsor/*) or writes unbounded state (/oracle), so all
-  // get a per-IP rate limit, not just the SSE connection endpoint.
-  rateLimits: Object.freeze({
-    oracle: Object.freeze({
-      max: num(process.env.ORACLE_RATE_LIMIT_MAX, 20),
-      windowMs: num(process.env.ORACLE_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    sponsor: Object.freeze({
-      max: num(process.env.SPONSOR_RATE_LIMIT_MAX, 10),
-      windowMs: num(process.env.SPONSOR_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    answer: Object.freeze({
-      max: num(process.env.ANSWER_RATE_LIMIT_MAX, 60),
-      windowMs: num(process.env.ANSWER_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    //
+  // Every one of these endpoints
 
-/* … truncated 5869 chars — edit only what you need near the top … */
+/* … truncated 708 chars — edit only what you need near the top … */

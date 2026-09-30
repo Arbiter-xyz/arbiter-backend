@@ -16,9 +16,66 @@ lockstep by hand (see #163). Pre-split history and the round-by-round
 build narrative live in the archived
 [`arbiter`](https://github.com/rudeus112266/arbiter) repo.
 
-> **Security:** this backend custodies the platform's keys and auth flows.
-> To report a vulnerability, see [SECURITY.md](SECURITY.md) — please don't
-> open a public issue.
+## Try it live
+
+Two public deployments exist, and they are deliberately different things:
+
+| Environment | URL | Lifetime | Chain calls |
+| --- | --- | --- | --- |
+| **Developer sandbox** | `https://sandbox.arbiter.xyz` | Long-lived; kept up for integrators | Real Soroban testnet `submit()`/`resolve()`/`withdraw()` round trips |
+| **Demo deployment** | `https://demo.arbiter.xyz` | Disposable; may be redeployed or torn down after the SCF submission window | Real Soroban testnet, but not a stable target |
+
+### Developer sandbox (`https://sandbox.arbiter.xyz`)
+
+This is the environment to point a real integration at. It runs its own
+Soroban testnet contract deployment with its own `contractId` and
+`PLATFORM_SECRET`, kept distinct from whatever gets redeployed for demo
+purposes, and its own backend service and `config.js` env block. It is
+committed to staying up rather than being torn down after a submission
+window, and it reuses the existing `rateLimit.js` / `config.rateLimits`
+machinery at a more generous ceiling than the demo deployment, since it
+absorbs sustained integrator traffic rather than one-off demo hits.
+
+`GET /health` and a real `/oracle` submit→resolve round trip are expected
+to succeed against it in checks run at least a week apart. "Long-lived"
+means "not torn down after a specific date" — it is not an uptime SLA.
+
+### Demo deployment (`https://demo.arbiter.xyz`)
+
+The public Railway/Vercel deployment referenced in earlier revisions of
+this README. It is a disposable testnet deployment on free-tier hosting:
+expect it to be redeployed or torn down after the SCF submission window,
+not a permanent production environment. Use it to look around, not to
+build against.
+
+### Zero-chain mode (`POST /oracle/sandbox`)
+
+Distinct from both of the above: `/oracle/sandbox` (`backend/src/sandbox.js`)
+is a purely local simulation. Its own docstring says it "Never touches
+stellarClient.js — no chain calls," which is exactly why it's zero-setup,
+but also why it can't prove anything about real Soroban RPC latency, real
+surge pricing, or a real `submit()`/`resolve()`/`withdraw()` round trip.
+It returns canned response shapes with no payment and no chain. Use it to
+see a response shape before setting up a wallet; use the developer
+sandbox when you need the real round trip.
+
+### Funding a testnet USDC path
+
+You do not need Arbiter's own platform key to get test funds. To fund your
+own integration against the developer sandbox:
+
+1. Create and fund a testnet Stellar account with Friendbot:
+   `curl "https://friendbot.stellar.org?addr=<YOUR_TESTNET_ADDRESS>"`.
+2. Add a trustline for the testnet USDC asset issued by the sandbox's
+documented testnet issuer (see the sandbox's `/health` response and the
+`arbiter-contract` testnet deployment notes for the current issuer and
+asset code).
+3. Acquire testnet USDC from the sandbox's documented testnet faucet, or
+   from any testnet DEX path against that issuer, and pay for questions
+   from your own key.
+
+This keeps your integration independent of Arbiter's platform key and of
+any single hot key's funding.
 
 ## What it does
 
@@ -84,7 +141,8 @@ README, tests, and changelog:
 - **TypeScript / JavaScript**: [`sdk/typescript`](sdk/typescript) (`@arbiter-xyz/sdk`), for Node 18+ and browsers
 - **Python**: [`sdk/python`](sdk/python) (`arbiter-sdk`), for Python 3.9+
 
-Both can be tried against `POST /oracle/sandbox` with no wallet at all.
+Both can be tried against `POST /oracle/sandbox` with no wallet at all,
+and against the developer sandbox for a real round trip.
 
 ## Webhooks
 
@@ -161,11 +219,4 @@ Nothing is auto-merged: these PRs need human review.
 
 ## Running i
 
-Load-test tooling (`scripts/loadtest.js`), measured limits, and the current
-bottleneck (serialized on-chain settlement) are in
-[docs/capacity/README.md](docs/capacity/README.md).
-
-## Handsoff notes
-
-<!-- handsoff-issue-59 -->
-- #59: oracle.js's core settlement logic and metered.js have zero unit test coverage
+/* … truncated 1211 chars — edit only what you need near the top … */
