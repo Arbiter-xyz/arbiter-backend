@@ -46,13 +46,27 @@ import { registerWebhook, listWebhooks, deleteWebhook, WebhookError } from './we
 import { logger, httpLogger } from './logger.js';
 import { getProvenance } from './provenance.js';
 import { enforceSecurityPosture } from './securityPosture.js';
-import { metricsMiddleware, metricsHandler, buildInfo } from './metrics.js';
-import { startHealthProbes } from './healthProbes.js';
-import { createFaultInjector, mountFaultRoutes } from './faultInjection.js';
-import { runRecoverySweep, defaultRecoveryDeps, startRecoverySweeper } from './disasterRecovery.js';
-import { store } from './store.js';
-import { getKnownJobIds, getJob } from './jobs.js';
-import { getLatestLedgerSequence } from './stellarClient.js';
+import {
+  getAutoWithdrawSettings,
+  setAutoWithdrawSettings,
+  deleteAutoWithdrawSettings,
+  checkAutoWithdraw,
+  submitAutoWithdraw,
+  startAutoWithdrawSweep,
+  AutoWithdrawError,
+} from './autoWithdraw.js';
+import { recordWorkerWithdrawal } from './earnings.js';
+import {
+  parseTaxYear,
+  getTaxProfile,
+  saveTaxProfile,
+  buildTaxSummary,
+  buildAllTaxSummaries,
+  listTaxYears,
+  taxSummaryToCsv,
+  taxSummariesToCsv,
+  TaxReportError,
+} from './taxReport.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -805,6 +819,13 @@ app.post('/sponsor/withdraw', rateLimited('sponsor', byIp), async (req, res) => 
     const result = beneficiaryAddress
       ? await feeBumpWithdrawTo(xdr, workerAddress, beneficiaryAddress, amountStroops)
       : await feeBumpWithdraw(xdr, workerAddress, amountStroops);
+    // The relay only lands a transaction the worker signed that matches
+    // this exact withdraw call, so a success here is a real withdrawal.
+    await recordWorkerWithdrawal(workerAddress, {
+      amountStroops,
+      txHash: result.hash,
+      beneficiaryAddress: beneficiaryAddress || null,
+    }).catch((err) => req.log.error({ err }, 'failed to record withdrawal in earnings ledger'));
     res.json(result);
   } catch (err) {
     req.log.error({ err }, 'sponsor withdraw failed');
@@ -869,6 +890,127 @@ app.get('/workers/:address/gamification', async (req, res) => {
   } catch (err) {
     req.log.error({ err }, 'worker gamification lookup failed');
     res.status(500).json({ error: 'failed to build gamification profile' });
+  }
+});
+
+// ---------------------------------------------------------------------
+// Auto-withdraw and tax reporting. Every route here reads or changes a
+// worker's own settings or personal details, so all of them need a session
+// token for that address (POST /workers/:address/session), passed as
+// `Authorization: Bearer <token>`, a `token` body field, or a `token`
+// query param. Non-address worker ids are refused outright: they can't
+// hold withdrawable earnings (see workerAuth.js).
+// ---------------------------------------------------------------------
+
+function requireWorkerSession(req, res, next) {
+  const { address } = req.params;
+  if (!requiresAuth(address)) {
+    return res.status(400).json({ error: 'this endpoint needs a real Stellar worker address' });
+  }
+  const bearer = (req.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  const token = bearer || req.body?.token || req.query.token;
+  if (verifySessionToken(token) !== address) {
+    return res.status(401).json({ error: 'a valid session token for this address is required — see POST /workers/:address/session' });
+  }
+  next();
+}
+
+function sendDomainError(req, res, err, label) {
+  if (err instanceof AutoWithdrawError || err instanceof TaxReportError) {
+    return res.status(err.status).json({ error: err.message });
+  }
+  req.log.error({ err }, label);
+  res.status(500).json({ error: label });
+}
+
+app.get('/workers/:address/auto-withdraw', requireWorkerSession, async (req, res) => {
+  try {
+    res.json(await getAutoWithdrawSettings(req.params.address));
+  } catch (err) {
+    sendDomainError(req, res, err, 'failed to load auto-withdraw settings');
+  }
+});
+
+app.put('/workers/:address/auto-withdraw', rateLimited('push', byIp), requireWorkerSession, async (req, res) => {
+  const { enabled, thresholdStroops, beneficiaryAddress } = req.body || {};
+  try {
+    const settings = await setAutoWithdrawSettings(req.params.address, { enabled, thresholdStroops, beneficiaryAddress });
+    // Check straight away, so a worker already over their new threshold
+    // doesn't wait for the next settlement or sweep. Best-effort only.
+    const check = settings.enabled
+      ? await checkAutoWithdraw(req.params.address).catch((err) => {
+          req.log.warn({ err }, 'initial auto-withdraw check failed');
+          return null;
+        })
+      : null;
+    res.json({ ...settings, check });
+  } catch (err) {
+    sendDomainError(req, res, err, 'failed to save auto-withdraw settings');
+  }
+});
+
+app.delete('/workers/:address/auto-withdraw', rateLimited('push', byIp), requireWorkerSession, async (req, res) => {
+  try {
+    await deleteAutoWithdrawSettings(req.params.address);
+    res.json({ ok: true });
+  } catch (err) {
+    sendDomainError(req, res, err, 'failed to delete auto-withdraw settings');
+  }
+});
+
+// Manual "check now" — the same check settlement and the sweep run. Costs
+// an RPC simulation or two, hence the sponsor-bucket rate limit.
+app.post('/workers/:address/auto-withdraw/check', rateLimited('sponsor', byIp), requireWorkerSession, async (req, res) => {
+  try {
+    res.json(await checkAutoWithdraw(req.params.address));
+  } catch (err) {
+    sendDomainError(req, res, err, 'auto-withdraw check failed');
+  }
+});
+
+// The worker signs the pending transaction (GET .../auto-withdraw returns
+// its XDR) and posts it here to be fee-bumped and submitted.
+app.post('/workers/:address/auto-withdraw/submit', rateLimited('sponsor', byIp), requireWorkerSession, async (req, res) => {
+  const { signedXdr } = req.body || {};
+  if (!signedXdr) return res.status(400).json({ error: 'signedXdr is required' });
+  try {
+    res.json(await submitAutoWithdraw(req.params.address, signedXdr));
+  } catch (err) {
+    sendDomainError(req, res, err, 'auto-withdraw submit failed');
+  }
+});
+
+app.get('/workers/:address/tax-profile', requireWorkerSession, async (req, res) => {
+  const profile = await getTaxProfile(req.params.address);
+  if (!profile) return res.status(404).json({ error: 'no tax profile saved for this address' });
+  res.json(profile);
+});
+
+app.put('/workers/:address/tax-profile', rateLimited('push', byIp), requireWorkerSession, async (req, res) => {
+  try {
+    res.json(await saveTaxProfile(req.params.address, req.body || {}));
+  } catch (err) {
+    sendDomainError(req, res, err, 'failed to save tax profile');
+  }
+});
+
+app.get('/workers/:address/tax-years', requireWorkerSession, async (req, res) => {
+  res.json({ years: await listTaxYears(req.params.address) });
+});
+
+// ?year=2025 (defaults to last calendar year), ?format=csv for a download.
+app.get('/workers/:address/tax-summary', requireWorkerSession, async (req, res) => {
+  try {
+    const year = parseTaxYear(req.query.year);
+    const summary = await buildTaxSummary(req.params.address, year, { includeLines: true });
+    if (req.query.format === 'csv') {
+      res.set('Content-Type', 'text/csv; charset=utf-8');
+      res.set('Content-Disposition', `attachment; filename="arbiter-earnings-${year}-${req.params.address}.csv"`);
+      return res.send(taxSummaryToCsv(summary));
+    }
+    res.json(summary);
+  } catch (err) {
+    sendDomainError(req, res, err, 'failed to build tax summary');
   }
 });
 
@@ -1033,42 +1175,25 @@ app.get('/admin/kyc', requireAdmin, async (req, res) => {
   res.json({ customers: await listAnchorKyc() });
 });
 
-app.get('/admin/teams', requireAdmin, async (req, res) => {
-  const ids = await listKnownTeamIds();
-  const teams = (await Promise.all(ids.map((id) => getTeam(id)))).filter(Boolean);
-  res.json({ teams: teams.map((t) => ({ id: t.id, name: t.name, createdAt: t.createdAt, members: t.members.length })) });
-});
-
-// Holiday/maintenance dispatch pauses — see maintenanceWindows.js.
-app.get('/admin/maintenance-windows', requireAdmin, async (req, res) => {
-  const now = Date.now();
-  const [windows, pause] = await Promise.all([listWindows(), getDispatchPause(now)]);
-  res.json({
-    dispatchPaused: Boolean(pause),
-    ...(pause ? { resumesAt: new Date(pause.resumesAt).toISOString() } : {}),
-    windows: windows.map((w) => ({ ...serializeWindow(w), active: w.startsAt <= now && now < w.endsAt })),
-  });
-});
-
-// body: { startsAt, endsAt, reason? } — ISO-8601 strings or epoch ms.
-app.post('/admin/maintenance-windows', requireAdmin, async (req, res) => {
+// Every worker with earnings in a tax year, one summary each.
+// ?usOnly=true / ?reportableOnly=true narrow it to what a 1099 filing
+// actually covers; ?format=csv gives a one-row-per-worker bulk export.
+app.get('/admin/tax-summaries', requireAdmin, async (req, res) => {
   try {
-    const window = await addWindow(req.body || {});
-    req.log.info({ window }, 'maintenance window scheduled');
-    res.status(201).json({ window: serializeWindow(window) });
+    const year = parseTaxYear(req.query.year);
+    const summaries = await buildAllTaxSummaries(year, {
+      usOnly: req.query.usOnly === 'true',
+      reportableOnly: req.query.reportableOnly === 'true',
+    });
+    if (req.query.format === 'csv') {
+      res.set('Content-Type', 'text/csv; charset=utf-8');
+      res.set('Content-Disposition', `attachment; filename="arbiter-tax-summaries-${year}.csv"`);
+      return res.send(taxSummariesToCsv(summaries));
+    }
+    res.json({ taxYear: year, count: summaries.length, summaries });
   } catch (err) {
-    if (err instanceof MaintenanceWindowError) return res.status(400).json({ error: err.message });
-    req.log.error({ err }, 'failed to schedule maintenance window');
-    res.status(500).json({ error: 'failed to schedule maintenance window' });
+    sendDomainError(req, res, err, 'failed to build tax summaries');
   }
-});
-
-// Deleting an active window ends the pause immediately.
-app.delete('/admin/maintenance-windows/:id', requireAdmin, async (req, res) => {
-  const removed = await removeWindow(req.params.id);
-  if (!removed) return res.status(404).json({ error: 'no such maintenance window' });
-  req.log.info({ windowId: req.params.id }, 'maintenance window removed');
-  res.json({ ok: true, id: req.params.id });
 });
 
 // ---------------------------------------------------------------------
@@ -1139,6 +1264,7 @@ app.post('/admin/recovery/sweep', requireAdmin, async (req, res) => {
 app.use(express.static(path.join(__dirname, '../../app/dist')));
 
 app.listen(config.port, () => {
+  startAutoWithdrawSweep();
   logger.info(
     { port: config.port, contractId: config.contractId || null, network: config.networkPassphrase, allowedOrigins: config.allowedOrigins },
     `Arbiter backend listening on :${config.port}`,

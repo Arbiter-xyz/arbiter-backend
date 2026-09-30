@@ -351,34 +351,6 @@ export async function getQuestionOnChain(questionId) {
   };
 }
 
-/** Latest closed ledger per the RPC — used by the health probe and to age
- * on-chain questions (Question.created_at is a ledger sequence). */
-export async function getLatestLedgerSequence() {
-  return withRetry(async () => (await getServer().getLatestLedger()).sequence, {
-    attempts: 2,
-    timeoutMs: 5_000,
-    baseDelayMs: 200,
-    label: 'getLatestLedger',
-  });
-}
-
-/** Size of the contract's on-chain Pending-question index (contract
- * v0.3.0+; see pending_count() in arbiter-contract's lib.rs). */
-export async function getPendingCountOnChain() {
-  return Number((await simulateReadOnly('pending_count')) ?? 0);
-}
-
-/** One page (at most 100, the contract's MAX_PENDING_PAGE) of Pending
- * question ids from the on-chain index, as decimal strings — the same
- * representation jobs and pending stashes are keyed by. */
-export async function listPendingOnChain(start, limit = 100) {
-  const ids = await simulateReadOnly('list_pending', [
-    nativeToScVal(start, { type: 'u32' }),
-    nativeToScVal(limit, { type: 'u32' }),
-  ]);
-  return (ids ?? []).map((id) => BigInt(id).toString());
-}
-
 export async function getTimeoutLedgersOnChain() {
   return simulateReadOnly('get_timeout_ledgers');
 }
@@ -398,9 +370,40 @@ export async function getBalanceOnChain(payerAddress) {
   return BigInt(balance ?? 0);
 }
 
-export async function readWorker(workerAddress) {
-  const sim = await simulateReadOnly('get_worker', [addressArg(workerAddress)]);
-  const raw = sim.result?.retval;
-  if (raw === undefined) return null;
-  return scValToNative(raw);
+/** Builds and prepares (simulates + assembles footprint/auth) the worker's
+ * OWN withdraw() or withdraw_to() call, with the worker's account as the
+ * source, and returns it UNSIGNED. The backend never signs this — the
+ * worker does, then it goes through the same /sponsor/withdraw-style
+ * fee-bump relay (sponsor.js), whose invoked-function check matches this
+ * call byte for byte since the args are built the same way. */
+export async function buildWorkerWithdrawTx(workerAddress, amountStroops, beneficiaryAddress = null, timeoutSeconds = 3600) {
+  const srv = getServer();
+  const account = await withRetry(() => srv.getAccount(workerAddress), {
+    attempts: 2,
+    timeoutMs: 5_000,
+    baseDelayMs: 200,
+    label: 'getAccount(worker)',
+  });
+  const contract = new Contract(config.contractId);
+  const op = beneficiaryAddress
+    ? contract.call('withdraw_to', addressArg(workerAddress), addressArg(beneficiaryAddress), i128Arg(amountStroops))
+    : contract.call('withdraw', addressArg(workerAddress), i128Arg(amountStroops));
+
+  const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
+    .addOperation(op)
+    .setTimeout(timeoutSeconds)
+    .build();
+
+  const prepared = await srv.prepareTransaction(tx);
+  return prepared.toXDR();
+}
+
+/** Refreshes storage TTL on a worker's Owed/Stake entries via the
+ * contract's permissionless touch() — no worker signature involved, so
+ * this can run on the platform's own admin key exactly like resolve()
+ * does. See touch()'s doc comment in lib.rs for why a periodic sweep needs
+ * to exist at all (a worker who earns once and never returns has no other
+ * way to keep their balance from archiving off-chain storage). */
+export async function touchWorker(workerAddress) {
+  return invokeAsAdmin('touch', [addressArg(workerAddress)]);
 }
