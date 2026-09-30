@@ -48,26 +48,14 @@ import { logger, httpLogger } from './logger.js';
 import { getProvenance } from './provenance.js';
 import { enforceSecurityPosture } from './securityPosture.js';
 import {
-  getAutoWithdrawSettings,
-  setAutoWithdrawSettings,
-  deleteAutoWithdrawSettings,
-  checkAutoWithdraw,
-  submitAutoWithdraw,
-  startAutoWithdrawSweep,
-  AutoWithdrawError,
-} from './autoWithdraw.js';
-import { recordWorkerWithdrawal } from './earnings.js';
-import {
-  parseTaxYear,
-  getTaxProfile,
-  saveTaxProfile,
-  buildTaxSummary,
-  buildAllTaxSummaries,
-  listTaxYears,
-  taxSummaryToCsv,
-  taxSummariesToCsv,
-  TaxReportError,
-} from './taxReport.js';
+  getOrCreateReferralCode,
+  lookupReferralCode,
+  redeemReferralCode,
+  getReferralSummary,
+  listReferrers,
+  ReferralError,
+} from './referrals.js';
+import { recordWorkerIp, noteAnswerTiming, listFlaggedPairs, getWorkerCollusionReport, clearPairFlag } from './collusion.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1052,6 +1040,103 @@ app.post('/workers/:address/push-unsubscribe', rateLimited('push', byIp), async 
 mountSessionRoutes(app, '/workers', rateLimited('push', byIp));
 
 // ---------------------------------------------------------------------
+// Referrals and automated onboarding — see referrals.js. Minting and
+// viewing your own referrals always requires a session token (a code is
+// tied to a real address; there's no test-string convenience here, same
+// as private pools). Onboarding proves control of the NEW address the same
+// way: the challenge is signed offline, so it works before the account
+// exists on-chain.
+// ---------------------------------------------------------------------
+
+function requireWorkerSession(req, res, token) {
+  if (!requiresAuth(req.params.address)) {
+    res.status(400).json({ error: 'a valid Stellar address is required' });
+    return false;
+  }
+  if (verifySessionToken(token) !== req.params.address) {
+    res.status(401).json({ error: 'a valid session token for this address is required — see POST /workers/:address/session' });
+    return false;
+  }
+  return true;
+}
+
+function sendReferralError(req, res, err, fallback) {
+  if (err instanceof ReferralError) return res.status(err.status).json({ error: err.message });
+  req.log.error({ err }, fallback);
+  return res.status(500).json({ error: fallback });
+}
+
+// Public: lets an onboarding UI validate a code before asking for a
+// signature. Deliberately doesn't reveal the owner's address.
+app.get('/referrals/:code', rateLimited('referrals', byIp), async (req, res) => {
+  const record = await lookupReferralCode(req.params.code);
+  if (!record || record.remaining <= 0) return res.status(404).json({ valid: false, error: 'unknown or exhausted referral code' });
+  res.json({ valid: true, code: record.code, remaining: record.remaining });
+});
+
+// Returns the caller's code, minting it on first call. body: { token }
+app.post('/workers/:address/referral-code', rateLimited('referrals', byIp), async (req, res) => {
+  const { token } = req.body || {};
+  if (!requireWorkerSession(req, res, token)) return;
+  try {
+    res.json(await getOrCreateReferralCode(req.params.address));
+  } catch (err) {
+    sendReferralError(req, res, err, 'failed to create referral code');
+  }
+});
+
+app.get('/workers/:address/referrals', async (req, res) => {
+  if (!requireWorkerSession(req, res, req.query.token)) return;
+  try {
+    res.json(await getReferralSummary(req.params.address));
+  } catch (err) {
+    sendReferralError(req, res, err, 'failed to load referrals');
+  }
+});
+
+/**
+ * One-call onboarding: redeem a referral code (optional unless
+ * REFERRAL_REQUIRED_FOR_SPONSORED_ONBOARDING is set) and get back the
+ * sponsored account + trustline transaction to co-sign, then submit it via
+ * POST /sponsor/onboard/submit. Safe to retry: redeeming the same code
+ * twice is a no-op, so a failed build can simply be called again.
+ * body: { token, referralCode? }
+ */
+app.post('/workers/:address/onboard', rateLimited('referrals', byIp), async (req, res) => {
+  const { token, referralCode } = req.body || {};
+  if (!requireWorkerSession(req, res, token)) return;
+
+  if (!referralCode && config.referrals.requiredForSponsoredOnboarding) {
+    return res.status(400).json({ error: 'a referral code is required to onboard on this server' });
+  }
+
+  let referral = null;
+  if (referralCode) {
+    try {
+      referral = await redeemReferralCode(req.params.address, referralCode);
+    } catch (err) {
+      return sendReferralError(req, res, err, 'failed to redeem referral code');
+    }
+  }
+
+  try {
+    const xdr = await buildSponsoredOnboardTx(req.params.address);
+    res.json({
+      address: req.params.address,
+      referral: referral && { code: referral.code, referrer: referral.referrer, redeemedAt: referral.redeemedAt },
+      xdr,
+      next: 'sign `xdr` with this address, then POST it to /sponsor/onboard/submit as { xdr }',
+    });
+  } catch (err) {
+    req.log.error({ err }, 'onboarding: sponsored onboard build failed');
+    res.status(502).json({
+      error: 'referral recorded, but building the sponsored onboarding transaction failed — retry this call',
+      referral: referral && { code: referral.code, referrer: referral.referrer },
+    });
+  }
+});
+
+// ---------------------------------------------------------------------
 // Worker-facing SSE dispatch channel.
 // ---------------------------------------------------------------------
 
@@ -1084,6 +1169,9 @@ app.get('/app/events', async (req, res) => {
   res.flushHeaders();
 
   registerWorker(workerId, res, categories);
+  // Shared-IP signal for collusion.js (stored only as an HMAC). Not awaited:
+  // it's bookkeeping and must never delay the SSE handshake.
+  recordWorkerIp(workerId, req.ip);
   res.write(`event: connected\ndata: ${JSON.stringify({ workerId, categories })}\n\n`);
 
   const keepAlive = setInterval(() => res.write(': keep-alive\n\n'), 15_000);
@@ -1105,16 +1193,12 @@ app.post('/app/answer', rateLimited('answer', byIp), async (req, res) => {
   if (requiresAuth(workerId) && (await verifySession(token)) !== workerId) {
     return res.status(401).json({ error: 'a valid session token for this address is required — see POST /workers/:address/session' });
   }
-  // Checked again inside submitAnswer (the authoritative gate); screening
-  // here too just gives the worker a specific reason instead of a 409.
-  const screened = screenAnswer(answer);
-  if (!screened.ok) {
-    return res.status(422).json({ ok: false, error: `answer rejected by content filter: ${screened.reason}` });
-  }
-  const accepted = submitAnswer(questionId, workerId, answer);
+  const accepted = await submitAnswer(questionId, workerId, answer);
   if (!accepted) {
     return res.status(409).json({ ok: false, error: 'question is closed, expired, or already answered by this worker' });
   }
+  // Answer-timing signal for collusion.js; best-effort, never throws.
+  await noteAnswerTiming(questionId, workerId);
   res.json({ ok: true });
 });
 
@@ -1155,10 +1239,32 @@ app.get('/admin/kyc', requireAdmin, async (req, res) => {
   res.json({ customers: await listAnchorKyc() });
 });
 
-// Fiat accounts with a Stripe refund/dispute reconciled against their
-// credit balance (see billing.js's reverseCharge).
-app.get('/admin/reversals', requireAdmin, async (req, res) => {
-  res.json({ accounts: await listPaymentReversals() });
+app.get('/admin/referrals', requireAdmin, async (req, res) => {
+  res.json({ referrers: await listReferrers() });
+});
+
+// Collusion heuristics (collusion.js). Flags are leads for review, not
+// verdicts — see that module's header for what each signal means.
+app.get('/admin/collusion', requireAdmin, async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 100, 500);
+  res.json({ pairs: await listFlaggedPairs({ limit }) });
+});
+
+app.get('/admin/collusion/workers/:workerId', requireAdmin, async (req, res) => {
+  res.json(await getWorkerCollusionReport(req.params.workerId, getReputation));
+});
+
+// The one admin write: an operator reviewed a pair and lifts its routing
+// suspension. Only a strictly worse score re-suspends afterwards.
+// body: { workers: [a, b], note? }
+app.post('/admin/collusion/clear', requireAdmin, async (req, res) => {
+  const { workers, note } = req.body || {};
+  if (!Array.isArray(workers) || workers.length !== 2 || workers.some((w) => typeof w !== 'string' || !w)) {
+    return res.status(400).json({ error: 'workers must be an array of exactly two worker ids' });
+  }
+  const cleared = await clearPairFlag(workers[0], workers[1], { note });
+  if (!cleared) return res.status(404).json({ error: 'no flag recorded for this pair' });
+  res.json(cleared);
 });
 
 // ---------------------------------------------------------------------

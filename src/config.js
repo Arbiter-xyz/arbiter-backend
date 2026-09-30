@@ -333,6 +333,13 @@ export function negotiateApiVersion({ path = '', accept = '' } = {}) {
       max: num(process.env.WEBHOOKS_RATE_LIMIT_MAX, 20),
       windowMs: num(process.env.WEBHOOKS_RATE_LIMIT_WINDOW_MS, 60_000),
     }),
+    // Code minting/redemption and onboarding. Tight on purpose: each
+    // redemption is a durable write, and onboarding builds a transaction
+    // the platform would pay reserves for.
+    referrals: Object.freeze({
+      max: num(process.env.REFERRALS_RATE_LIMIT_MAX, 10),
+      windowMs: num(process.env.REFERRALS_RATE_LIMIT_WINDOW_MS, 60_000),
+    }),
   }),
 
   vapid: Object.freeze({
@@ -375,34 +382,21 @@ export function negotiateApiVersion({ path = '', accept = '' } = {}) {
     token: process.env.ADMIN_TOKEN || '',
   }),
 
-  // Home domain of the SEP-24/SEP-12 anchor Arbiter integrates with for
-  // fiat rails (bank deposit/withdraw, KYC status). Arbiter is a CLIENT of
-  // this anchor's stellar.toml — it never stores PII or bank details
-  // itself. Unset disables the /anchor/* routes entirely.
-  anchor: Object.freeze({
-    homeDomain: process.env.ANCHOR_HOME_DOMAIN || '',
+  vapid: Object.freeze({
+    publicKey: process.env.VAPID_PUBLIC_KEY || '',
+    privateKey: process.env.VAPID_PRIVATE_KEY || '',
+    subject: process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
   }),
 
-  // The non-crypto onramp (see billing.js): API-key customers pay in fiat
-  // via Stripe and are settled on-chain from ONE pooled balance under this
-  // dedicated identity — deliberately separate from platformSecret/
-  // platformAddress above (which already collects platform fee revenue via
-  // resolve()/refund()), so customer float and fee revenue never commingle
-  // in one account. Unset disables the /billing/* routes and the API-key
-  // branch of POST /oracle entirely (same fail-closed-if-unconfigured
-  // posture as admin.token above).
-  billing: Object.freeze({
-    stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
-    stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
-    fiatPoolSecret: process.env.FIAT_POOL_SECRET || '',
-    fiatPoolAddress: process.env.FIAT_POOL_ADDRESS || '',
-    // 1 USD = 1 USDC face value, at USDC's existing 7-decimal stroop
-    // convention (see pricing.js's stroopsToUsdc) — the simplest possible
-    // conversion for v1. Stripe's own processing fee is absorbed by the
-    // platform, not passed through to the credited balance; revisit if
-    // margin matters before volume does.
-    usdToStroops: 10_000_000n,
-    minTopupUsd: num(process.env.MIN_TOPUP_USD, 10),
+  push: Object.freeze({
+    // Push notifications supplement, never replace, the SSE dispatch
+    // channel — they're for workers who aren't currently connected. A
+    // push round-trip (deliver -> notice -> tap -> app loads) realistically
+    // takes several seconds, so notifying for a very short quorum window
+    // (e.g. the 'express' tier's 12s) would routinely arrive after the
+    // window already closed. Below this threshold, skip push entirely
+    // rather than notify workers for an opportunity they can't act on.
+    minTimeoutForPushMs: num(process.env.PUSH_MIN_TIMEOUT_MS, 20_000),
   }),
 
   // Settlement webhooks (see webhooks.js for registration/validation and
@@ -429,33 +423,35 @@ export function negotiateApiVersion({ path = '', accept = '' } = {}) {
     secretEncryptionKey: process.env.WEBHOOK_SECRET_ENCRYPTION_KEY || '',
   }),
 
-  // Auto-withdraw (see autoWithdraw.js). The backend can never sign a
-  // worker's withdraw() itself, so "auto" means: once Owed crosses the
-  // worker's threshold, prepare the unsigned withdraw transaction and push
-  // it to them to sign. These bound how that runs.
-  autoWithdraw: Object.freeze({
-    // Floor on any worker-configured threshold, so nobody ends up with a
-    // prepared transaction (and a notification) after every tiny credit.
-    minThresholdStroops: BigInt(process.env.AUTO_WITHDRAW_MIN_THRESHOLD_STROOPS || '10000000'), // 1 USDC
-    // How often the background sweep re-checks every opted-in worker's
-    // Owed balance, on top of the check that runs right after settlement.
-    // 0 disables the sweep (settlement-time checks still run).
-    sweepIntervalMs: num(process.env.AUTO_WITHDRAW_SWEEP_INTERVAL_MS, 15 * 60 * 1000),
-    // How long a prepared transaction stays valid for the worker to sign.
-    // Also becomes the transaction's own time bound on-chain.
-    pendingTtlMs: num(process.env.AUTO_WITHDRAW_PENDING_TTL_MS, 24 * 60 * 60 * 1000),
+  // Referral-based worker onboarding (see referrals.js). A worker mints one
+  // code; new workers redeem it once, at onboarding time. The code is
+  // bookkeeping plus a sybil speed bump, not a payout mechanism: there is no
+  // on-chain referral reward, so nothing here moves money.
+  referrals: Object.freeze({
+    // Total redemptions one code allows. Bounds how far a single referrer
+    // can fan out a ring of fresh identities under one code.
+    maxUsesPerCode: num(process.env.REFERRAL_MAX_USES_PER_CODE, 25),
+    // When true, POST /workers/:address/onboard refuses to build a
+    // sponsored-onboarding transaction without a valid referral code.
+    // Off by default so open onboarding keeps working as it does today.
+    requiredForSponsoredOnboarding: process.env.REFERRAL_REQUIRED_FOR_SPONSORED_ONBOARDING === 'true',
   }),
 
-  // Annual earnings summary for tax reporting (see taxReport.js). The
-  // payer block is the platform's own details, as they'd appear in the
-  // PAYER box of a 1099. Unset fields are left blank in exports.
-  tax: Object.freeze({
-    // US reporting threshold in USD. At or above it, a summary is flagged
-    // as reportable. $600 matches 1099-NEC; change it if your counsel says
-    // a different form or threshold applies.
-    reportingThresholdUsd: num(process.env.TAX_REPORTING_THRESHOLD_USD, 600),
-    payerName: process.env.TAX_PAYER_NAME || '',
-    payerTin: process.env.TAX_PAYER_TIN || '',
-    payerAddress: process.env.TAX_PAYER_ADDRESS || '',
+  // Collusion-detection heuristics (see collusion.js). Every threshold is a
+  // tunable heuristic, not a proof: flags are for operator review and for
+  // denying the reconcile fast path, never for slashing on their own.
+  collusion: Object.freeze({
+    // Co-answered questions a pair needs before agreement-lift is scored at
+    // all; below this, one lucky streak looks exactly like a ring.
+    minSharedQuestions: num(process.env.COLLUSION_MIN_SHARED_QUESTIONS, 5),
+    // Two answers landing within this window of each other count as
+    // "synchronized" for the timing heuristic.
+    syncWindowMs: num(process.env.COLLUSION_SYNC_WINDOW_MS, 1_500),
+    // Pair score at or above which the pair is flagged for review and its
+    // shared quorums lose the reconcile fast path.
+    flagScore: num(process.env.COLLUSION_FLAG_SCORE, 0.6),
+    // Pair score at or above which both workers are also dropped from
+    // routing eligibility (soft, fails open like every other routing gate).
+    suspendScore: num(process.env.COLLUSION_SUSPEND_SCORE, 0.85),
   }),
 });
