@@ -152,3 +152,132 @@ export function describeTolerance(tolerance) {
   if ('percent' in tolerance) return `within ${tolerance.percent}% of each other`;
   return `within ${tolerance.absolute} (absolute) of each other`;
 }
+
+/**
+ * Tool-forced Claude schema for the incident postmortem generator (#109),
+ * the sibling of reconcile.js's REPORT_CONSENSUS_TOOL. Given a set of
+ * correlated log lines (request-id/job-id fields already emitted by
+ * httpLogger/jobLogger()), Claude must return a structured draft with a
+ * timeline, a root cause, and the affected jobs — never free-form prose.
+ */
+export const REPORT_POSTMORTEM_TOOL = Object.freeze({
+  name: 'report_postmortem',
+  description:
+    'Draft a structured incident postmortem from correlated log lines. ' +
+    'Return a chronological timeline, the most likely root cause, and the ' +
+    'jobs/requests affected by the outage.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      timeline: {
+        type: 'array',
+        description: 'Chronological events reconstructed from the log lines.',
+        items: {
+          type: 'object',
+          properties: {
+            timestamp: { type: 'string', description: 'ISO-8601 timestamp of the event.' },
+            event: { type: 'string', description: 'What happened at this point.' },
+            correlationId: {
+              type: 'string',
+              description: 'request-id or job-id this event belongs to, if any.',
+            },
+          },
+          required: ['timestamp', 'event'],
+        },
+      },
+      rootCause: {
+        type: 'string',
+        description: 'The most likely root cause of the incident, or "unknown" if the logs are inconclusive.',
+      },
+      affectedJobs: {
+        type: 'array',
+        description: 'Job ids (or request ids) whose work was disrupted by the incident.',
+        items: { type: 'string' },
+      },
+    },
+    required: ['timeline', 'rootCause', 'affectedJobs'],
+  },
+});
+
+/**
+ * The clearly-marked fallback returned when Claude can't produce a draft
+ * (missing key, timeout, malformed tool output). Mirrors reconcile()'s
+ * discipline: the caller gets a usable, obviously-degraded response and
+ * never an unhandled rejection.
+ */
+export function postmortemFallback(reason) {
+  return {
+    ok: false,
+    draft: null,
+    error: 'draft generation failed, see raw logs',
+    reason: reason || 'unknown error',
+  };
+}
+
+/**
+ * Normalizes whatever Claude returned through REPORT_POSTMORTEM_TOOL into
+ * the shape the admin route returns. Tolerates missing/extra fields so a
+ * slightly-off tool response still yields a usable draft instead of a
+ * crash.
+ */
+export function normalizePostmortemDraft(input) {
+  const raw = input && typeof input === 'object' ? input : {};
+  const timeline = Array.isArray(raw.timeline)
+    ? raw.timeline
+        .filter((e) => e && typeof e === 'object')
+        .map((e) => ({
+          timestamp: typeof e.timestamp === 'string' ? e.timestamp : '',
+          event: typeof e.event === 'string' ? e.event : '',
+          correlationId: typeof e.correlationId === 'string' ? e.correlationId : null,
+        }))
+    : [];
+  const affectedJobs = Array.isArray(raw.affectedJobs)
+    ? raw.affectedJobs.filter((j) => typeof j === 'string')
+    : [];
+  return {
+    ok: true,
+    draft: {
+      timeline,
+      rootCause: typeof raw.rootCause === 'string' && raw.rootCause.trim() ? raw.rootCause : 'unknown',
+      affectedJobs,
+    },
+    error: null,
+    reason: null,
+  };
+}
+
+/**
+ * Builds the user-turn prompt for the postmortem call from a bounded slice
+ * of structured log lines. Accepts either already-parsed objects or raw
+ * JSON strings (as they'd come out of a log store), and drops anything
+ * unparseable rather than throwing.
+ */
+export function buildPostmortemPrompt(logLines, { from, to, jobId } = {}) {
+  const parsed = [];
+  for (const line of Array.isArray(logLines) ? logLines : []) {
+    if (line && typeof line === 'object') {
+      parsed.push(line);
+      continue;
+    }
+    if (typeof line === 'string') {
+      try {
+        const obj = JSON.parse(line);
+        if (obj && typeof obj === 'object') parsed.push(obj);
+      } catch {
+        // Non-JSON log line: skip it rather than failing the whole draft.
+      }
+    }
+  }
+
+  const scope = [];
+  if (from) scope.push(`from ${from}`);
+  if (to) scope.push(`to ${to}`);
+  if (jobId) scope.push(`job/request id ${jobId}`);
+  const scopeText = scope.length ? ` Time range: ${scope.join(', ')}.` : '';
+
+  return (
+    `Draft an incident postmortem from the following ${parsed.length} correlated log line(s).${scopeText}\n` +
+    'Use the request-id/job-id fields to reconstruct the dispatch → reconcile → settle flow.\n\n' +
+    JSON.stringify(parsed, null, 2)
+  );
+}

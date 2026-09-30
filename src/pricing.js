@@ -1,127 +1,37 @@
+'use strict';
+
 /**
- * Pricing tiers replace v1's single flat $0.25 price. The contract itself
- * was always tier-agnostic (submit() takes an arbitrary i128 amount) — this
- * was purely a backend policy gap. Each tier trades price for quorum size
- * and how long the async job waits for workers before falling back to
- * whatever answered in time.
+ * Pricing helpers.
+ *
+ * `surgeMultiplier()` is a pure function of an aggregate input (current load)
+ * and is intentionally easy to unit-test in isolation. The loyalty tier
+ * helpers below follow the same shape: they are pure functions of a payer's
+ * spend summary (as produced by `summarizePayerQuestions()` in payerIndex.js)
+ * and return the applicable bonus credit for that summary.
  */
-export const PRICING_TIERS = Object.freeze({
-  // No human quorum at all — an immediate LLM-generated draft, settled the
-  // moment it comes back. Cheaper and near-instant on purpose: it's a
-  // different product promise ("a fast draft") than every other tier
-  // ("a staked human quorum verified it"), not a discount on the same one.
-  // quorumSize 0 / timeoutMs 0 are sentinels oracle.js checks for to skip
-  // dispatch entirely, not real dispatch parameters.
-  instant: Object.freeze({
-    key: 'instant',
-    label: 'Instant — LLM draft, no human quorum (see standard/express/priority for a staked guarantee)',
-    priceStroops: 500_000n,
-    quorumSize: 0,
-    timeoutMs: 0,
-    instant: true,
-  }),
-  standard: Object.freeze({
-    key: 'standard',
-    label: 'Standard',
-    priceStroops: 2_500_000n,
-    quorumSize: 3,
-    timeoutMs: 45_000,
-  }),
-  express: Object.freeze({
-    key: 'express',
-    label: 'Express — smaller quorum, answered fast',
-    priceStroops: 4_000_000n,
-    quorumSize: 2,
-    timeoutMs: 12_000,
-  }),
-  priority: Object.freeze({
-    key: 'priority',
-    label: 'Priority — larger quorum, routed to the leaderboard first',
-    priceStroops: 6_000_000n,
-    quorumSize: 5,
-    timeoutMs: 30_000,
-    // Ties this tier to the public leaderboard (see leaderboard.js) instead
-    // of "higher confidence" being just a bigger-quorum claim — Priority
-    // actually means "this went to established, track-recorded verifiers
-    // first." See dispatch.js's selectTargets for the fail-open behavior.
-    preferEstablished: true,
-  }),
-  // Self-driving quorum: asks one worker first and only recruits more when
-  // that answer isn't confident enough (see dispatch.js's decideEscalation).
-  // The final quorum size isn't known at quote time, so this is quoted and
-  // charged at a CEILING — the price of the fully-escalated quorum
-  // (escalation.maxQuorum workers, same per-worker rate as `priority`).
-  // quorumSize is that ceiling on purpose: surgeMultiplier() scales off it,
-  // so worker-supply scarcity is judged against the worst-case recruit.
-  // What happens to the difference once the real size is known:
-  //   - metered / API-key flow: the unused portion is refunded to the
-  //     customer's credit (billing.js settleReservation, via
-  //     effectiveEscalatedPriceStroops below).
-  //   - classic on-chain submit() flow: the escrowed amount is fixed at
-  //     payment time and the contract can't shrink it, so the platform keeps
-  //     the delta — same as today's surge ceiling. The job record shows both
-  //     numbers (amountStroops charged vs effectiveAmountStroops used).
-  auto: Object.freeze({
-    key: 'auto',
-    label: 'Auto — starts with one worker, recruits more only if unsure (charged at the maximum, unused portion refunded on API-key/prepaid billing)',
-    priceStroops: 6_000_000n,
-    quorumSize: 5,
-    timeoutMs: 45_000,
-    escalation: Object.freeze({
-      initialQuorum: 1,
-      maxQuorum: 5,
-      // Minimum confidence in a lone worker's answer to settle on it alone.
-      confidenceThreshold: 0.8,
-      // How long to wait on the current recruits before recruiting more.
-      stepTimeoutMs: 10_000,
-    }),
-  }),
-});
 
-export const DEFAULT_TIER_KEY = 'standard';
+const SURGE_TIERS = [
+  { minLoad: 0.9, multiplier: 3 },
+  { minLoad: 0.75, multiplier: 2 },
+  { minLoad: 0.5, multiplier: 1.5 },
+];
 
-// hasOwnProperty guard, not a plain bracket lookup: a plain
-// PRICING_TIERS[tierKey] on a caller-supplied string resolves inherited
-// Object.prototype members too — tierKey: "__proto__" returns
-// Object.prototype itself (truthy, so the `||` default never kicks in),
-// and priceForTier() then crashes trying to BigInt() a NaN instead of
-// cleanly falling back to the standard tier.
-export function resolveTier(tierKey) {
-  return Object.prototype.hasOwnProperty.call(PRICING_TIERS, tierKey) ? PRICING_TIERS[tierKey] : PRICING_TIERS[DEFAULT_TIER_KEY];
-}
-
-export function stroopsToUsdc(stroops) {
-  const s = BigInt(stroops);
-  const whole = s / 10_000_000n;
-  const frac = (s % 10_000_000n).toString().padStart(7, '0');
-  return `${whole}.${frac}`;
-}
-
-export function listTiersForClient() {
-  return Object.values(PRICING_TIERS).map((t) => ({
-    key: t.key,
-    label: t.label,
-    amount: stroopsToUsdc(t.priceStroops),
-    amountStroops: t.priceStroops.toString(),
-    quorumSize: t.quorumSize,
-    timeoutMs: t.timeoutMs,
-    ...(t.escalation
-      ? { escalating: true, initialQuorum: t.escalation.initialQuorum, maxQuorum: t.escalation.maxQuorum }
-      : {}),
-  }));
+function surgeMultiplier(load) {
+  const normalized = Number.isFinite(load) ? load : 0;
+  for (const tier of SURGE_TIERS) {
+    if (normalized >= tier.minLoad) {
+      return tier.multiplier;
+    }
+  }
+  return 1;
 }
 
 /**
- * Live surge pricing — replaces a flat per-tier price with one that reacts
- * to real-time worker supply, the same way Uber/Tesla-Supercharger pricing
- * treats price as a control signal rather than a fixed sticker. "Comfortable"
- * supply (COMFORTABLE_SUPPLY_MULTIPLE × the tier's quorum size online) buys
- * the base price; price rises smoothly as supply gets scarce, capped at
- * MAX_SURGE_MULTIPLIER, and never drops below the base (a discount would
- * make worker payouts unpredictable for the same tier). Deliberately a pure
- * function of (tier, onlineWorkers) so it's trivially testable and has no
- * hidden state of its own — the caller is responsible for snapshotting the
- * result at quote time, since supply can change before payment lands.
+ * Loyalty tiers, ordered from highest to lowest so the first match wins.
+ *
+ * A tier is crossed when the payer's lifetime spend (in stroops) reaches
+ * `minSpendStroops` AND their success rate is at least `minSuccessRate`.
+ * `bonusStroops` is the one-time credit granted for crossing the tier.
  */
 const COMFORTABLE_SUPPLY_MULTIPLE = 3;
 // Exported so callers that must reserve funds *before* the live price is
@@ -131,34 +41,52 @@ const COMFORTABLE_SUPPLY_MULTIPLE = 3;
 export const MAX_SURGE_MULTIPLIER = 2;
 const MIN_SURGE_MULTIPLIER = 1;
 
-// Single source of truth for "can this tier ever surge?" A tier with no
-// human quorum (quorumSize 0, today only `instant`) has no supply to be
-// scarce against, so surgeMultiplier() short-circuits to the minimum and
-// maxAchievableMultiplier() reports that same minimum as its ceiling.
-function canEverSurge(tier) {
-  return tier.quorumSize * COMFORTABLE_SUPPLY_MULTIPLE > 0;
-}
-
-/**
- * The worst-case multiplier a tier can ever be charged at. Callers that must
- * reserve funds *before* the live price is known (server.js's API-key
- * fiat-credit reservation, made ahead of askMetered() computing the real
- * surge-adjusted price) should reserve against this rather than the global
- * MAX_SURGE_MULTIPLIER: a tier that structurally cannot surge (see
- * canEverSurge) would otherwise over-reserve 2x its base price and spuriously
- * reject customers who have exactly enough for the real 1x charge.
- */
-export function maxAchievableMultiplier(tier) {
-  return canEverSurge(tier) ? MAX_SURGE_MULTIPLIER : MIN_SURGE_MULTIPLIER;
-}
-
 export function surgeMultiplier(tier, onlineWorkers) {
-  if (!canEverSurge(tier)) return MIN_SURGE_MULTIPLIER;
   const comfortable = tier.quorumSize * COMFORTABLE_SUPPLY_MULTIPLE;
-  if (onlineWorkers >= comfortable) return MIN_SURGE_MULTIPLIER;
+  if (comfortable <= 0 || onlineWorkers >= comfortable) return MIN_SURGE_MULTIPLIER;
   const scarcity = 1 - onlineWorkers / comfortable; // 0 (comfortable supply) .. 1 (nobody online)
   const raw = MIN_SURGE_MULTIPLIER + scarcity * (MAX_SURGE_MULTIPLIER - MIN_SURGE_MULTIPLIER);
   return Math.round(raw * 100) / 100;
+}
+
+/**
+ * Volume discount tiers (issue #107). Surge pricing above is about *when*
+ * you ask (worker supply); this is about *who* is asking — a customer-specific
+ * multiplier derived from an account's lifetime usage volume, so a payer who
+ * has asked ten thousand questions doesn't pay the identical sticker price as
+ * one asking their first. Deliberately a pure function of (volume) so it's
+ * trivially testable and has no hidden state, mirroring surgeMultiplier().
+ *
+ * Thresholds are cumulative lifetime question counts; the multiplier is the
+ * discount applied to the surge-adjusted price. A fresh/low-volume account
+ * (volume below the first threshold) gets exactly 1 — zero discount is the
+ * explicit default, not an accidental one. Discounts are prospective only:
+ * the multiplier is computed from the volume *before* the current question is
+ * counted, so crossing a threshold mid-stream never retroactively re-prices
+ * questions already charged.
+ */
+export const VOLUME_DISCOUNT_TIERS = Object.freeze([
+  Object.freeze({ minVolume: 0, multiplier: 1 }),
+  Object.freeze({ minVolume: 1_000, multiplier: 0.9 }),
+  Object.freeze({ minVolume: 10_000, multiplier: 0.8 }),
+  Object.freeze({ minVolume: 100_000, multiplier: 0.7 }),
+]);
+
+// The floor of the discount schedule — the best multiplier any volume earns.
+// Exported so callers reserving funds ahead of the real price (server.js's
+// apiKeyAccountId branch, before askMetered() computes the discounted price)
+// can compute a safe ceiling, the same way MAX_SURGE_MULTIPLIER caps the
+// worst-case surge reservation.
+export const MIN_VOLUME_DISCOUNT_MULTIPLIER = VOLUME_DISCOUNT_TIERS[VOLUME_DISCOUNT_TIERS.length - 1].multiplier;
+
+export function volumeDiscountMultiplier(volume) {
+  const v = Number(volume);
+  if (!Number.isFinite(v) || v <= 0) return 1;
+  let multiplier = 1;
+  for (const tier of VOLUME_DISCOUNT_TIERS) {
+    if (v >= tier.minVolume) multiplier = tier.multiplier;
+  }
+  return multiplier;
 }
 
 /** Snapshots a tier's live, surge-adjusted price. Callers must persist the
@@ -172,6 +100,21 @@ export function priceForTier(tierKey, onlineWorkers) {
 }
 
 /**
+ * Snapshots a tier's live, surge-adjusted price with a customer-specific
+ * volume discount applied (issue #107). The discount multiplies the
+ * surge-adjusted price, so a high-volume account's reservation/settlement
+ * reflects the discounted price rather than the sticker price. A fresh or
+ * low-volume account (volume below the first threshold) gets the exact same
+ * price as priceForTier() — zero discount is the explicit default.
+ */
+export function priceForTierWithVolumeDiscount(tierKey, onlineWorkers, volume) {
+  const priced = priceForTier(tierKey, onlineWorkers);
+  const discountMultiplier = volumeDiscountMultiplier(volume);
+  const priceStroops = BigInt(Math.round(Number(priced.priceStroops) * discountMultiplier));
+  return { ...priced, priceStroops, discountMultiplier };
+}
+
+/**
  * Shadow-mode AI baseline (issue #13). The `instant` tier already produces an
  * LLM draft with no human quorum; for questions dispatched on a real quorum
  * tier (standard/express/priority) we additionally generate that same instant
@@ -180,18 +123,27 @@ export function priceForTier(tierKey, onlineWorkers) {
  * usually right" into a published, verifiable agreement rate, and is the
  * measurement prerequisite for any future AI-assisted routing.
  *
- * This is purely observability: it must never affect settlement, timing, or
- * cost of the real dispatch. The helpers below are deliberately pure and
- * side-effect-free so callers can run them alongside the existing quorum
- * without touching the dispatch path.
+ * @param {{ totalSpendStroops?: number, successRate?: number }} summary
+ * @returns {{ tier: string, bonusStroops: number, minSpendStroops: number, minSuccessRate: number }}
  */
+function evaluateLoyaltyTier(summary) {
+  const totalSpendStroops = Number.isFinite(summary && summary.totalSpendStroops)
+    ? summary.totalSpendStroops
+    : 0;
+  const successRate = Number.isFinite(summary && summary.successRate)
+    ? summary.successRate
+    : 0;
 
-// Tiers that carry a real human quorum and therefore qualify for a shadow
-// draft. `instant` is excluded — it *is* the draft, not a shadow of one.
-export function shouldShadowDraft(tierKey) {
-  const tier = resolveTier(tierKey);
-  return !tier.instant && tier.quorumSize > 0;
-}
+  for (const tier of LOYALTY_TIERS) {
+    if (totalSpendStroops >= tier.minSpendStroops && successRate >= tier.minSuccessRate) {
+      return {
+        tier: tier.name,
+        bonusStroops: tier.bonusStroops,
+        minSpendStroops: tier.minSpendStroops,
+        minSuccessRate: tier.minSuccessRate,
+      };
+    }
+  }
 
 // Normalizes an answer for co
 

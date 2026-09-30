@@ -45,6 +45,27 @@ function sessionSecret() {
 }
 const SESSION_SECRET = sessionSecret();
 
+// Graceful SESSION_SECRET rotation (#7): during a bounded grace window,
+// session verification also accepts tokens signed by the immediately-prior
+// secret (SESSION_SECRET_PREVIOUS). The window is measured from process
+// start (i.e. from when the rotation was deployed). 0 disables it.
+const SESSION_SECRET_PREVIOUS = process.env.SESSION_SECRET_PREVIOUS || '';
+const SESSION_SECRET_ROTATION_GRACE_MS = num(process.env.SESSION_SECRET_ROTATION_GRACE_MS, 0);
+const SESSION_SECRET_ROTATION_STARTED_AT = Date.now();
+
+function sessionSecrets() {
+  const secrets = [SESSION_SECRET];
+  if (
+    SESSION_SECRET_PREVIOUS &&
+    SESSION_SECRET_PREVIOUS !== SESSION_SECRET &&
+    SESSION_SECRET_ROTATION_GRACE_MS > 0 &&
+    Date.now() - SESSION_SECRET_ROTATION_STARTED_AT < SESSION_SECRET_ROTATION_GRACE_MS
+  ) {
+    secrets.push(SESSION_SECRET_PREVIOUS);
+  }
+  return secrets;
+}
+
 // Per-customer outbound webhook retry policy (#154). Shaped like retry.js's
 // withRetry(fn, { attempts, baseDelayMs, ... }) options so the delivery
 // worker from #56 reuses that exponential-backoff algorithm rather than a
@@ -83,102 +104,35 @@ export function validateWebhookRetryPolicy(policy) {
   return { attempts, baseDelayMs };
 }
 
-// Supported fiat currencies for the Stripe onramp (#103). Each entry carries
-// the number of minor units in one major unit (Stripe's `amount` is always
-// in the currency's smallest unit) and the FX rate used to convert one major
-// unit of that currency into USDC face value (which is what stroops are
-// denominated in). USD is 1:1 by definition; the others are a
-// periodically-updated static table — precision-to-the-cent isn't required
-// for the onramp, and a static table avoids a live FX dependency on the
-// checkout path. Rates are expressed as USDC-per-major-unit and are the
-// source of truth for both checkout-time quoting and webhook-time crediting
-// (the rate is snapshotted into session metadata at checkout so the webhook
-// credits at the rate the customer actually saw).
-export const SUPPORTED_FIAT_CURRENCIES = Object.freeze({
-  usd: Object.freeze({ minorUnitsPerMajor: 100, usdcPerMajor: 1 }),
-  eur: Object.freeze({ minorUnitsPerMajor: 100, usdcPerMajor: 1.08 }),
-  gbp: Object.freeze({ minorUnitsPerMajor: 100, usdcPerMajor: 1.27 }),
-  cad: Object.freeze({ minorUnitsPerMajor: 100, usdcPerMajor: 0.74 }),
-  aud: Object.freeze({ minorUnitsPerMajor: 100, usdcPerMajor: 0.66 }),
+// Contract compatibility pin (#163). This backend is developed independently
+// of `arbiter-contract`, so nothing at build time guarantees the two agree on
+// argument shapes. COMPATIBLE_CONTRACT_VERSION names the tagged contract
+// release this backend is built against, and COMPATIBLE_CONTRACT_WASM_HASH is
+// that release's recorded WASM hash (from arbiter-contract's release notes).
+// At startup (see contractVersionCheck.js) the deployed instance's hash is
+// fetched on-chain and compared against this pin; a mismatch logs a loud,
+// specific warning rather than surfacing later as an opaque Soroban error.
+// Compatibility model: same major version = safe; different major = verify
+// manually against arbiter-contract's breaking-change definition.
+export const contractCompatibility = Object.freeze({
+  version: process.env.COMPATIBLE_CONTRACT_VERSION || '',
+  wasmHash: (process.env.COMPATIBLE_CONTRACT_WASM_HASH || '').toLowerCase(),
 });
-
-// Normalizes and validates a caller-supplied currency code. Returns the
-// lowercased ISO-4217 code, or throws for anything not in the supported
-// table — callers (createCheckoutSession) turn that into a 400 rather than
-// silently defaulting to USD.
-export function normalizeFiatCurrency(currency) {
-  if (typeof currency !== 'string' || !/^[A-Za-z]{3}$/.test(currency.trim())) {
-    throw new Error(`unsupported currency: ${JSON.stringify(currency)}`);
-  }
-  const code = currency.trim().toLowerCase();
-  if (!Object.prototype.hasOwnProperty.call(SUPPORTED_FIAT_CURRENCIES, code)) {
-    throw new Error(`unsupported currency: ${code}`);
-  }
-  return code;
-}
-
-// Converts an amount in a fiat currency's minor units (Stripe's `amount`)
-// into stroops of USDC face value, using the given currency's locked-in FX
-// rate. 1 USDC = 10_000_000 stroops. Used both at checkout time (to quote)
-// and at webhook time (to credit), so the two can never disagree as long as
-// the same rate is passed in.
-export function fiatMinorUnitsToStroops(amountMinorUnits, currency) {
-  const code = normalizeFiatCurrency(currency);
-  const { minorUnitsPerMajor, usdcPerMajor } = SUPPORTED_FIAT_CURRENCIES[code];
-  const majorUnits = Number(amountMinorUnits) / minorUnitsPerMajor;
-  const usdc = majorUnits * usdcPerMajor;
-  return BigInt(Math.round(usdc * 10_000_000));
-}
-
-// Chaos-engineering fault injection (#110). Env-gated following the same
-// "everything is an env var with a safe default" convention as the rest of
-// this file: with CHAOS_ENABLED unset (the default) the whole mechanism is
-// inert — `chaos.enabled` is false and every consumer short-circuits before
-// touching any injection state, so normal operation is byte-for-byte
-// unaffected by the chaos code's mere presence. It is additionally refused
-// outright when NODE_ENV=production, so a stray env var in a production
-// deployment can never arm it. Scenarios are named seams matching the
-// callers retry.js already wraps (stellarClient.js's runInvokeAsAdmin /
-// simulateReadOnly, sponsor.js's relayFeeBump) plus the documented
-// fail-closed outcomes a chaos run asserts on (e.g. a Soroban RPC timeout
-// during resolveQuestion() must surface as a retryable failure, never a
-// silent success).
-const CHAOS_SCENARIOS = Object.freeze([
-  'soroban_rpc_timeout',
-  'horizon_unreachable',
-  'redis_unreachable',
-  'claude_timeout',
-]);
-
-function chaosConfig() {
-  const requested = process.env.CHAOS_ENABLED === 'true';
-  const isProduction = process.env.NODE_ENV === 'production';
-  const enabled = requested && !isProduction;
-  if (requested && isProduction) {
-    console.warn('[config] CHAOS_ENABLED=true ignored: chaos fault injection is never reachable in production');
-  }
-  const scenario = (process.env.CHAOS_SCENARIO || '').trim();
-  if (enabled && scenario && !CHAOS_SCENARIOS.includes(scenario)) {
-    throw new Error(`chaos: unknown CHAOS_SCENARIO ${JSON.stringify(scenario)}; expected one of ${CHAOS_SCENARIOS.join(', ')}`);
-  }
-  return Object.freeze({
-    enabled,
-    scenario: enabled ? scenario : '',
-    // Fraction of matching calls to fail, in [0, 1]. Defaults to 1 (every
-    // matching call fails) so a scenario is deterministic unless a run
-    // deliberately wants partial-failure behavior.
-    failureRate: num(process.env.CHAOS_FAILURE_RATE, 1),
-    // Injected latency for timeout scenarios, in ms.
-    latencyMs: num(process.env.CHAOS_LATENCY_MS, 0),
-    scenarios: CHAOS_SCENARIOS,
-  });
-}
 
 export const config = Object.freeze({
   port: num(process.env.PORT, 4000),
   horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
-  sorobanRpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org',
+  // Primary RPC URL — kept for backward compatibility with existing callers
+  // that read config.sorobanRpcUrl directly. Equals sorobanRpcUrls[0].
+  sorobanRpcUrl: sorobanRpcUrls[0],
+  // Full ordered list of configured RPC endpoints (primary first).
+  sorobanRpcUrls: Object.freeze(sorobanRpcUrls),
   networkPassphrase: process.env.NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015',
+
+  // Which deployment this process is (#150): 'demo' (disposable) or
+  // 'sandbox' (long-lived developer sandbox). Surfaced so /health and the
+  // README can distinguish the two environments unambiguously.
+  deploymentProfile,
 
   usdc: Object.freeze({
     sacId: process.env.USDC_SAC_ID || '',
@@ -190,53 +144,145 @@ export const config = Object.freeze({
   platformSecret: process.env.PLATFORM_SECRET || '',
   platformAddress: process.env.PLATFORM_ADDRESS || '',
 
+  // Pinned arbiter-contract release this backend expects (see
+  // contractCompatibility above and contractVersionCheck.js).
+  compatibleContractVersion: contractCompatibility.version,
+  compatibleContractWasmHash: contractCompatibility.wasmHash,
+
   // Must match the timeout_ledgers the contract was actually initialize()'d
   // with — this copy is for display/UX only (e.g. "auto-refund available
   // after ledger N"); the contract enforces its own stored value regardless.
   timeoutLedgers: num(process.env.TIMEOUT_LEDGERS, 100),
 
-  minConfidence: num(process.env.MIN_CONFIDENCE, 0.6),
+// API version negotiation (#136). Additive, not a rewrite: every existing
+// unversioned route in server.js keeps working unchanged and is treated as
+// implicit v1, so no integrator is forced onto a /v1/ prefix. New or changed
+// routes opt into an explicit version via either a URL-path prefix
+// (/v2/...) or the Accept header (application/vnd.arbiter.v2+json).
+//
+// v1 is the implicit default (no version requested). v2 is the first
+// explicitly negotiated version and is the real worked example for this
+// issue. Requesting a version that isn't in this list must produce a clear
+// 4xx (see negotiateApiVersion below) — never a silent fallback to v1 and
+// never a 500.
+export const API_VERSIONS = Object.freeze(['v1', 'v2']);
+export const DEFAULT_API_VERSION = 'v1';
 
-  // Undo window (see undoWindow.js): how long a paid, non-instant question
-  // is held after payment before it's dispatched to workers, during which
-  // the payer can POST /oracle/:jobId/cancel for a refund. 0 disables it.
-  undoWindowMs: num(process.env.UNDO_WINDOW_MS, 8_000),
+// Matches Accept: application/vnd.arbiter.v2+json (and the v1 form). Kept
+// permissive about surrounding parameters (q-values, charset) since curl
+// users won't hand-craft a perfect Accept header.
+const ACCEPT_VERSION_RE = /application\/vnd\.arbiter\.(v\d+)\+json/i;
 
-  anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
-  anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-sonnet-5',
+// Resolves the requested API version from a request's URL path and Accept
+// header. Returns { version, explicit } where `explicit` is true only when
+// the caller actually asked for a version (path prefix or Accept header) —
+// unversioned requests resolve to DEFAULT_API_VERSION with explicit:false so
+// callers can keep the legacy behavior byte-for-byte.
+//
+// Throws an Error with a `.status = 400` for an unrecognized version so the
+// route layer can surface a clear 4xx instead of a silent fallback or 500.
+export function negotiateApiVersion({ path = '', accept = '' } = {}) {
+  const pathMatch = /^\/(v\d+)(?:\/|$)/i.exec(path);
+  const acceptMatch = ACCEPT_VERSION_RE.exec(accept || '');
+  const requested = (pathMatch?.[1] || acceptMatch?.[1] || '').toLowerCase();
 
-  // Draft-answer suggestions for human-quorum tiers (see oracle.js's
-  // shouldDraftSuggestion): one extra Claude call per dispatched question,
-  // delivered to workers as an unverified prefill. Opt-in, off by default:
-  // it adds real per-question Claude spend, and a visible draft can anchor
-  // workers toward the LLM's answer instead of their own independent one —
-  // a trade-off an operator should choose deliberately, not inherit.
-  draftSuggestions: Object.freeze({
-    enabled: process.env.DRAFT_SUGGESTIONS_ENABLED === 'true',
-    tiers: Object.freeze(
-      (process.env.DRAFT_SUGGESTION_TIERS || 'standard,express,priority')
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean),
-    ),
+  if (!requested) return { version: DEFAULT_API_VERSION, explicit: false };
+
+  if (!API_VERSIONS.includes(requested)) {
+    const err = new Error(
+      `unsupported API version '${requested}'; supported versions: ${API_VERSIONS.join(', ')}`,
+    );
+    err.status = 400;
+    err.code = 'unsupported_api_version';
+    err.supportedVersions = API_VERSIONS;
+    throw err;
+  }
+
+  return { version: requested, explicit: true };
+}
+
+  // Cross-instance quorum collection (#160). When more than one backend
+  // instance is running, a question's collector lives in the memory of
+  // whichever instance dispatched it, but an answer for that question can
+  // arrive at any instance a worker happens to be connected to. Answers are
+  // therefore routed over Redis pub/sub: the owning instance subscribes to
+  // `quorum:answers:<questionId>` and any instance that receives an answer
+  // for a question it does not own publishes it there instead of dropping
+  // it. Pub/sub (not Streams) is deliberate: answers are only useful while
+  // the collector is still open, so replay/ordering guarantees buy nothing
+  // here, and the simpler transport keeps the failure modes small. The
+  // channel prefix is configurable so tests can namespace channels against a
+  // shared fake Redis without colliding with a real deployment.
+  quorum: Object.freeze({
+    channelPrefix: process.env.QUORUM_CHANNEL_PREFIX || 'quorum:answers:',
+    // How long an owning instance waits for a cross-instance answer before
+    // treating the question as orphaned and letting the existing TTL/timeout
+    // path refund it. Bounded by pendingQuestionTtlMs so a dead dispatcher
+    // can never hold a question open longer than the normal pending TTL.
+    answerTimeoutMs: num(process.env.QUORUM_ANSWER_TIMEOUT_MS, 30_000),
   }),
-
-  pendingQuestionTtlMs: num(process.env.PENDING_QUESTION_TTL_MS, 600_000),
-  jobResultTtlMs: num(process.env.JOB_RESULT_TTL_MS, 3_600_000),
-
-  redisUrl: process.env.REDIS_URL || '',
-
-  // Chaos-engineering fault injection (#110). Inert unless CHAOS_ENABLED=true
-  // and NODE_ENV !== 'production'; see chaosConfig() above.
-  chaos: chaosConfig(),
 
   // Comma-separated list of allowed CORS origins, e.g.
   // "https://app.example.com,https://demo.example.com". Defaults to '*'
   // (wide open) for local dev — lock this down for any real deployment.
-  allowedOrigins: (process.env.ALLOWED_ORIGINS || '*')
+  allowedOrigins: (process.env.ALLOWED_ORIGINS || '*').split(',').map((s) => s.trim()).filter(Boolean),
+
+  // Express `trust proxy` value, applied in server.js before any rate-limited
+  // route registers. false (default) = trust nothing, req.ip is the raw
+  // socket address (unchanged local-dev behavior). Behind Railway set
+  // TRUST_PROXY=1 (exactly one proxy hop). See trustProxy() above for why
+  // `true` is dangerous here.
+  trustProxy: trustProxy(),
+
+  // 'json' for real deployments (log aggregators parse JSON lines
+  // directly); anything else pretty-prints for local dev readability.
+  logFormat: process.env.LOG_FORMAT || 'pretty',
+  logLevel: process.env.LOG_LEVEL || 'info',
+
+  // Prometheus scrape endpoint (metrics.js) and the probes behind its gauges
+  // (healthProbes.js). METRICS_TOKEN unset = /metrics is open, which is the
+  // usual setup for a scrape target on a private network.
+  metrics: Object.freeze({
+    token: process.env.METRICS_TOKEN || '',
+    probeIntervalMs: num(process.env.METRICS_PROBE_INTERVAL_MS, 15_000),
+    jobScanIntervalMs: num(process.env.METRICS_JOB_SCAN_INTERVAL_MS, 60_000),
+  }),
+
+  // Chain-driven recovery sweep (disasterRecovery.js): refunds on-chain
+  // Pending questions that no local state can still settle, e.g. after the
+  // store was lost. Needs contract v0.3.0+ (list_pending) and PLATFORM_SECRET.
+  recovery: Object.freeze({
+    enabled: process.env.RECOVERY_SWEEP_ENABLED !== 'false',
+    intervalMs: num(process.env.RECOVERY_SWEEP_INTERVAL_MS, 5 * 60 * 1000),
+    minAgeLedgers: num(process.env.RECOVERY_MIN_AGE_LEDGERS, 12),
+    staleInflightMs: num(process.env.RECOVERY_STALE_INFLIGHT_MS, 30 * 60 * 1000),
+    maxRefundsPerSweep: num(process.env.RECOVERY_MAX_REFUNDS_PER_SWEEP, 50),
+  }),
+
+  // Alert drill only (faultInjection.js). Refused in production by
+  // securityPosture.js.
+  faultInjection: process.env.ARBITER_FAULT_INJECTION === 'true',
+
+  // Response security headers (see securityHeaders.js). CSP_CONNECT_SRC is a
+  // comma-separated list of extra origins the frontend may fetch()/stream
+  // from — only needed when the UI is hosted on a different origin than
+  // this API. HSTS_ENABLED=false turns off Strict-Transport-Security.
+  securityHeaders: Object.freeze({
+    connectSrc: (process.env.CSP_CONNECT_SRC || '').split(',').map((s) => s.trim()).filter(Boolean),
+    hsts: process.env.HSTS_ENABLED !== 'false',
+  }),
+
+  const ids = (process.env.CONTRACT_IDS || '')
     .split(',')
     .map((s) => s.trim())
-    .filter(Boolean),
+    .filter(Boolean);
+  if (ids.length > 0) {
+    return ids.map((id, i) => ({
+      id,
+      adminKey: process.env.ADMIN_SECRET_KEY || null,
+      label: `contract-${i}`,
+    }));
+  }
 
   worker: Object.freeze({
     rateLimitMaxConnections: num(process.env.WORKER_RATE_LIMIT_MAX_CONNECTIONS, 5),

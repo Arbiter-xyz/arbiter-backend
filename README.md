@@ -16,9 +16,66 @@ lockstep by hand (see #163). Pre-split history and the round-by-round
 build narrative live in the archived
 [`arbiter`](https://github.com/rudeus112266/arbiter) repo.
 
-> **Security:** this backend custodies the platform's keys and auth flows.
-> To report a vulnerability, see [SECURITY.md](SECURITY.md) — please don't
-> open a public issue.
+## Try it live
+
+Two public deployments exist, and they are deliberately different things:
+
+| Environment | URL | Lifetime | Chain calls |
+| --- | --- | --- | --- |
+| **Developer sandbox** | `https://sandbox.arbiter.xyz` | Long-lived; kept up for integrators | Real Soroban testnet `submit()`/`resolve()`/`withdraw()` round trips |
+| **Demo deployment** | `https://demo.arbiter.xyz` | Disposable; may be redeployed or torn down after the SCF submission window | Real Soroban testnet, but not a stable target |
+
+### Developer sandbox (`https://sandbox.arbiter.xyz`)
+
+This is the environment to point a real integration at. It runs its own
+Soroban testnet contract deployment with its own `contractId` and
+`PLATFORM_SECRET`, kept distinct from whatever gets redeployed for demo
+purposes, and its own backend service and `config.js` env block. It is
+committed to staying up rather than being torn down after a submission
+window, and it reuses the existing `rateLimit.js` / `config.rateLimits`
+machinery at a more generous ceiling than the demo deployment, since it
+absorbs sustained integrator traffic rather than one-off demo hits.
+
+`GET /health` and a real `/oracle` submit→resolve round trip are expected
+to succeed against it in checks run at least a week apart. "Long-lived"
+means "not torn down after a specific date" — it is not an uptime SLA.
+
+### Demo deployment (`https://demo.arbiter.xyz`)
+
+The public Railway/Vercel deployment referenced in earlier revisions of
+this README. It is a disposable testnet deployment on free-tier hosting:
+expect it to be redeployed or torn down after the SCF submission window,
+not a permanent production environment. Use it to look around, not to
+build against.
+
+### Zero-chain mode (`POST /oracle/sandbox`)
+
+Distinct from both of the above: `/oracle/sandbox` (`backend/src/sandbox.js`)
+is a purely local simulation. Its own docstring says it "Never touches
+stellarClient.js — no chain calls," which is exactly why it's zero-setup,
+but also why it can't prove anything about real Soroban RPC latency, real
+surge pricing, or a real `submit()`/`resolve()`/`withdraw()` round trip.
+It returns canned response shapes with no payment and no chain. Use it to
+see a response shape before setting up a wallet; use the developer
+sandbox when you need the real round trip.
+
+### Funding a testnet USDC path
+
+You do not need Arbiter's own platform key to get test funds. To fund your
+own integration against the developer sandbox:
+
+1. Create and fund a testnet Stellar account with Friendbot:
+   `curl "https://friendbot.stellar.org?addr=<YOUR_TESTNET_ADDRESS>"`.
+2. Add a trustline for the testnet USDC asset issued by the sandbox's
+documented testnet issuer (see the sandbox's `/health` response and the
+`arbiter-contract` testnet deployment notes for the current issuer and
+asset code).
+3. Acquire testnet USDC from the sandbox's documented testnet faucet, or
+   from any testnet DEX path against that issuer, and pay for questions
+   from your own key.
+
+This keeps your integration independent of Arbiter's platform key and of
+any single hot key's funding.
 
 ## What it does
 
@@ -84,7 +141,8 @@ README, tests, and changelog:
 - **TypeScript / JavaScript**: [`sdk/typescript`](sdk/typescript) (`@arbiter-xyz/sdk`), for Node 18+ and browsers
 - **Python**: [`sdk/python`](sdk/python) (`arbiter-sdk`), for Python 3.9+
 
-Both can be tried against `POST /oracle/sandbox` with no wallet at all.
+Both can be tried against `POST /oracle/sandbox` with no wallet at all,
+and against the developer sandbox for a real round trip.
 
 ## Webhooks
 
@@ -152,6 +210,54 @@ and `GET /admin/transactions` return it. `GET /payers/:address/questions`
 also returns `spendByCategory` and `spendByDay` (UTC days) buckets for spend
 dashboards.
 
+## Teams
+
+A team is a named group of Stellar addresses that share one view of their
+question history and spend. It adds no new credential: every call
+authenticates as a member with `address` plus a session `token` from
+`POST /payers/:address/session`, in the JSON body or the query string.
+
+```http
+POST   /teams                                {"name": "Acme research"}
+GET    /teams                                teams you belong to
+GET    /teams/:teamId
+PATCH  /teams/:teamId                        {"name": "..."}            (admin)
+DELETE /teams/:teamId                                                   (owner)
+POST   /teams/:teamId/members                {"members": ["G..."], "role": "member"}
+PATCH  /teams/:teamId/members/:member        {"role": "admin"}          (owner)
+DELETE /teams/:teamId/members/:member        remove a member, or leave
+GET    /teams/:teamId/questions              combined history + spendByMember
+```
+
+Each team has exactly one `owner`, plus any number of `admin`s and
+`member`s. Admins add and remove plain members. Only the owner manages
+admins. Setting another member's role to `owner` transfers ownership, and
+the previous owner becomes an admin. The owner can't leave or be removed
+until ownership is transferred. People who aren't members get a `404` for a
+team. Limits: 100 members per team, 20 teams per address.
+
+## Maintenance windows
+
+Operators can pause dispatch for holidays or planned maintenance:
+
+```http
+POST   /admin/maintenance-windows   {"startsAt": "2026-12-24T00:00:00Z", "endsAt": "2026-12-27T00:00:00Z", "reason": "holiday"}
+GET    /admin/maintenance-windows
+DELETE /admin/maintenance-windows/:id    (deleting an active window ends the pause now)
+GET    /maintenance                      public: current pause + upcoming windows
+```
+
+While a window is active, requests to `POST /oracle` that would create a
+question get `503` with `Retry-After` and `resumesAt`, before anyone is
+charged. Questions aren't queued through a pause, because the contract's
+`refund_timeout()` would make a paid question refundable long before a
+holiday ends. So a question that was already paid for when the window opened
+is refunded (`reconciliationMethod: "dispatch-paused"`) instead of being
+dispatched. This covers step 2 of the classic flow and jobs still in their
+undo-window hold. Questions that were already dispatched finish normally.
+Sandbox requests are unaffected. Windows that overlap or touch are merged
+into a single pause.
+
 ## Dependency updates
 
 `.github/dependabot.yml` runs a weekly npm update job. Minor and patch bumps
@@ -167,5 +273,5 @@ bottleneck (serialized on-chain settlement) are in
 
 ## Handsoff notes
 
-<!-- handsoff-issue-59 -->
-- #59: oracle.js's core settlement logic and metered.js have zero unit test coverage
+<!-- handsoff-issue-108 -->
+- #108: A public status page reporting real uptime/incident history

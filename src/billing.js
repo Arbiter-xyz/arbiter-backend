@@ -4,7 +4,7 @@ import { store } from './store.js';
 import { config } from './config.js';
 import { hashApiKey } from './apiKeyAuth.js';
 import { logger } from './logger.js';
-import { withRetry } from './retry.js';
+import { fiatPoolBalanceStroops, billingReservationCount, billingSettlementCount } from './metrics.js';
 
 /**
  * The non-crypto onramp: a fiat customer pays via Stripe and is issued an
@@ -16,21 +16,12 @@ import { withRetry } from './retry.js';
  * credit and how much of it they have, never the on-chain settlement
  * itself.
  *
- * Multiple processors (Stripe, PayPal, Coinbase Commerce) implement the
- * same processor-agnostic interface below — createCheckoutSession() and
- * verifyAndParseWebhook() — mirroring how store.js exposes MemoryStore and
- * RedisStore behind one `store` export. The Stripe path is the original
- * concrete instance and is unchanged in behavior; the additional
- * processors are additive, not a replacement.
- */
-
-/**
- * Bounded retry/timeout policy for the outbound Stripe checkout call,
- * matching the shape of HORIZON_RETRY_OPTS in sponsor.js. The Stripe SDK's
- * own network retry is disabled (maxNetworkRetries: 0) so this is the
- * single, uniform retry loop for the call — the same choice round 5 made
- * for Claude in reconcile.js's getClient(), rather than layering a second,
- * redundant retry loop on top of the SDK's default.
+ * Enterprise customers billed after the fact (net-30 invoicing) invert the
+ * prepay-then-consume model: usage happens first, the bill comes later, and
+ * accruing a balance owed is the entire point. Such accounts are marked
+ * invoice-billed (see setInvoiceBilled/isInvoiceBilled) and their usage is
+ * accumulated in a running total (recordInvoiceUsage) that is never
+ * decremented by consumption, so a periodic report can be built from it.
  */
 const STRIPE_RETRY_OPTS = { attempts: 2, timeoutMs: 8000, label: 'stripe.checkout.sessions.create' };
 
@@ -91,9 +82,41 @@ async function createAccount() {
   const rawKey = generateApiKey();
   // Durable, no TTL — same as every other identity record in this codebase
   // (worker/payer index entries, reputation).
-  await store.set(`account:${accountId}`, { createdAt: Date.now() });
+  await store.set(`account:${accountId}`, { createdAt: Date.now(), suspended: false });
   await store.set(`apikey:${hashApiKey(rawKey)}`, { accountId });
   return { accountId, rawKey };
+}
+
+/**
+ * Marks an account as invoice-billed (net-30) rather than prepaid-credit-
+ * billed. Stored alongside the existing account:{accountId} record so the
+ * flag travels with the account identity. Invoice-billed accounts skip
+ * reserveCredit()/settleReservation() entirely in POST /oracle and instead
+ * accrue usage via recordInvoiceUsage().
+ */
+export async function setInvoiceBilled(accountId, invoiceBilled = true) {
+  const account = (await store.get(`account:${accountId}`)) || {};
+  await store.set(`account:${accountId}`, { ...account, invoiceBilled: Boolean(invoiceBilled) });
+}
+
+export async function isInvoiceBilled(accountId) {
+  const account = await store.get(`account:${accountId}`);
+  return Boolean(account?.invoiceBilled);
+}
+
+/**
+ * Accumulates a running usage total for an invoice-billed account. Uses the
+ * same store.incrBy primitive billing.js already uses for credit, but this
+ * counter is never decremented by consumption — it is the raw usage an
+ * invoice would be built from. Returns the new running total.
+ */
+export async function recordInvoiceUsage(accountId, stroops) {
+  if (!(stroops > 0)) return getInvoiceUsageStroops(accountId);
+  return store.incrBy(`invoice-usage:${accountId}`, stroops);
+}
+
+export async function getInvoiceUsageStroops(accountId) {
+  return (await store.get(`invoice-usage:${accountId}`)) || 0;
 }
 
 export async function getCreditBalanceStroops(accountId) {
@@ -110,22 +133,13 @@ export async function getCreditBalanceStroops(accountId) {
  * never go negative and a customer can never be charged more than their
  * balance covers, without needing to predict the exact price in advance.
  *
- * The reservation is recorded durably (keyed by questionId) BEFORE the
- * on-chain charge runs, so a crash between askMetered() and
- * settleReservation() leaves a recoverable "pending reservation" record
- * instead of a permanently over-debited balance — see
- * reconcilePendingReservations().
+ * Invoice-billed accounts deliberately bypass this path (see oracle.js):
+ * going negative — accruing a balance owed — is the entire point for them.
  */
-export async function reserveCredit(accountId, maxStroops, questionId) {
+export async function reserveCredit(accountId, maxStroops) {
   const ok = await store.decrIfAtLeast(`credit:${accountId}`, maxStroops);
-  if (ok && questionId) {
-    await store.set(`reservation:${questionId}`, {
-      accountId,
-      reservedStroops: maxStroops,
-      questionId,
-      createdAt: Date.now(),
-    });
-  }
+  if (ok) billingReservationCount.inc({ outcome: 'reserved' });
+  else billingReservationCount.inc({ outcome: 'insufficient' });
   return ok;
 }
 
@@ -137,29 +151,7 @@ export async function reserveCredit(accountId, maxStroops, questionId) {
 export async function settleReservation(accountId, reservedStroops, actualStroops, questionId) {
   const refund = reservedStroops - actualStroops;
   if (refund > 0) await store.incrBy(`credit:${accountId}`, refund);
-  if (questionId) await store.del(`reservation:${questionId}`);
-}
-
-/**
- * Startup/periodic reconciliation for the crash window between
- * reserveCredit() and settleReservation(). For each pending reservation:
- *  - if the associated job already recorded a final amountStroops, settle
- *    against that real charge (refunding the unused difference);
- *  - if no job was ever created, refund the reservation in full.
- * `getJob` is injected (jobs.js) to avoid a circular import; it returns the
- * job record or null. Idempotent: settleReservation() deletes the record.
- */
-export async function reconcilePendingReservations(getJob) {
-  const keys = await store.keys('reservation:*');
-  for (const key of keys) {
-    const reservation = await store.get(key);
-    if (!reservation) continue;
-    const { accountId, reservedStroops, questionId } = reservation;
-    const job = getJob ? await getJob(questionId) : null;
-    const actualStroops = job && Number.isFinite(job.amountStroops) ? job.amountStroops : 0;
-    await settleReservation(accountId, reservedStroops, actualStroops, questionId);
-    logger.info({ questionId, accountId, actualStroops }, 'reconciled abandoned credit reservation');
-  }
+  billingSettlementCount.inc({ outcome: actualStroops > 0 ? 'charged' : 'refunded' });
 }
 
 /** Creates a fresh account (and its one API key) and a Stripe Checkout
@@ -195,29 +187,37 @@ export function isAllowedRedirectUrl(url) {
 }
 
 /**
- * Supported fiat currencies for the Stripe onramp, each with the number of
- * minor units Stripe expects in `unit_amount` (USD/EUR cents, JPY has none)
- * and the FX rate to USDC face value. Rates are a periodically-updated
- * static table rather than a live lookup: the issue explicitly allows this
- * when precision-to-the-cent isn't required, and it keeps the webhook path
- * free of an external dependency that could be unreachable at credit time.
- * `usdToStroops` remains the USD anchor (config.billing.usdToStroops) so
- * the existing 1:1 USD conversion is unchanged.
+ * Apple Pay / Google Pay quick-checkout (issue #105).
+ *
+ * Stripe Checkout auto-detects and offers Apple Pay / Google Pay on
+ * supporting devices/browsers whenever the account has those payment
+ * methods enabled — no `payment_method_types` array is needed here, and
+ * passing one would actually *narrow* the methods offered. The only
+ * code-side requirement is that the Checkout Session's redirect URLs
+ * (success_url/cancel_url) live on a domain that has been registered with
+ * Stripe for Apple Pay domain verification; that domain is exactly the
+ * origin isAllowedRedirectUrl() already restricts to config.allowedOrigins,
+ * so the existing allowlist is the single source of truth for both the
+ * redirect-safety check and Apple Pay's domain-association requirement.
+ *
+ * This helper exists so the domain-verification requirement is explicit
+ * and testable rather than an implicit assumption: it returns the origin
+ * Stripe will associate with the session, or null when the URL is not on
+ * an allowed origin (in which case createCheckoutSession() would already
+ * have rejected it).
  */
-const SUPPORTED_CURRENCIES = {
-  usd: { minorUnits: 100, usdPerUnit: 1 },
-  eur: { minorUnits: 100, usdPerUnit: 1.08 },
-  gbp: { minorUnits: 100, usdPerUnit: 1.27 },
-};
+export function getApplePayVerificationOrigin(url) {
+  if (!isAllowedRedirectUrl(url)) return null;
+  try {
+    return new URL(url).origin;
+  } catch {
+    return null;
+  }
+}
 
-/**
- * Resolves a currency code to its FX descriptor, or throws for an
- * unsupported/malformed code. Callers turn the throw into a 400 — an
- * unknown currency must never silently fall back to USD.
- */
-export function resolveCurrency(currency) {
-  if (typeof currency !== 'string') {
-    throw new Error('currency must be a string');
+export async function createCheckoutSession(amountUsd, successUrl, cancelUrl) {
+  if (!Number.isFinite(amountUsd) || amountUsd < config.billing.minTopupUsd) {
+    throw new Error(`amountUsd must be a number >= ${config.billing.minTopupUsd}`);
   }
   const code = currency.trim().toLowerCase();
   if (!/^[a-z]{3}$/.test(code) || !SUPPORTED_CURRENCIES[code]) {
@@ -500,39 +500,106 @@ export function configuredProcessors() {
 }
 
 /**
- * Processor-agnostic checkout entry point. Defaults to Stripe so existing
- * callers (POST /billing/checkout) keep their exact behavior; callers may
- * pass a processor name to route to PayPal or Coinbase Commerce instead.
+ * The single flat subscription tier (issue #101). Prorated upgrades/
+ * downgrades between tiers are explicitly out of scope — one tier, one
+ * recurring price, one included-volume grant per billing cycle.
+ *
+ * `includedVolumeStroops` is the credit granted on each `invoice.paid`.
+ * `rollover` is the documented policy for unused included volume at the
+ * cycle boundary: false means use-it-or-lose-it (the balance is reset to
+ * the tier's included volume on renewal, not incremented), true would
+ * carry the remainder forward. Defaulting to false mirrors the
+ * "0 preserves today's behavior" framing config.js uses for
+ * minStakeStroops — the conservative, non-compounding choice is the
+ * explicit default, not an accident of implementation order.
  */
-export async function createCheckoutSession(amountUsd, successUrl, cancelUrl, currency = 'usd', processor = 'stripe') {
-  return getProcessor(processor).createCheckoutSession(amountUsd, successUrl, cancelUrl, currency);
+export const SUBSCRIPTION_TIER = {
+  name: 'api-pro',
+  priceUsd: 99,
+  includedVolumeStroops: 1_000_000_000,
+  rollover: false,
+};
+
+/**
+ * Creates a fresh account (and its one API key) and a Stripe Checkout
+ * Session in `mode: 'subscription'` to fund it. Mirrors
+ * createCheckoutSession()'s one-time-reveal pattern for the raw key and
+ * its allowed-origin check on the redirect URLs; the difference is the
+ * Stripe primitive — a recurring price instead of a one-shot payment, so
+ * credit arrives via `invoice.paid` (see handleStripeWebhook()).
+ */
+export async function createSubscriptionCheckoutSession(successUrl, cancelUrl) {
+  if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
+    throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
+  }
+
+  const { accountId, rawKey } = await createAccount();
+  const session = await getStripe().checkout.sessions.create({
+    mode: 'subscription',
+    line_items: [
+      {
+        price_data: {
+          currency: 'usd',
+          product_data: { name: `Arbiter API ${SUBSCRIPTION_TIER.name}` },
+          unit_amount: Math.round(SUBSCRIPTION_TIER.priceUsd * 100),
+          recurring: { interval: 'month' },
+        },
+        quantity: 1,
+      },
+    ],
+    metadata: { accountId },
+    success_url: `${successUrl}?apiKey=${rawKey}`,
+    cancel_url: cancelUrl,
+  });
+
+  return { checkoutUrl: session.url };
 }
 
 /**
- * Processor-agnostic webhook entry point. Verifies and parses the event
- * with the named processor, then applies the shared idempotent credit
- * grant. The dedup key is namespaced per processor so event ids from
- * different processors can never collide.
+ * Per-customer usage analytics. Unlike stats.js's incrementStat() counters
+ * (global, platform-wide, sandbox-excluded), these are keyed per account so
+ * a customer can see their own per-endpoint/per-tier call patterns via
+ * GET /billing/usage. Keyed usage:{accountId}:{endpoint}:{tier}:{day} so a
+ * rolling window can be read back without scanning the whole keyspace.
+ *
+ * Sandbox traffic is excluded by the caller (server.js), consistent with
+ * how stats.js already excludes it from platform-wide numbers.
  */
-export async function handleWebhook(processorName, rawBody, headers) {
-  const processor = getProcessor(processorName);
-  const event = await processor.verifyAndParseWebhook(rawBody, headers);
-  if (!event) return { handled: false };
+const USAGE_WINDOW_DAYS = 30;
 
-  const dedupKey = `${processor.name}-event:${event.id}`;
-  const firstSeen = await store.setNX(dedupKey, { at: Date.now() });
-  if (!firstSeen) return { handled: true, duplicate: true };
+function usageDay(ts = Date.now()) {
+  return new Date(ts).toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+}
 
-  await store.incrBy(`credit:${event.accountId}`, event.stroops);
-  logger.info({ processor: processor.name, eventId: event.id, accountId: event.accountId }, 'billing credit granted');
-  return { handled: true, duplicate: false };
+/** Records one API call for an account. Called from the resolveApiKey()-
+ * gated request flow in server.js's POST /oracle, alongside the existing
+ * incrementStat() calls. */
+export async function recordUsage(accountId, endpoint, tier, ts = Date.now()) {
+  if (!accountId || !endpoint || !tier) return;
+  await store.incrBy(`usage:${accountId}:${endpoint}:${tier}:${usageDay(ts)}`, 1);
 }
 
 /**
- * Backwards-compatible Stripe webhook handler. Kept so existing callers
- * (POST /billing/webhook) continue to work unchanged; delegates to the
- * shared handleWebhook() path.
+ * Reads the pooled fiat balance for the /metrics endpoint (issue #162).
+ * Returns null when billing isn't configured so the metrics route can skip
+ * the gauge entirely rather than reporting a misleading zero. The balance
+ * itself is read from the same store key the on-chain pool accounting
+ * already maintains; this is a read-only accessor, not a new source of
+ * truth.
  */
-export async function handleStripeWebhook(rawBody, headers) {
-  return handleWebhook('stripe', rawBody, headers);
+export async function getFiatPoolBalanceStroops() {
+  if (!isBillingConfigured()) return null;
+  const balance = await store.get(`pool:${config.billing.fiatPoolAddress}`);
+  return balance || 0;
+}
+
+/**
+ * Refreshes the fiat-pool-balance gauge. Called by the /metrics handler
+ * before scraping so the gauge reflects the current pool rather than a
+ * stale value from process start. No-op when billing is unconfigured.
+ */
+export async function refreshFiatPoolBalanceMetric() {
+  const balance = await getFiatPoolBalanceStroops();
+  if (balance === null) return;
+  fiatPoolBalanceStroops.set(balance);
 }
