@@ -4,7 +4,7 @@ import { store } from './store.js';
 import { config } from './config.js';
 import { hashApiKey } from './apiKeyAuth.js';
 import { logger } from './logger.js';
-import { fiatPoolBalanceStroops, billingReservationCount, billingSettlementCount } from './metrics.js';
+import { recordPaymentReversal } from './paymentReversals.js';
 
 /**
  * The non-crypto onramp: a fiat customer pays via Stripe and is issued an
@@ -84,39 +84,24 @@ async function createAccount() {
   // (worker/payer index entries, reputation).
   await store.set(`account:${accountId}`, { createdAt: Date.now(), suspended: false });
   await store.set(`apikey:${hashApiKey(rawKey)}`, { accountId });
+  await store.set(`account-key:${accountId}`, hashApiKey(rawKey));
   return { accountId, rawKey };
 }
 
 /**
- * Marks an account as invoice-billed (net-30) rather than prepaid-credit-
- * billed. Stored alongside the existing account:{accountId} record so the
- * flag travels with the account identity. Invoice-billed accounts skip
- * reserveCredit()/settleReservation() entirely in POST /oracle and instead
- * accrue usage via recordInvoiceUsage().
+ * Swaps an account's API key for a fresh one. The caller must already
+ * hold the current key (resolved by the route via resolveApiKey()); the
+ * old key's apikey:{hash} entry is deleted before returning, so it stops
+ * working immediately — no grace period. Credit balance and history are
+ * keyed by accountId and are untouched.
  */
-export async function setInvoiceBilled(accountId, invoiceBilled = true) {
-  const account = (await store.get(`account:${accountId}`)) || {};
-  await store.set(`account:${accountId}`, { ...account, invoiceBilled: Boolean(invoiceBilled) });
-}
-
-export async function isInvoiceBilled(accountId) {
-  const account = await store.get(`account:${accountId}`);
-  return Boolean(account?.invoiceBilled);
-}
-
-/**
- * Accumulates a running usage total for an invoice-billed account. Uses the
- * same store.incrBy primitive billing.js already uses for credit, but this
- * counter is never decremented by consumption — it is the raw usage an
- * invoice would be built from. Returns the new running total.
- */
-export async function recordInvoiceUsage(accountId, stroops) {
-  if (!(stroops > 0)) return getInvoiceUsageStroops(accountId);
-  return store.incrBy(`invoice-usage:${accountId}`, stroops);
-}
-
-export async function getInvoiceUsageStroops(accountId) {
-  return (await store.get(`invoice-usage:${accountId}`)) || 0;
+export async function rotateApiKey(accountId, currentRawKey) {
+  const rawKey = generateApiKey();
+  const newHash = hashApiKey(rawKey);
+  await store.set(`apikey:${newHash}`, { accountId });
+  await store.delete(`apikey:${hashApiKey(currentRawKey)}`);
+  await store.set(`account-key:${accountId}`, newHash);
+  return rawKey;
 }
 
 export async function getCreditBalanceStroops(accountId) {
@@ -158,7 +143,8 @@ export async function settleReservation(accountId, reservedStroops, actualStroop
  * Session to fund it. The raw key is embedded in success_url and shown
  * exactly once on redirect — the same one-time-reveal pattern Stripe
  * itself uses for webhook signing secrets. Losing it means starting over;
- * key recovery/rotation is a deliberate v1 gap, not an oversight.
+ * proactive rotation (with the current key in hand) is available via
+ * rotateApiKey(); recovery of a lost key is a deliberate v1 gap.
  *
  * successUrl/cancelUrl are caller-supplied, and the raw key is appended
  * directly to successUrl's query string — without validating the origin,
@@ -500,59 +486,96 @@ export function configuredProcessors() {
 }
 
 /**
- * The single flat subscription tier (issue #101). Prorated upgrades/
- * downgrades between tiers are explicitly out of scope — one tier, one
- * recurring price, one included-volume grant per billing cycle.
- *
- * `includedVolumeStroops` is the credit granted on each `invoice.paid`.
- * `rollover` is the documented policy for unused included volume at the
- * cycle boundary: false means use-it-or-lose-it (the balance is reset to
- * the tier's included volume on renewal, not incremented), true would
- * carry the remainder forward. Defaulting to false mirrors the
- * "0 preserves today's behavior" framing config.js uses for
- * minStakeStroops — the conservative, non-compounding choice is the
- * explicit default, not an accident of implementation order.
+ * Verifies the Stripe signature (constructEvent throws on a bad/missing
+ * one — the route handler turns that into a 400) and, for a completed
+ * checkout, credits the account; for a refund/dispute, debits it (see
+ * reverseCharge). Every other event type is ignored. Idempotent per Stripe event id via
+ * store.setNX, since Stripe retries webhook delivery on anything but a 2xx
+ * response — without this, a retried delivery would double-credit the same
+ * payment.
  */
-export const SUBSCRIPTION_TIER = {
-  name: 'api-pro',
-  priceUsd: 99,
-  includedVolumeStroops: 1_000_000_000,
-  rollover: false,
-};
+export async function handleStripeWebhook(rawBody, signature) {
+  const event = getStripe().webhooks.constructEvent(rawBody, signature, config.billing.stripeWebhookSecret);
+  if (!HANDLED_EVENT_TYPES.has(event.type)) return;
+
+  const isNew = await store.setNX(`stripe-event:${event.id}`, 1, THIRTY_DAYS_MS);
+  if (!isNew) return;
+
+  if (event.type === 'checkout.session.completed') return creditCheckout(event);
+  return reverseCharge(event);
+}
+
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+const HANDLED_EVENT_TYPES = new Set(['checkout.session.completed', 'charge.refunded', 'charge.dispute.created']);
+
+// amount_total is USD cents (integer, no float involved). stroopsPerCent
+// is exact (10_000_000n / 100n = 100_000n) at USDC's 7-decimal
+// convention, so this conversion never loses a fraction of a cent.
+function centsToStroops(cents) {
+  return Number(BigInt(cents) * (config.billing.usdToStroops / 100n));
+}
+
+async function creditCheckout(event) {
+  const session = event.data.object;
+  const accountId = session.metadata?.accountId;
+  if (!accountId) {
+    logger.error({ eventId: event.id }, 'stripe checkout.session.completed missing accountId metadata');
+    return;
+  }
+  // Durable paymentIntent -> account mapping, so a later refund/dispute
+  // (which carries only the PaymentIntent, not our checkout metadata) can
+  // be correlated back to the account it credited.
+  if (session.payment_intent) {
+    await store.set(`stripe-pi:${session.payment_intent}`, { accountId, amountCents: session.amount_total });
+  }
+  await store.incrBy(`credit:${accountId}`, centsToStroops(session.amount_total));
+}
 
 /**
- * Creates a fresh account (and its one API key) and a Stripe Checkout
- * Session in `mode: 'subscription'` to fund it. Mirrors
- * createCheckoutSession()'s one-time-reveal pattern for the raw key and
- * its allowed-origin check on the redirect URLs; the difference is the
- * Stripe primitive — a recurring price instead of a one-shot payment, so
- * credit arrives via `invoice.paid` (see handleStripeWebhook()).
+ * Claws back credit for a refunded or disputed charge. The balance is
+ * floored at 0, never negative — it may already be partially or fully
+ * spent (settled on-chain out of the fiat pool), and that is an explicit
+ * policy choice: the shortfall is recorded for the admin console
+ * (/admin/reversals) rather than carried as debt on the account.
  */
-export async function createSubscriptionCheckoutSession(successUrl, cancelUrl) {
-  if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
-    throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
+async function reverseCharge(event) {
+  const obj = event.data.object;
+  const mapping = obj.payment_intent ? await store.get(`stripe-pi:${obj.payment_intent}`) : null;
+  const accountId = mapping?.accountId || obj.metadata?.accountId;
+  if (!accountId) {
+    logger.error({ eventId: event.id, type: event.type }, 'stripe reversal could not be correlated to an account');
+    return;
   }
 
-  const { accountId, rawKey } = await createAccount();
-  const session = await getStripe().checkout.sessions.create({
-    mode: 'subscription',
-    line_items: [
-      {
-        price_data: {
-          currency: 'usd',
-          product_data: { name: `Arbiter API ${SUBSCRIPTION_TIER.name}` },
-          unit_amount: Math.round(SUBSCRIPTION_TIER.priceUsd * 100),
-          recurring: { interval: 'month' },
-        },
-        quantity: 1,
-      },
-    ],
-    metadata: { accountId },
-    success_url: `${successUrl}?apiKey=${rawKey}`,
-    cancel_url: cancelUrl,
-  });
+  // charge.refunded carries the cumulative amount_refunded on the charge;
+  // charge.dispute.created carries the disputed amount.
+  const amountCents = event.type === 'charge.refunded' ? obj.amount_refunded : obj.amount;
+  const requestedStroops = centsToStroops(amountCents || 0);
+  const debitedStroops = await debitCreditFloored(accountId, requestedStroops);
 
-  return { checkoutUrl: session.url };
+  await recordPaymentReversal(accountId, {
+    eventId: event.id,
+    type: event.type,
+    paymentIntent: obj.payment_intent || null,
+    amountCents: amountCents || 0,
+    requestedStroops: String(requestedStroops),
+    debitedStroops: String(debitedStroops),
+    shortfallStroops: String(requestedStroops - debitedStroops),
+  });
+  logger.warn({ accountId, eventId: event.id, type: event.type, requestedStroops, debitedStroops }, 'stripe payment reversed — credit debited');
+}
+
+/** Debits up to `stroops` from an account, never below 0. Retries around
+ * concurrent spends via the atomic decrIfAtLeast. Returns the amount
+ * actually debited. */
+async function debitCreditFloored(accountId, stroops) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const balance = await getCreditBalanceStroops(accountId);
+    const take = Math.min(balance, stroops);
+    if (take <= 0) return 0;
+    if (await store.decrIfAtLeast(`credit:${accountId}`, take)) return take;
+  }
+  return 0;
 }
 
 /**

@@ -16,7 +16,7 @@ import {
 import { getStats } from './stats.js';
 import { getVapidPublicKey, isPushConfigured, saveSubscription, removeSubscription } from './push.js';
 import { getPayerQuestionIds, summarizePayerQuestions, bucketPayerSpend } from './payerIndex.js';
-import { requiresAuth, buildChallengeXdr, verifyChallengeAndIssueSession, verifySessionToken } from './workerAuth.js';
+import { requiresAuth, verifySession, mountSessionRoutes } from './workerAuth.js';
 import {
   buildSponsoredOnboardTx,
   finalizeSponsoredOnboardTx,
@@ -36,12 +36,13 @@ import { checkRateLimit } from './rateLimit.js';
 import { issueSandboxChallenge, startSandboxFulfillment } from './sandbox.js';
 import { requireAdmin } from './adminAuth.js';
 import { listTransactions, listWorkers, listPayers, getTreasury, getFeeRevenue, listAnchorPayouts, listAnchorKyc } from './admin.js';
+import { listPaymentReversals } from './paymentReversals.js';
 import { getAnchorConfig, isAnchorConfigured } from './anchorClient.js';
 import { recordAnchorTransaction, recordAnchorKyc } from './anchorRecords.js';
-import { resolveApiKey } from './apiKeyAuth.js';
+import { resolveApiKey, extractApiKey } from './apiKeyAuth.js';
 import { parseConsensusRule } from './consensus.js';
 import { getPrivatePool, addPoolWorkers, removePoolWorkers, PoolValidationError } from './privatePools.js';
-import { isBillingConfigured, createCheckoutSession, handleStripeWebhook, getCreditBalanceStroops, reserveCredit, settleReservation } from './billing.js';
+import { isBillingConfigured, createCheckoutSession, handleStripeWebhook, rotateApiKey, getCreditBalanceStroops, reserveCredit, settleReservation } from './billing.js';
 import { registerWebhook, listWebhooks, deleteWebhook, WebhookError } from './webhooks.js';
 import { logger, httpLogger } from './logger.js';
 import { getProvenance } from './provenance.js';
@@ -333,7 +334,7 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
     if (question.length > config.maxQuestionLength) {
       return res.status(400).json({ error: `body.question must be at most ${config.maxQuestionLength} characters` });
     }
-    if (verifySessionToken(token) !== payerAddress) {
+    if ((await verifySession(token)) !== payerAddress) {
       return res.status(401).json({ error: 'a valid session token for this address is required — see POST /payers/:address/session' });
     }
     if (!consensus.ok) return res.status(400).json({ error: consensus.error });
@@ -405,25 +406,10 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
 // does.
 // ---------------------------------------------------------------------
 
-app.post('/payers/:address/session/challenge', rateLimited('push', byIp), async (req, res) => {
-  try {
-    const xdr = await buildChallengeXdr(req.params.address);
-    res.json({ xdr });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.post('/payers/:address/session', rateLimited('push', byIp), async (req, res) => {
-  const { signedXdr } = req.body || {};
-  if (!signedXdr) return res.status(400).json({ error: 'signedXdr is required' });
-  const session = await verifyChallengeAndIssueSession(req.params.address, signedXdr);
-  if (!session) return res.status(401).json({ error: 'challenge verification failed — signature did not match, or the challenge expired' });
-  res.json(session);
-});
+mountSessionRoutes(app, '/payers', rateLimited('push', byIp));
 
 app.get('/payers/:address/balance', async (req, res) => {
-  if (requiresAuth(req.params.address) && verifySessionToken(req.query.token) !== req.params.address) {
+  if (requiresAuth(req.params.address) && (await verifySession(req.query.token)) !== req.params.address) {
     return res.status(401).json({ error: 'a valid session token for this address is required — see POST /payers/:address/session' });
   }
   try {
@@ -467,7 +453,7 @@ app.get('/oracle/:jobId/provenance', async (req, res) => {
 // entries in the index may resolve to nothing — filtered out below rather
 // than surfaced as broken rows.
 app.get('/payers/:address/questions', async (req, res) => {
-  if (requiresAuth(req.params.address) && verifySessionToken(req.query.token) !== req.params.address) {
+  if (requiresAuth(req.params.address) && (await verifySession(req.query.token)) !== req.params.address) {
     return res.status(401).json({ error: 'a valid session token for this address is required — see POST /payers/:address/session' });
   }
   const ids = await getPayerQuestionIds(req.params.address);
@@ -496,12 +482,12 @@ app.get('/payers/:address/questions', async (req, res) => {
 // no test-string convenience to preserve here.
 // ---------------------------------------------------------------------
 
-function requirePoolOwner(req, res, token) {
+async function requirePoolOwner(req, res, token) {
   if (!requiresAuth(req.params.address)) {
     res.status(400).json({ error: 'pool owner must be a valid Stellar address' });
     return false;
   }
-  if (verifySessionToken(token) !== req.params.address) {
+  if ((await verifySession(token)) !== req.params.address) {
     res.status(401).json({ error: 'a valid session token for this address is required — see POST /payers/:address/session' });
     return false;
   }
@@ -520,7 +506,7 @@ async function handlePoolWrite(req, res, mutate) {
 }
 
 app.get('/payers/:address/pool', async (req, res) => {
-  if (!requirePoolOwner(req, res, req.query.token)) return;
+  if (!(await requirePoolOwner(req, res, req.query.token))) return;
   try {
     const workers = await getPrivatePool(req.params.address);
     res.json({ payerAddress: req.params.address, workers, size: workers.length });
@@ -533,14 +519,14 @@ app.get('/payers/:address/pool', async (req, res) => {
 // body: { token, workers: [address, ...] }
 app.post('/payers/:address/pool', rateLimited('push', byIp), async (req, res) => {
   const { token, workers } = req.body || {};
-  if (!requirePoolOwner(req, res, token)) return;
+  if (!(await requirePoolOwner(req, res, token))) return;
   await handlePoolWrite(req, res, () => addPoolWorkers(req.params.address, workers));
 });
 
 // Removes one worker. Token goes in the query string, same as the GET,
 // since DELETE bodies aren't reliably passed through by proxies.
 app.delete('/payers/:address/pool/:worker', rateLimited('push', byIp), async (req, res) => {
-  if (!requirePoolOwner(req, res, req.query.token)) return;
+  if (!(await requirePoolOwner(req, res, req.query.token))) return;
   await handlePoolWrite(req, res, () => removePoolWorkers(req.params.address, [req.params.worker]));
 });
 
@@ -684,6 +670,15 @@ app.get('/billing/account', async (req, res) => {
   res.json({ accountId, creditBalanceStroops: String(creditBalanceStroops), creditBalance: stroopsToUsdc(creditBalanceStroops) });
 });
 
+// Proactive key rotation with the current key in hand. The new raw key is
+// returned exactly once; the old key stops working immediately.
+app.post('/billing/account/rotate-key', rateLimited('billing', byIp), async (req, res) => {
+  const accountId = await resolveApiKey(req);
+  if (!accountId) return res.status(401).json({ error: 'a valid API key is required' });
+  const apiKey = await rotateApiKey(accountId, extractApiKey(req));
+  res.json({ accountId, apiKey });
+});
+
 // ---------------------------------------------------------------------
 // Settlement webhooks — instead of polling GET /oracle/:jobId, an owner
 // registers a URL that receives a signed POST when each of their questions
@@ -702,7 +697,7 @@ async function resolveWebhookOwner(req) {
   if (accountId) return `account:${accountId}`;
   const address = req.body?.address ?? req.query.address;
   const token = req.body?.token ?? req.query.token;
-  if (typeof address === 'string' && requiresAuth(address) && verifySessionToken(token) === address) {
+  if (typeof address === 'string' && requiresAuth(address) && (await verifySession(token)) === address) {
     return `payer:${address}`;
   }
   return null;
@@ -1028,7 +1023,7 @@ app.get('/push/vapid-public-key', (req, res) => {
 
 app.post('/workers/:address/push-subscribe', rateLimited('push', byIp), async (req, res) => {
   const { subscription, categories, token } = req.body || {};
-  if (requiresAuth(req.params.address) && verifySessionToken(token) !== req.params.address) {
+  if (requiresAuth(req.params.address) && (await verifySession(token)) !== req.params.address) {
     return res.status(401).json({ error: 'a valid session token for this address is required — see POST /workers/:address/session' });
   }
   if (!subscription || typeof subscription !== 'object' || !subscription.endpoint) {
@@ -1040,7 +1035,7 @@ app.post('/workers/:address/push-subscribe', rateLimited('push', byIp), async (r
 
 app.post('/workers/:address/push-unsubscribe', rateLimited('push', byIp), async (req, res) => {
   const { token } = req.body || {};
-  if (requiresAuth(req.params.address) && verifySessionToken(token) !== req.params.address) {
+  if (requiresAuth(req.params.address) && (await verifySession(token)) !== req.params.address) {
     return res.status(401).json({ error: 'a valid session token for this address is required — see POST /workers/:address/session' });
   }
   await removeSubscription(req.params.address);
@@ -1054,22 +1049,7 @@ app.post('/workers/:address/push-unsubscribe', rateLimited('push', byIp), async 
 // workerId convenience remains open (see workerAuth.js for why that's safe).
 // ---------------------------------------------------------------------
 
-app.post('/workers/:address/session/challenge', rateLimited('push', byIp), async (req, res) => {
-  try {
-    const xdr = await buildChallengeXdr(req.params.address);
-    res.json({ xdr });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.post('/workers/:address/session', rateLimited('push', byIp), async (req, res) => {
-  const { signedXdr } = req.body || {};
-  if (!signedXdr) return res.status(400).json({ error: 'signedXdr is required' });
-  const session = await verifyChallengeAndIssueSession(req.params.address, signedXdr);
-  if (!session) return res.status(401).json({ error: 'challenge verification failed — signature did not match, or the challenge expired' });
-  res.json(session);
-});
+mountSessionRoutes(app, '/workers', rateLimited('push', byIp));
 
 // ---------------------------------------------------------------------
 // Worker-facing SSE dispatch channel.
@@ -1079,7 +1059,7 @@ app.get('/app/events', async (req, res) => {
   const workerId = req.query.worker;
   if (!workerId) return res.status(400).json({ error: 'worker query param is required' });
 
-  if (requiresAuth(workerId) && verifySessionToken(req.query.token) !== workerId) {
+  if (requiresAuth(workerId) && (await verifySession(req.query.token)) !== workerId) {
     return res.status(401).json({ error: 'a valid session token for this address is required — see POST /workers/:address/session' });
   }
 
@@ -1114,7 +1094,7 @@ app.get('/app/events', async (req, res) => {
   });
 });
 
-app.post('/app/answer', rateLimited('answer', byIp), (req, res) => {
+app.post('/app/answer', rateLimited('answer', byIp), async (req, res) => {
   const { questionId, workerId, answer, token } = req.body || {};
   if (!questionId || !workerId || typeof answer !== 'string') {
     return res.status(400).json({ error: 'questionId, workerId, and answer are required' });
@@ -1122,7 +1102,7 @@ app.post('/app/answer', rateLimited('answer', byIp), (req, res) => {
   if (answer.length > config.maxAnswerLength) {
     return res.status(400).json({ error: `answer must be at most ${config.maxAnswerLength} characters` });
   }
-  if (requiresAuth(workerId) && verifySessionToken(token) !== workerId) {
+  if (requiresAuth(workerId) && (await verifySession(token)) !== workerId) {
     return res.status(401).json({ error: 'a valid session token for this address is required — see POST /workers/:address/session' });
   }
   // Checked again inside submitAnswer (the authoritative gate); screening
@@ -1175,25 +1155,10 @@ app.get('/admin/kyc', requireAdmin, async (req, res) => {
   res.json({ customers: await listAnchorKyc() });
 });
 
-// Every worker with earnings in a tax year, one summary each.
-// ?usOnly=true / ?reportableOnly=true narrow it to what a 1099 filing
-// actually covers; ?format=csv gives a one-row-per-worker bulk export.
-app.get('/admin/tax-summaries', requireAdmin, async (req, res) => {
-  try {
-    const year = parseTaxYear(req.query.year);
-    const summaries = await buildAllTaxSummaries(year, {
-      usOnly: req.query.usOnly === 'true',
-      reportableOnly: req.query.reportableOnly === 'true',
-    });
-    if (req.query.format === 'csv') {
-      res.set('Content-Type', 'text/csv; charset=utf-8');
-      res.set('Content-Disposition', `attachment; filename="arbiter-tax-summaries-${year}.csv"`);
-      return res.send(taxSummariesToCsv(summaries));
-    }
-    res.json({ taxYear: year, count: summaries.length, summaries });
-  } catch (err) {
-    sendDomainError(req, res, err, 'failed to build tax summaries');
-  }
+// Fiat accounts with a Stripe refund/dispute reconciled against their
+// credit balance (see billing.js's reverseCharge).
+app.get('/admin/reversals', requireAdmin, async (req, res) => {
+  res.json({ accounts: await listPaymentReversals() });
 });
 
 // ---------------------------------------------------------------------
@@ -1222,7 +1187,7 @@ app.get('/anchor/config', async (req, res) => {
 
 app.post('/anchor/report', rateLimited('push', byIp), async (req, res) => {
   const { address, token, kind, status, amount, assetCode, anchorTransactionId, tier } = req.body || {};
-  if (verifySessionToken(token) !== address) {
+  if ((await verifySession(token)) !== address) {
     return res.status(401).json({ error: 'a valid session token for this address is required — see POST /payers/:address/session or /workers/:address/session' });
   }
 
