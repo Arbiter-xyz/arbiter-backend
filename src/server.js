@@ -44,6 +44,28 @@ import { registerWebhook, listWebhooks, deleteWebhook, WebhookError } from './we
 import { logger, httpLogger } from './logger.js';
 import { getProvenance } from './provenance.js';
 import { enforceSecurityPosture } from './securityPosture.js';
+import {
+  getDispatchPause,
+  describePause,
+  listWindows,
+  listUpcomingWindows,
+  addWindow,
+  removeWindow,
+  MaintenanceWindowError,
+} from './maintenanceWindows.js';
+import {
+  createTeam,
+  listTeamsFor,
+  requireTeamRole,
+  renameTeam,
+  addMembers,
+  setMemberRole,
+  removeMember,
+  deleteTeam,
+  listKnownTeamIds,
+  getTeam,
+  TeamError,
+} from './teams.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -106,9 +128,37 @@ function rateLimited(bucket, keyFn) {
 }
 const byIp = (req) => req.ip;
 
-app.get('/health', (req, res) => {
-  res.json({ ok: true, onlineWorkers: onlineWorkerCount(), contractId: config.contractId });
+app.get('/health', async (req, res) => {
+  const pause = await getDispatchPause();
+  res.json({ ok: true, onlineWorkers: onlineWorkerCount(), contractId: config.contractId, dispatchPaused: Boolean(pause) });
 });
+
+// Public, like /health: the dispatch pause in effect (if any) and every
+// scheduled maintenance/holiday window still ahead, so clients and workers
+// can plan around them. See maintenanceWindows.js.
+app.get('/maintenance', async (req, res) => {
+  const now = Date.now();
+  const [pause, upcoming] = await Promise.all([getDispatchPause(now), listUpcomingWindows(now)]);
+  res.json({
+    dispatchPaused: Boolean(pause),
+    ...(pause ? { reason: pause.reason, resumesAt: new Date(pause.resumesAt).toISOString() } : {}),
+    windows: upcoming.map(serializeWindow),
+  });
+});
+
+function serializeWindow(w) {
+  return { ...w, startsAt: new Date(w.startsAt).toISOString(), endsAt: new Date(w.endsAt).toISOString() };
+}
+
+/** 503 + Retry-After for a request that would create a question while
+ * dispatch is paused. Returns true if it responded. */
+async function rejectIfDispatchPaused(res) {
+  const pause = await getDispatchPause();
+  if (!pause) return false;
+  res.set('Retry-After', String(Math.max(1, Math.ceil((pause.resumesAt - Date.now()) / 1000))));
+  res.status(503).json({ error: describePause(pause), reason: pause.reason, resumesAt: new Date(pause.resumesAt).toISOString() });
+  return true;
+}
 
 // Platform-wide, real-settlement-only counters — safe to surface publicly
 // (e.g. a landing page trust strip) since sandbox traffic never counts
@@ -189,6 +239,14 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
   // downstream (dispatch, reconcile, settle) is the identical pipeline,
   // funded from the platform's own pooled balance instead of the caller's.
   const apiKeyAccountId = await resolveApiKey(req);
+
+  // Maintenance windows: refuse to CREATE a question while dispatch is
+  // paused, before anyone is charged. Step 2 of the classic flow is let
+  // through on purpose — that payer has already paid, and startFulfillment
+  // refunds it instead of dispatching (see maintenanceWindows.js).
+  const createsQuestion = Boolean(apiKeyAccountId || payerAddress || !questionId || !paymentTx);
+  if (createsQuestion && (await rejectIfDispatchPaused(res))) return;
+
   if (apiKeyAccountId) {
     if (!question || typeof question !== 'string') {
       return res.status(400).json({ error: 'body.question (string) is required' });
@@ -454,6 +512,117 @@ app.delete('/payers/:address/pool/:worker', rateLimited('push', byIp), async (re
   if (!requirePoolOwner(req, res, req.query.token)) return;
   await handlePoolWrite(req, res, () => removePoolWorkers(req.params.address, [req.params.worker]));
 });
+
+// ---------------------------------------------------------------------
+// Team/organization accounts — see teams.js. The caller is always a
+// Stellar address proven with a session token (POST /payers/:address/session),
+// sent as `address` + `token` in the JSON body or the query string, same as
+// the payer side of /webhooks. Role checks live in teams.js; these handlers
+// only authenticate and map TeamError to its HTTP status.
+// ---------------------------------------------------------------------
+
+const TEAM_AUTH_ERROR = 'a Stellar `address` and its session `token` are required — see POST /payers/:address/session';
+
+function resolveTeamActor(req) {
+  const address = req.body?.address ?? req.query.address;
+  const token = req.body?.token ?? req.query.token;
+  if (typeof address === 'string' && requiresAuth(address) && verifySessionToken(token) === address) return address;
+  return null;
+}
+
+function teamRoute(handler) {
+  return async (req, res) => {
+    const actor = resolveTeamActor(req);
+    if (!actor) return res.status(401).json({ error: TEAM_AUTH_ERROR });
+    try {
+      await handler(req, res, actor);
+    } catch (err) {
+      if (err instanceof TeamError) return res.status(err.status).json({ error: err.message });
+      req.log.error({ err }, 'team request failed');
+      res.status(500).json({ error: 'failed to process team request' });
+    }
+  };
+}
+
+// body: { address, token, name }
+app.post('/teams', rateLimited('push', byIp), teamRoute(async (req, res, actor) => {
+  res.status(201).json({ team: await createTeam(actor, req.body?.name) });
+}));
+
+app.get('/teams', teamRoute(async (req, res, actor) => {
+  res.json({ teams: await listTeamsFor(actor) });
+}));
+
+app.get('/teams/:teamId', teamRoute(async (req, res, actor) => {
+  res.json({ team: await requireTeamRole(req.params.teamId, actor, 'member') });
+}));
+
+// body: { address, token, name }
+app.patch('/teams/:teamId', rateLimited('push', byIp), teamRoute(async (req, res, actor) => {
+  res.json({ team: await renameTeam(req.params.teamId, actor, req.body?.name) });
+}));
+
+app.delete('/teams/:teamId', rateLimited('push', byIp), teamRoute(async (req, res, actor) => {
+  await deleteTeam(req.params.teamId, actor);
+  res.json({ ok: true, id: req.params.teamId });
+}));
+
+// body: { address, token, members: [address, ...], role?: 'member' | 'admin' }
+app.post('/teams/:teamId/members', rateLimited('push', byIp), teamRoute(async (req, res, actor) => {
+  const { members, role } = req.body || {};
+  res.json({ team: await addMembers(req.params.teamId, actor, members, role ?? 'member') });
+}));
+
+// body: { address, token, role: 'member' | 'admin' | 'owner' } — 'owner' transfers ownership.
+app.patch('/teams/:teamId/members/:member', rateLimited('push', byIp), teamRoute(async (req, res, actor) => {
+  res.json({ team: await setMemberRole(req.params.teamId, actor, req.params.member, req.body?.role) });
+}));
+
+// Remove a member, or leave (member === address). Credentials go in the
+// query string, same as DELETE /payers/:address/pool/:worker.
+app.delete('/teams/:teamId/members/:member', rateLimited('push', byIp), teamRoute(async (req, res, actor) => {
+  res.json({ team: await removeMember(req.params.teamId, actor, req.params.member) });
+}));
+
+// The team's combined question history: every member's own payer history
+// (GET /payers/:address/questions), merged, with the same spend buckets
+// plus a per-member breakdown. Any member may read it — sharing that
+// visibility is what a team is for.
+app.get('/teams/:teamId/questions', teamRoute(async (req, res, actor) => {
+  const team = await requireTeamRole(req.params.teamId, actor, 'member');
+  const perMember = await Promise.all(
+    team.members.map(async ({ address }) => {
+      const ids = await getPayerQuestionIds(address);
+      const jobs = await Promise.all(ids.map((id) => getJobStatus(id)));
+      return { address, summary: summarizePayerQuestions(ids, jobs) };
+    }),
+  );
+
+  const questions = perMember
+    .flatMap(({ address, summary }) => summary.questions.map((q) => ({ ...q, askedBy: address })))
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const totalSpendStroops = perMember.reduce((sum, m) => sum + m.summary.totalSpendStroops, 0n);
+  const resolved = perMember.reduce((n, m) => n + m.summary.resolved, 0);
+  const settled = perMember.reduce((n, m) => n + m.summary.settled, 0);
+  const { spendByCategory, spendByDay } = bucketPayerSpend(questions);
+
+  res.json({
+    teamId: team.id,
+    questions,
+    totalTracked: perMember.reduce((n, m) => n + m.summary.totalTracked, 0),
+    totalSpendStroops: totalSpendStroops.toString(),
+    totalSpend: stroopsToUsdc(totalSpendStroops),
+    successRate: settled > 0 ? resolved / settled : null,
+    spendByCategory,
+    spendByDay,
+    spendByMember: perMember.map(({ address, summary }) => ({
+      address,
+      questions: summary.questions.length,
+      spendStroops: summary.totalSpendStroops.toString(),
+      spend: stroopsToUsdc(summary.totalSpendStroops),
+    })),
+  });
+}));
 
 // ---------------------------------------------------------------------
 // Billing — the non-crypto onramp. /billing/webhook is registered above,
@@ -780,10 +949,10 @@ app.post('/app/answer', rateLimited('answer', byIp), (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// Admin/ops console — everything here is read-only and gated by
-// requireAdmin (see adminAuth.js). No rate limit: these calls don't spend
-// a network fee or write state the way /sponsor/* and /oracle do, and the
-// bearer-token gate is the actual access control.
+// Admin/ops console — gated by requireAdmin (see adminAuth.js). Read-only
+// except for scheduling maintenance windows. No rate limit: these calls
+// don't spend a network fee, and the bearer-token gate is the actual
+// access control.
 // ---------------------------------------------------------------------
 
 app.get('/admin/transactions', requireAdmin, async (req, res) => {
@@ -814,6 +983,44 @@ app.get('/admin/payouts', requireAdmin, async (req, res) => {
 
 app.get('/admin/kyc', requireAdmin, async (req, res) => {
   res.json({ customers: await listAnchorKyc() });
+});
+
+app.get('/admin/teams', requireAdmin, async (req, res) => {
+  const ids = await listKnownTeamIds();
+  const teams = (await Promise.all(ids.map((id) => getTeam(id)))).filter(Boolean);
+  res.json({ teams: teams.map((t) => ({ id: t.id, name: t.name, createdAt: t.createdAt, members: t.members.length })) });
+});
+
+// Holiday/maintenance dispatch pauses — see maintenanceWindows.js.
+app.get('/admin/maintenance-windows', requireAdmin, async (req, res) => {
+  const now = Date.now();
+  const [windows, pause] = await Promise.all([listWindows(), getDispatchPause(now)]);
+  res.json({
+    dispatchPaused: Boolean(pause),
+    ...(pause ? { resumesAt: new Date(pause.resumesAt).toISOString() } : {}),
+    windows: windows.map((w) => ({ ...serializeWindow(w), active: w.startsAt <= now && now < w.endsAt })),
+  });
+});
+
+// body: { startsAt, endsAt, reason? } — ISO-8601 strings or epoch ms.
+app.post('/admin/maintenance-windows', requireAdmin, async (req, res) => {
+  try {
+    const window = await addWindow(req.body || {});
+    req.log.info({ window }, 'maintenance window scheduled');
+    res.status(201).json({ window: serializeWindow(window) });
+  } catch (err) {
+    if (err instanceof MaintenanceWindowError) return res.status(400).json({ error: err.message });
+    req.log.error({ err }, 'failed to schedule maintenance window');
+    res.status(500).json({ error: 'failed to schedule maintenance window' });
+  }
+});
+
+// Deleting an active window ends the pause immediately.
+app.delete('/admin/maintenance-windows/:id', requireAdmin, async (req, res) => {
+  const removed = await removeWindow(req.params.id);
+  if (!removed) return res.status(404).json({ error: 'no such maintenance window' });
+  req.log.info({ windowId: req.params.id }, 'maintenance window removed');
+  res.json({ ok: true, id: req.params.id });
 });
 
 // ---------------------------------------------------------------------
