@@ -273,8 +273,5 @@ bottleneck (serialized on-chain settlement) are in
 
 ## Handsoff notes
 
-<!-- handsoff-issue-117 -->
-- #117: Backend-side content moderation for question text before dispatch
-
-<!-- handsoff-issue-158 -->
-- #158: Extend /health to report real dependency status; add scheduled uptime alerting
+<!-- handsoff-issue-108 -->
+- #108: A public status page reporting real uptime/incident history

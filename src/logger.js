@@ -112,15 +112,57 @@ export function jobLogger(questionId) {
 }
 
 /**
- * Logger for the scheduled synthetic monitor (#111). Every line carries
- * `synthetic: true` so a synthetic run's lifecycle (dispatch -> reconcile
- * -> settle) is trivially separable from real customer traffic in logs
- * and alerting — a failed synthetic run (timeout, refund, error) is
- * distinguishable from a successful one without being confused with a
- * real incident. The synthetic monitor follows the same real paid
- * /oracle path as demo-agent/ask.js, so it reuses jobLogger()'s
- * questionId correlation and just adds the synthetic tag on top.
+ * In-memory ring buffer of recent structured log lines, so an operator can
+ * pull a time-bounded slice of correlated logs (request-id/job-id) after an
+ * outage and hand it to the postmortem generator. This codebase has no
+ * log-aggregator integration today (the roadmap names that gap explicitly),
+ * so the generator reads from whatever the process itself has retained
+ * rather than pretending a shipping destination exists. Bounded so it can
+ * never grow without limit; oldest lines are evicted first.
  */
-export function syntheticLogger(questionId) {
-  return jobLogger(questionId).child({ synthetic: true });
+const LOG_BUFFER_LIMIT = 5000;
+const logBuffer = [];
+
+/**
+ * Capture a structured log line into the in-memory buffer. Accepts either a
+ * raw JSON string (as emitted in LOG_FORMAT=json mode) or an already-parsed
+ * object; unparseable lines are ignored rather than throwing, since a
+ * malformed line must never take down the process. Returns the parsed entry
+ * (or null when it couldn't be parsed).
+ */
+export function recordLogLine(line) {
+  let entry = line;
+  if (typeof line === 'string') {
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      return null;
+    }
+  }
+  if (!entry || typeof entry !== 'object') return null;
+  logBuffer.push(entry);
+  if (logBuffer.length > LOG_BUFFER_LIMIT) logBuffer.splice(0, logBuffer.length - LOG_BUFFER_LIMIT);
+  return entry;
+}
+
+/**
+ * Return the buffered log lines matching a time range and/or correlation id.
+ * `from`/`to` are epoch-millisecond bounds (inclusive) matched against the
+ * pino `time` field; `jobId`/`requestId` match the correlation fields the
+ * logger already tags (questionId via jobLogger(), reqId via httpLogger).
+ * All filters are optional — an empty filter returns the whole buffer.
+ */
+export function getLogSlice({ from, to, jobId, requestId } = {}) {
+  return logBuffer.filter((entry) => {
+    if (from != null && entry.time != null && entry.time < from) return false;
+    if (to != null && entry.time != null && entry.time > to) return false;
+    if (jobId != null && String(entry.questionId) !== String(jobId)) return false;
+    if (requestId != null && String(entry.reqId ?? entry.req?.id) !== String(requestId)) return false;
+    return true;
+  });
+}
+
+/** Test/ops helper: drop everything currently buffered. */
+export function clearLogBuffer() {
+  logBuffer.length = 0;
 }

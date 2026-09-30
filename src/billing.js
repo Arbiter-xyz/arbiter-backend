@@ -16,21 +16,12 @@ import { fiatPoolBalanceStroops, billingReservationCount, billingSettlementCount
  * credit and how much of it they have, never the on-chain settlement
  * itself.
  *
- * Multiple processors (Stripe, PayPal, Coinbase Commerce) implement the
- * same processor-agnostic interface below — createCheckoutSession() and
- * verifyAndParseWebhook() — mirroring how store.js exposes MemoryStore and
- * RedisStore behind one `store` export. The Stripe path is the original
- * concrete instance and is unchanged in behavior; the additional
- * processors are additive, not a replacement.
- */
-
-/**
- * Bounded retry/timeout policy for the outbound Stripe checkout call,
- * matching the shape of HORIZON_RETRY_OPTS in sponsor.js. The Stripe SDK's
- * own network retry is disabled (maxNetworkRetries: 0) so this is the
- * single, uniform retry loop for the call — the same choice round 5 made
- * for Claude in reconcile.js's getClient(), rather than layering a second,
- * redundant retry loop on top of the SDK's default.
+ * Enterprise customers billed after the fact (net-30 invoicing) invert the
+ * prepay-then-consume model: usage happens first, the bill comes later, and
+ * accruing a balance owed is the entire point. Such accounts are marked
+ * invoice-billed (see setInvoiceBilled/isInvoiceBilled) and their usage is
+ * accumulated in a running total (recordInvoiceUsage) that is never
+ * decremented by consumption, so a periodic report can be built from it.
  */
 const STRIPE_RETRY_OPTS = { attempts: 2, timeoutMs: 8000, label: 'stripe.checkout.sessions.create' };
 
@@ -97,84 +88,35 @@ async function createAccount() {
 }
 
 /**
- * Anomaly-based auto-suspend (issue #153). A compromised key being hammered
- * or a runaway retry loop burns through a real balance via reserveCredit()
- * (which reserves the surge-case ceiling per call, before the actual price
- * is even known). The per-IP rate ceiling in rateLimit.js can't see a
- * distributed pattern against one account, so we track a per-account
- * trailing-window velocity signal and flip a suspension flag on the account
- * record when it trips. resolveApiKey() (apiKeyAuth.js) fails closed on
- * that flag before the request ever reaches reserveCredit().
- *
- * The signal is deliberately simple and explainable — a fixed threshold
- * over a trailing window, mirroring dispatch.js's computeSmoothedCount()
- * trailing-sample approach rather than inventing a new statistical model.
- * Per-account baselining is a deliberate v1 gap (real false-positive risk
- * against a customer whose legitimate traffic just grew); operators can
- * unsuspend via the admin-gated endpoint below.
+ * Marks an account as invoice-billed (net-30) rather than prepaid-credit-
+ * billed. Stored alongside the existing account:{accountId} record so the
+ * flag travels with the account identity. Invoice-billed accounts skip
+ * reserveCredit()/settleReservation() entirely in POST /oracle and instead
+ * accrue usage via recordInvoiceUsage().
  */
-export const SUSPEND_WINDOW_MS = 60 * 1000;
-export const SUSPEND_MAX_CALLS_PER_WINDOW = 600;
+export async function setInvoiceBilled(accountId, invoiceBilled = true) {
+  const account = (await store.get(`account:${accountId}`)) || {};
+  await store.set(`account:${accountId}`, { ...account, invoiceBilled: Boolean(invoiceBilled) });
+}
 
-/**
- * Pure, exported velocity/threshold check — same testability pattern as
- * computeSmoothedCount/stakeGateAllows/surgeMultiplier. Given the timestamps
- * of recent calls for one account and the current time, returns true when
- * the count within the trailing window exceeds the fixed ceiling. No store
- * or timer access, so it can be unit-tested independently.
- */
-export function isAbusiveVelocity(timestamps, now = Date.now(), windowMs = SUSPEND_WINDOW_MS, maxCalls = SUSPEND_MAX_CALLS_PER_WINDOW) {
-  if (!Array.isArray(timestamps)) return false;
-  const cutoff = now - windowMs;
-  let count = 0;
-  for (const ts of timestamps) {
-    if (typeof ts === 'number' && ts > cutoff) count += 1;
-  }
-  return count > maxCalls;
+export async function isInvoiceBilled(accountId) {
+  const account = await store.get(`account:${accountId}`);
+  return Boolean(account?.invoiceBilled);
 }
 
 /**
- * Records one call for the account's velocity window and suspends the
- * account if the trailing-window count trips the threshold. Called inline
- * from reserveCredit() so the check runs on the same path that spends real
- * balance, before the reservation is attempted. The window is stored as a
- * plain array under a short TTL so it self-expires without a sweep.
+ * Accumulates a running usage total for an invoice-billed account. Uses the
+ * same store.incrBy primitive billing.js already uses for credit, but this
+ * counter is never decremented by consumption — it is the raw usage an
+ * invoice would be built from. Returns the new running total.
  */
-export async function recordCallVelocity(accountId, now = Date.now()) {
-  if (!accountId) return false;
-  const key = `velocity:${accountId}`;
-  const timestamps = (await store.get(key)) || [];
-  const cutoff = now - SUSPEND_WINDOW_MS;
-  const recent = timestamps.filter((ts) => typeof ts === 'number' && ts > cutoff);
-  recent.push(now);
-  await store.set(key, recent, SUSPEND_WINDOW_MS * 2);
-  if (isAbusiveVelocity(recent, now)) {
-    await suspendAccount(accountId, 'velocity');
-    return true;
-  }
-  return false;
+export async function recordInvoiceUsage(accountId, stroops) {
+  if (!(stroops > 0)) return getInvoiceUsageStroops(accountId);
+  return store.incrBy(`invoice-usage:${accountId}`, stroops);
 }
 
-/** Flips the suspension flag on the account record. Fails closed: a missing
- * account record is left alone (resolveApiKey() already rejects unknown
- * keys), and the flag is what resolveApiKey() checks. */
-export async function suspendAccount(accountId, reason = 'manual') {
-  const account = await store.get(`account:${accountId}`);
-  if (!account) return false;
-  await store.set(`account:${accountId}`, { ...account, suspended: true, suspendedAt: Date.now(), suspendedReason: reason });
-  logger.warn({ accountId, reason }, 'api key account suspended');
-  return true;
-}
-
-/** Operator override path (issue #153 open question 2): clears the
- * suspension flag so a wrongly-suspended key can be restored. Exposed via
- * the admin-gated endpoint in server.js. */
-export async function unsuspendAccount(accountId) {
-  const account = await store.get(`account:${accountId}`);
-  if (!account) return false;
-  await store.set(`account:${accountId}`, { ...account, suspended: false, suspendedAt: null, suspendedReason: null });
-  logger.info({ accountId }, 'api key account unsuspended');
-  return true;
+export async function getInvoiceUsageStroops(accountId) {
+  return (await store.get(`invoice-usage:${accountId}`)) || 0;
 }
 
 export async function getCreditBalanceStroops(accountId) {
@@ -191,11 +133,8 @@ export async function getCreditBalanceStroops(accountId) {
  * never go negative and a customer can never be charged more than their
  * balance covers, without needing to predict the exact price in advance.
  *
- * Also the inline trigger for the anomaly sweep (issue #153): the velocity
- * check runs here, on the same path that spends real balance, so a key
- * that trips the threshold is suspended before its next reservation. A
- * suspended account is rejected earlier by resolveApiKey(), so this is a
- * backstop for in-flight requests rather than the primary gate.
+ * Invoice-billed accounts deliberately bypass this path (see oracle.js):
+ * going negative — accruing a balance owed — is the entire point for them.
  */
 export async function reserveCredit(accountId, maxStroops) {
   const ok = await store.decrIfAtLeast(`credit:${accountId}`, maxStroops);
