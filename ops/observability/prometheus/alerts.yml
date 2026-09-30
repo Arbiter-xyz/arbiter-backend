@@ -1,0 +1,156 @@
+# Alerting rules for arbiter-backend. Every expression here is exercised by
+# alerts.test.yml (`promtool test rules`, run in CI) against both an injected
+# anomaly (must fire) and healthy traffic (must stay silent), and the live
+# pipeline (Prometheus -> Alertmanager -> receiver) is exercised by
+# scripts/alert-drill.js. Metric definitions: src/metrics.js. What to do when
+# one fires: docs/runbooks/observability.md.
+
+groups:
+  - name: arbiter-availability
+    rules:
+      - alert: ArbiterBackendDown
+        expr: up{job="arbiter-backend"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "arbiter-backend {{ $labels.instance }} is not answering scrapes"
+          runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterbackenddown"
+
+      - alert: ArbiterHighErrorRate
+        # More than 5% of requests failing with a 5xx, over at least a
+        # trickle of traffic (so one failed request at 3am isn't a page).
+        expr: |
+          (
+              sum by (instance) (rate(arbiter_http_requests_total{status=~"5.."}[5m]))
+            /
+              sum by (instance) (rate(arbiter_http_requests_total[5m]))
+          ) > 0.05
+          and
+          sum by (instance) (rate(arbiter_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "arbiter-backend {{ $labels.instance }} is failing more than 5% of requests with a 5xx"
+          runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterhigherrorrate"
+
+      - alert: ArbiterHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum by (instance, le) (rate(arbiter_http_request_duration_seconds_bucket[5m]))
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "arbiter-backend {{ $labels.instance }} p95 request latency is above 2s"
+          runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterhighlatency"
+
+  - name: arbiter-dependencies
+    rules:
+      - alert: ArbiterStoreDown
+        expr: arbiter_store_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "arbiter-backend {{ $labels.instance }} cannot reach Redis"
+          runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterstoredown"
+
+      - alert: ArbiterStoreNotDurable
+        # store.js silently falls back to the in-memory store if Redis is
+        # unreachable at boot. Everything then works — until the next
+        # restart, which is a total state loss.
+        expr: arbiter_store_durable == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "arbiter-backend {{ $labels.instance }} is running on the in-memory store; a restart will lose all state"
+          runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterstorenotdurable"
+
+      - alert: ArbiterChainRpcDown
+        expr: arbiter_chain_rpc_up == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "arbiter-backend {{ $labels.instance }} cannot reach the Soroban RPC; nothing can be paid for or settled"
+          runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterchainrpcdown"
+
+      - alert: ArbiterChainLedgerStalled
+        expr: arbiter_chain_rpc_up == 1 and changes(arbiter_chain_latest_ledger[5m]) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The Soroban RPC used by {{ $labels.instance }} answers but its latest ledger has not moved in 5m"
+          runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterchainledgerstalled"
+
+  - name: arbiter-settlement
+    rules:
+      - alert: ArbiterAdminCallFailures
+        # resolve()/refund()/charge()/touch() failing on-chain. A failed
+        # resolve() falls back to refund(); a failed refund() leaves the payer
+        # waiting on refund_timeout() — see ArbiterSettlementFellBackToTimeout.
+        expr: sum by (instance, method) (increase(arbiter_admin_invocations_total{result="error"}[15m])) >= 3
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.method }}() has failed on-chain repeatedly on {{ $labels.instance }} in the last 15m"
+          runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiteradmincallfailures"
+
+      - alert: ArbiterSettlementFellBackToTimeout
+        expr: sum by (instance) (increase(arbiter_settlements_total{outcome="refund_pending_timeout"}[30m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A paid question on {{ $labels.instance }} could be neither resolved nor refunded; its payer is waiting on refund_timeout()"
+          runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbitersettlementfellbacktotimeout"
+
+      - alert: ArbiterQuestionsStuckInFlight
+        # Tier windows are seconds to a few minutes; 15 minutes in flight
+        # means nothing is driving the job any more.
+        expr: arbiter_job_oldest_inflight_age_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A paid question on {{ $labels.instance }} has been in flight for more than 15 minutes"
+          runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterquestionsstuckinflight"
+
+  - name: arbiter-recovery
+    rules:
+      - alert: ArbiterEscrowStranded
+        # Payers' funds are Pending on-chain with nothing local able to settle
+        # them, and the recovery sweep has not managed to refund them for 15
+        # minutes (normally it refunds on the sweep that finds them).
+        expr: sum by (instance) (arbiter_recovery_actionable_pending_questions{reason!="inconsistent"}) > 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Paid questions on {{ $labels.instance }} are stranded in escrow and the recovery sweep is not refunding them"
+          runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterescrowstranded"
+
+      - alert: ArbiterEscrowInconsistent
+        # Local state says settled, the chain says Pending. The sweep never
+        # auto-refunds these.
+        expr: arbiter_recovery_actionable_pending_questions{reason="inconsistent"} > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A question on {{ $labels.instance }} is settled locally but still Pending on-chain"
+          runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterescrowinconsistent"
+
+      - alert: ArbiterRecoverySweepFailing
+        expr: increase(arbiter_recovery_sweep_failures_total[30m]) >= 3
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The recovery sweep on {{ $labels.instance }} cannot scan the chain; stranded payers would not be refunded"
+          runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterrecoverysweepfailing"

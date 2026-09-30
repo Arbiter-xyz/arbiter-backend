@@ -58,7 +58,8 @@ function similarity(a, b) {
 // quality problem this issue targets).
 const CLUSTER_THRESHOLD = 0.6;
 
-export function exactMatchVote(submissions) {
+/** Groups submissions by normalized answer text, in first-seen order. */
+export function groupByNormalizedAnswer(submissions) {
   const groups = new Map(); // normalized -> { representative, workerIds }
   for (const { workerId, answer } of submissions) {
     const norm = normalize(answer);
@@ -157,8 +158,14 @@ function getClient() {
  * it from the committed submissions and confirm, byte for byte, that the
  * prompt Claude actually saw contained exactly those submissions.
  */
-export function buildReconcileRequest(question, submissions, model = config.anthropicModel) {
+export function buildReconcileRequest(question, submissions, model = config.anthropicModel, rule = null) {
   const submissionsText = submissions.map((s) => `Worker ${s.workerId}: "${s.answer}"`).join('\n');
+  // Only non-default rules add anything to the prompt, so the default
+  // mode's Claude call is unchanged.
+  const ruleText =
+    rule?.mode === 'numeric-tolerance'
+      ? ` The asker requested numeric matching: treat numeric answers ${describeTolerance(rule.tolerance)} as matches.`
+      : '';
   return {
     model,
     max_tokens: 512,
@@ -185,11 +192,11 @@ function captureResponse(message) {
   return { id: message.id, model: message.model, stop_reason: message.stop_reason, content: message.content };
 }
 
-async function reconcileWithClaude(question, submissions) {
+async function reconcileWithClaude(question, submissions, rule = null) {
   const client = getClient();
   if (!client) throw new Error('ANTHROPIC_API_KEY not configured');
 
-  const request = buildReconcileRequest(question, submissions);
+  const request = buildReconcileRequest(question, submissions, config.anthropicModel, rule);
   const message = await client.messages.create(request);
 
   const toolUse = message.content.find((b) => b.type === 'tool_use' && b.name === 'report_consensus');
@@ -300,7 +307,10 @@ export async function reconcile(question, submissions, questionId, rule = null) 
     return { consensus: null, confidence: 0, matchingWorkerIds: [], method: 'no-answers' };
   }
 
-  const vote = clusterVote(submissions);
+  const numeric = rule?.mode === 'numeric-tolerance';
+  const vote = numeric
+    ? numericToleranceVote(submissions, rule.tolerance, groupByNormalizedAnswer)
+    : clusterVote(submissions);
   const allEstablished = submissions.every((s) => s.established);
 
   if (vote.allAgree && allEstablished) {

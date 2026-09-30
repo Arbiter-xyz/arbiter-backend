@@ -17,6 +17,7 @@ import { config } from './config.js';
 import { undoWindowFor, holdThenDispatch, cancelHeld } from './undoWindow.js';
 import { verifySessionToken } from './workerAuth.js';
 import { restoreCredit } from './billing.js';
+import { getDispatchPause, describePause } from './maintenanceWindows.js';
 
 const IDEMPOTENCY_PREFIX = 'idempotency:';
 // Who may cancel an API-key-funded job. Kept out of the job record itself,
@@ -185,8 +186,8 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
     category: pending.category || null,
   });
 
-  if (apiKeyAccountId) {
-    await store.set(JOB_OWNER_PREFIX + questionId, { apiKeyAccountId }, config.jobResultTtlMs);
+  if (ownerAccountId) {
+    await store.set(JOB_OWNER_PREFIX + questionId, { apiKeyAccountId: ownerAccountId }, config.jobResultTtlMs);
   }
   if (payerAddress) await recordPayerQuestion(payerAddress, questionId);
   // API-key customers are charged from the shared fiat pool, so `payer`
@@ -194,7 +195,9 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
   if (ownerAccountId) await setJobWebhookOwner(questionId, `account:${ownerAccountId}`);
 
   if (!cancellableUntil) {
-    runFulfillment(questionId, pending, tier);
+    dispatchUnlessPaused(questionId, pending, tier).catch((err) =>
+      jobLogger(questionId).error({ err }, 'failed to start dispatch'),
+    );
     return { jobId: questionId };
   }
 
@@ -202,6 +205,10 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
     questionId,
     holdMs,
     async () => {
+      // Checked again here, not just at payment time: a maintenance window
+      // can open while the job is sitting in its undo-window hold.
+      const pause = await getDispatchPause();
+      if (pause) return refundForDispatchPause(questionId, tier, pause);
       await updateJob(questionId, { status: 'awaiting_workers', cancellableUntil: null, dispatchedAt: Date.now() });
       runFulfillment(questionId, pending, tier);
     },
@@ -209,6 +216,33 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
   );
 
   return { jobId: questionId, cancellableUntil };
+}
+
+async function dispatchUnlessPaused(questionId, pending, tier) {
+  const pause = await getDispatchPause();
+  if (pause) return refundForDispatchPause(questionId, tier, pause);
+  runFulfillment(questionId, pending, tier);
+}
+
+/**
+ * A question that was paid for but would be dispatched inside a maintenance
+ * window (see maintenanceWindows.js for why it's refunded, not queued).
+ * Same settleRefunded() path as every other refund; an API-key customer's
+ * credit is restored too, exactly as cancelJob() does, since the escrow
+ * goes back to the shared fiat pool rather than to them.
+ */
+async function refundForDispatchPause(questionId, tier, pause) {
+  jobLogger(questionId).info({ pause }, 'dispatch paused for maintenance — refunding instead of dispatching');
+  await updateJob(questionId, { status: 'reconciling', cancellableUntil: null, dispatchPausedUntil: pause.resumesAt });
+  await settleRefunded(questionId, [], {
+    consensus: null,
+    confidence: 0,
+    matchingWorkerIds: [],
+    method: 'dispatch-paused',
+    reason: describePause(pause),
+  });
+  const owner = await store.get(JOB_OWNER_PREFIX + questionId);
+  if (owner?.apiKeyAccountId) await restoreCredit(owner.apiKeyAccountId, Number(tier.priceStroops));
 }
 
 function runFulfillment(questionId, pending, tier) {
