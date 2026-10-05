@@ -8,6 +8,7 @@ import {
   getPushEligibleWorkerIds,
   notifyWorker,
   isPushConfigured,
+  rebuildSubscribedWorkers,
 } from '../src/push.js';
 
 const fakeSubscription = (id) => ({
@@ -43,6 +44,23 @@ test('getPushEligibleWorkerIds: a specialist only matches its declared categorie
   await saveSubscription(worker, fakeSubscription(worker), ['Math']); // mixed case on purpose
   try {
     assert.ok(getPushEligibleWorkerIds('math').includes(worker), 'category matching must be case-insensitive');
+    assert.ok(!getPushEligibleWorkerIds('history').includes(worker));
+  } finally {
+    await removeSubscription(worker);
+  }
+});
+
+test('getPushEligibleWorkerIds: rebuilds from durable store after a simulated restart', async () => {
+  const worker = `restart-${Date.now()}`;
+  await saveSubscription(worker, fakeSubscription(worker), ['Math']);
+  try {
+    // Simulate a process restart: the in-process index is rebuilt purely from
+    // the durable store records, without calling saveSubscription() again.
+    await rebuildSubscribedWorkers();
+    assert.ok(
+      getPushEligibleWorkerIds('math').includes(worker),
+      'a previously-subscribed worker must be eligible after a restart'
+    );
     assert.ok(!getPushEligibleWorkerIds('history').includes(worker));
   } finally {
     await removeSubscription(worker);
