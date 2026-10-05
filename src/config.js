@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { randomBytes } from 'node:crypto';
 
 /**
  * Central runtime configuration.
@@ -7,6 +8,12 @@ import 'dotenv/config';
  * credential is either a per-customer API key (billing.js) or a small, fixed
  * set of operator credentials (admin) — never a general user/org model.
  */
+
+/** Parse an env var as a number, falling back when unset or not a valid number. */
+function num(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
 
 function parseAdminCredentials(raw) {
   // ADMIN_CREDENTIALS is a comma-separated list of `role:hash` pairs, where
@@ -119,6 +126,31 @@ export const contractCompatibility = Object.freeze({
   wasmHash: (process.env.COMPATIBLE_CONTRACT_WASM_HASH || '').toLowerCase(),
 });
 
+// Multi-provider Soroban RPC failover (#139): comma-separated list of RPC
+// endpoints, primary first. A single SOROBAN_RPC_URL (or none, which falls
+// back to the public testnet endpoint) still works exactly as before.
+const sorobanRpcUrls = (process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// Which deployment this process is (#150): 'demo' (disposable) or
+// 'sandbox' (long-lived developer sandbox). Unrecognized values fall back
+// to 'demo' rather than failing — this only affects display/labeling.
+const deploymentProfile = process.env.DEPLOYMENT_PROFILE === 'sandbox' ? 'sandbox' : 'demo';
+
+// Express `trust proxy` setting. false (default) = trust nothing, req.ip is
+// the raw socket address — correct for local dev and any deployment with no
+// reverse proxy in front. A bare `true` trusts every hop in X-Forwarded-For,
+// which lets a client spoof req.ip by sending its own header when there's no
+// proxy actually overwriting it; a specific hop count only trusts that many
+// proxies closest to the server, which is what TRUST_PROXY=1 (one hop, e.g.
+// Railway) asks for.
+function trustProxy() {
+  const n = Number(process.env.TRUST_PROXY);
+  return Number.isInteger(n) && n > 0 ? n : false;
+}
+
 export const config = Object.freeze({
   port: num(process.env.PORT, 4000),
   horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
@@ -153,53 +185,6 @@ export const config = Object.freeze({
   // with — this copy is for display/UX only (e.g. "auto-refund available
   // after ledger N"); the contract enforces its own stored value regardless.
   timeoutLedgers: num(process.env.TIMEOUT_LEDGERS, 100),
-
-// API version negotiation (#136). Additive, not a rewrite: every existing
-// unversioned route in server.js keeps working unchanged and is treated as
-// implicit v1, so no integrator is forced onto a /v1/ prefix. New or changed
-// routes opt into an explicit version via either a URL-path prefix
-// (/v2/...) or the Accept header (application/vnd.arbiter.v2+json).
-//
-// v1 is the implicit default (no version requested). v2 is the first
-// explicitly negotiated version and is the real worked example for this
-// issue. Requesting a version that isn't in this list must produce a clear
-// 4xx (see negotiateApiVersion below) — never a silent fallback to v1 and
-// never a 500.
-export const API_VERSIONS = Object.freeze(['v1', 'v2']);
-export const DEFAULT_API_VERSION = 'v1';
-
-// Matches Accept: application/vnd.arbiter.v2+json (and the v1 form). Kept
-// permissive about surrounding parameters (q-values, charset) since curl
-// users won't hand-craft a perfect Accept header.
-const ACCEPT_VERSION_RE = /application\/vnd\.arbiter\.(v\d+)\+json/i;
-
-// Resolves the requested API version from a request's URL path and Accept
-// header. Returns { version, explicit } where `explicit` is true only when
-// the caller actually asked for a version (path prefix or Accept header) —
-// unversioned requests resolve to DEFAULT_API_VERSION with explicit:false so
-// callers can keep the legacy behavior byte-for-byte.
-//
-// Throws an Error with a `.status = 400` for an unrecognized version so the
-// route layer can surface a clear 4xx instead of a silent fallback or 500.
-export function negotiateApiVersion({ path = '', accept = '' } = {}) {
-  const pathMatch = /^\/(v\d+)(?:\/|$)/i.exec(path);
-  const acceptMatch = ACCEPT_VERSION_RE.exec(accept || '');
-  const requested = (pathMatch?.[1] || acceptMatch?.[1] || '').toLowerCase();
-
-  if (!requested) return { version: DEFAULT_API_VERSION, explicit: false };
-
-  if (!API_VERSIONS.includes(requested)) {
-    const err = new Error(
-      `unsupported API version '${requested}'; supported versions: ${API_VERSIONS.join(', ')}`,
-    );
-    err.status = 400;
-    err.code = 'unsupported_api_version';
-    err.supportedVersions = API_VERSIONS;
-    throw err;
-  }
-
-  return { version: requested, explicit: true };
-}
 
   // Cross-instance quorum collection (#160). When more than one backend
   // instance is running, a question's collector lives in the memory of
@@ -272,17 +257,18 @@ export function negotiateApiVersion({ path = '', accept = '' } = {}) {
     hsts: process.env.HSTS_ENABLED !== 'false',
   }),
 
-  const ids = (process.env.CONTRACT_IDS || '')
+  // Sharded multi-contract dispatch (#162). Empty unless CONTRACT_IDS is
+  // set, in which case pendingQuestions.js's roundRobinContract() routes
+  // across the listed instances instead of the single legacy contractId.
+  contracts: (process.env.CONTRACT_IDS || '')
     .split(',')
     .map((s) => s.trim())
-    .filter(Boolean);
-  if (ids.length > 0) {
-    return ids.map((id, i) => ({
+    .filter(Boolean)
+    .map((id, i) => ({
       id,
       adminKey: process.env.ADMIN_SECRET_KEY || null,
       label: `contract-${i}`,
-    }));
-  }
+    })),
 
   worker: Object.freeze({
     rateLimitMaxConnections: num(process.env.WORKER_RATE_LIMIT_MAX_CONNECTIONS, 5),
@@ -382,23 +368,6 @@ export function negotiateApiVersion({ path = '', accept = '' } = {}) {
     token: process.env.ADMIN_TOKEN || '',
   }),
 
-  vapid: Object.freeze({
-    publicKey: process.env.VAPID_PUBLIC_KEY || '',
-    privateKey: process.env.VAPID_PRIVATE_KEY || '',
-    subject: process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
-  }),
-
-  push: Object.freeze({
-    // Push notifications supplement, never replace, the SSE dispatch
-    // channel — they're for workers who aren't currently connected. A
-    // push round-trip (deliver -> notice -> tap -> app loads) realistically
-    // takes several seconds, so notifying for a very short quorum window
-    // (e.g. the 'express' tier's 12s) would routinely arrive after the
-    // window already closed. Below this threshold, skip push entirely
-    // rather than notify workers for an opportunity they can't act on.
-    minTimeoutForPushMs: num(process.env.PUSH_MIN_TIMEOUT_MS, 20_000),
-  }),
-
   // Settlement webhooks (see webhooks.js for registration/validation and
   // webhookDelivery.js for signing/retry). Delivery is best-effort and
   // never on the settlement path; these bound how hard it tries.
@@ -455,3 +424,50 @@ export function negotiateApiVersion({ path = '', accept = '' } = {}) {
     suspendScore: num(process.env.COLLUSION_SUSPEND_SCORE, 0.85),
   }),
 });
+
+// API version negotiation (#136). Additive, not a rewrite: every existing
+// unversioned route in server.js keeps working unchanged and is treated as
+// implicit v1, so no integrator is forced onto a /v1/ prefix. New or changed
+// routes opt into an explicit version via either a URL-path prefix
+// (/v2/...) or the Accept header (application/vnd.arbiter.v2+json).
+//
+// v1 is the implicit default (no version requested). v2 is the first
+// explicitly negotiated version and is the real worked example for this
+// issue. Requesting a version that isn't in this list must produce a clear
+// 4xx (see negotiateApiVersion below) — never a silent fallback to v1 and
+// never a 500.
+export const API_VERSIONS = Object.freeze(['v1', 'v2']);
+export const DEFAULT_API_VERSION = 'v1';
+
+// Matches Accept: application/vnd.arbiter.v2+json (and the v1 form). Kept
+// permissive about surrounding parameters (q-values, charset) since curl
+// users won't hand-craft a perfect Accept header.
+const ACCEPT_VERSION_RE = /application\/vnd\.arbiter\.(v\d+)\+json/i;
+
+// Resolves the requested API version from a request's URL path and Accept
+// header. Returns { version, explicit } where `explicit` is true only when
+// the caller actually asked for a version (path prefix or Accept header) —
+// unversioned requests resolve to DEFAULT_API_VERSION with explicit:false so
+// callers can keep the legacy behavior byte-for-byte.
+//
+// Throws an Error with a `.status = 400` for an unrecognized version so the
+// route layer can surface a clear 4xx instead of a silent fallback or 500.
+export function negotiateApiVersion({ path = '', accept = '' } = {}) {
+  const pathMatch = /^\/(v\d+)(?:\/|$)/i.exec(path);
+  const acceptMatch = ACCEPT_VERSION_RE.exec(accept || '');
+  const requested = (pathMatch?.[1] || acceptMatch?.[1] || '').toLowerCase();
+
+  if (!requested) return { version: DEFAULT_API_VERSION, explicit: false };
+
+  if (!API_VERSIONS.includes(requested)) {
+    const err = new Error(
+      `unsupported API version '${requested}'; supported versions: ${API_VERSIONS.join(', ')}`,
+    );
+    err.status = 400;
+    err.code = 'unsupported_api_version';
+    err.supportedVersions = API_VERSIONS;
+    throw err;
+  }
+
+  return { version: requested, explicit: true };
+}

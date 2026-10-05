@@ -1,4 +1,4 @@
-import { timingSafeEqual } from 'node:crypto';
+import { timingSafeEqual, createHash } from 'node:crypto';
 import { config } from './config.js';
 import { hashApiKey } from './apiKeyAuth.js';
 
@@ -34,30 +34,21 @@ function safeEqual(a, b) {
 const ROLE_READONLY = 'readonly';
 const ROLE_FULL = 'full';
 
-/** Constant-time string comparison that tolerates differing lengths. */
-function timingSafeEqual(a, b) {
-  const ab = Buffer.from(String(a));
-  const bb = Buffer.from(String(b));
-  if (ab.length !== bb.length) {
-    // Still do a comparison so the failure path isn't obviously faster.
-    crypto.timingSafeEqual(ab, ab);
-    return false;
-  }
-  return crypto.timingSafeEqual(ab, bb);
-}
-
 /** Derive a stable, non-reversible session id from a credential hash. */
 function sessionIdForHash(hash) {
-  return crypto.createHash('sha256').update(`admin-session:${hash}`).digest('hex').slice(0, 32);
+  return createHash('sha256').update(`admin-session:${hash}`).digest('hex').slice(0, 32);
 }
 
-  const header = req.get('authorization') || '';
-  const [scheme, token] = header.split(' ');
-  if (scheme !== 'Bearer' || !token || !safeEqual(token, config.admin.token)) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-
-  return null;
+/**
+ * Resolve a presented bearer token against the one configured admin
+ * secret. There's only one shared token (see the module doc comment above
+ * for why), so any match grants ROLE_FULL — the reviewer/senior_reviewer
+ * split below is a separate, additive layer on top of this, not a second
+ * tier of secrets.
+ */
+function resolveAdminCredential(token) {
+  if (!token || !safeEqual(token, config.admin.token)) return null;
+  return { role: ROLE_FULL, sessionId: sessionIdForHash(token) };
 }
 
 /** Resolve the role granted by a presented token, or null if it matches no

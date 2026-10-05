@@ -4,26 +4,52 @@
  * Pricing helpers.
  *
  * `surgeMultiplier()` is a pure function of an aggregate input (current load)
- * and is intentionally easy to unit-test in isolation. The loyalty tier
- * helpers below follow the same shape: they are pure functions of a payer's
- * spend summary (as produced by `summarizePayerQuestions()` in payerIndex.js)
- * and return the applicable bonus credit for that summary.
+ * and is intentionally easy to unit-test in isolation.
  */
 
-const SURGE_TIERS = [
-  { minLoad: 0.9, multiplier: 3 },
-  { minLoad: 0.75, multiplier: 2 },
-  { minLoad: 0.5, multiplier: 1.5 },
-];
+// Base prices in stroops (1 USDC = 10_000_000 stroops, 7 decimals — matches
+// the fiat onramp's documented conversion in billing.js). quorumSize is the
+// number of worker answers required to settle; the instant tier has none —
+// it's a single LLM draft, no human quorum at all.
+//
+// Built on a null-prototype object (not just Object.freeze on a plain
+// literal), so a "__proto__" tier key can never resolve to Object.prototype
+// itself via a plain bracket lookup — PRICING_TIERS['__proto__'] is
+// genuinely undefined, not truthy, so even a naive `|| PRICING_TIERS[default]`
+// caller is safe, not just resolveTier()'s explicit hasOwnProperty check.
+export const PRICING_TIERS = Object.freeze(
+  Object.assign(Object.create(null), {
+    instant: Object.freeze({ key: 'instant', quorumSize: 0, priceStroops: 500_000n }),
+    standard: Object.freeze({ key: 'standard', quorumSize: 3, priceStroops: 2_500_000n }),
+    express: Object.freeze({ key: 'express', quorumSize: 2, priceStroops: 4_000_000n }),
+    priority: Object.freeze({ key: 'priority', quorumSize: 5, priceStroops: 6_000_000n }),
+  }),
+);
 
-function surgeMultiplier(load) {
-  const normalized = Number.isFinite(load) ? load : 0;
-  for (const tier of SURGE_TIERS) {
-    if (normalized >= tier.minLoad) {
-      return tier.multiplier;
-    }
+export const DEFAULT_TIER_KEY = 'standard';
+
+/**
+ * Resolve a caller-supplied tier key to its tier object, falling back to the
+ * default tier for any unknown key. Uses hasOwnProperty explicitly (not a
+ * plain bracket lookup) so a key of "__proto__" can't resolve
+ * Object.prototype itself — a bracket lookup finds it on the prototype
+ * chain, where it's truthy, so a `||` fallback never triggers and
+ * priceForTier() would otherwise crash trying to BigInt() a NaN instead of
+ * cleanly quoting the standard price.
+ */
+export function resolveTier(tierKey) {
+  if (Object.prototype.hasOwnProperty.call(PRICING_TIERS, tierKey)) {
+    return PRICING_TIERS[tierKey];
   }
-  return 1;
+  return PRICING_TIERS[DEFAULT_TIER_KEY];
+}
+
+/** Stroops (BigInt or numeric string) to a USDC decimal string for display. */
+export function stroopsToUsdc(stroops) {
+  const n = typeof stroops === 'bigint' ? stroops : BigInt(stroops);
+  const whole = n / 10_000_000n;
+  const frac = (n % 10_000_000n).toString().padStart(7, '0').replace(/0+$/, '') || '0';
+  return `${whole}.${frac}`;
 }
 
 /**
@@ -114,37 +140,3 @@ export function priceForTierWithVolumeDiscount(tierKey, onlineWorkers, volume) {
   return { ...priced, priceStroops, discountMultiplier };
 }
 
-/**
- * Shadow-mode AI baseline (issue #13). The `instant` tier already produces an
- * LLM draft with no human quorum; for questions dispatched on a real quorum
- * tier (standard/express/priority) we additionally generate that same instant
- * draft *in shadow* — off the settlement path — and later compare it against
- * the human-reconciled consensus. This turns "we think the LLM draft is
- * usually right" into a published, verifiable agreement rate, and is the
- * measurement prerequisite for any future AI-assisted routing.
- *
- * @param {{ totalSpendStroops?: number, successRate?: number }} summary
- * @returns {{ tier: string, bonusStroops: number, minSpendStroops: number, minSuccessRate: number }}
- */
-function evaluateLoyaltyTier(summary) {
-  const totalSpendStroops = Number.isFinite(summary && summary.totalSpendStroops)
-    ? summary.totalSpendStroops
-    : 0;
-  const successRate = Number.isFinite(summary && summary.successRate)
-    ? summary.successRate
-    : 0;
-
-  for (const tier of LOYALTY_TIERS) {
-    if (totalSpendStroops >= tier.minSpendStroops && successRate >= tier.minSuccessRate) {
-      return {
-        tier: tier.name,
-        bonusStroops: tier.bonusStroops,
-        minSpendStroops: tier.minSpendStroops,
-        minSuccessRate: tier.minSuccessRate,
-      };
-    }
-  }
-
-// Normalizes an answer for co
-
-/* … truncated 1885 chars — edit only what you need near the top … */
