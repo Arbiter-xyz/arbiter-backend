@@ -1048,7 +1048,7 @@ mountSessionRoutes(app, '/workers', rateLimited('push', byIp));
 // exists on-chain.
 // ---------------------------------------------------------------------
 
-function requireWorkerSession(req, res, token) {
+function checkWorkerSessionToken(req, res, token) {
   if (!requiresAuth(req.params.address)) {
     res.status(400).json({ error: 'a valid Stellar address is required' });
     return false;
@@ -1077,7 +1077,7 @@ app.get('/referrals/:code', rateLimited('referrals', byIp), async (req, res) => 
 // Returns the caller's code, minting it on first call. body: { token }
 app.post('/workers/:address/referral-code', rateLimited('referrals', byIp), async (req, res) => {
   const { token } = req.body || {};
-  if (!requireWorkerSession(req, res, token)) return;
+  if (!checkWorkerSessionToken(req, res, token)) return;
   try {
     res.json(await getOrCreateReferralCode(req.params.address));
   } catch (err) {
@@ -1086,7 +1086,7 @@ app.post('/workers/:address/referral-code', rateLimited('referrals', byIp), asyn
 });
 
 app.get('/workers/:address/referrals', async (req, res) => {
-  if (!requireWorkerSession(req, res, req.query.token)) return;
+  if (!checkWorkerSessionToken(req, res, req.query.token)) return;
   try {
     res.json(await getReferralSummary(req.params.address));
   } catch (err) {
@@ -1104,7 +1104,7 @@ app.get('/workers/:address/referrals', async (req, res) => {
  */
 app.post('/workers/:address/onboard', rateLimited('referrals', byIp), async (req, res) => {
   const { token, referralCode } = req.body || {};
-  if (!requireWorkerSession(req, res, token)) return;
+  if (!checkWorkerSessionToken(req, res, token)) return;
 
   if (!referralCode && config.referrals.requiredForSponsoredOnboarding) {
     return res.status(400).json({ error: 'a referral code is required to onboard on this server' });

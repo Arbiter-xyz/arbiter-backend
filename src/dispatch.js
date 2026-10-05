@@ -114,22 +114,60 @@ export async function submitAnswer(questionId, workerId, answer, traceparent) {
 }
 
 /**
- * Record an answer against the local collector for `questionId`. Shared by
+ * Record an answer against the local collector for `questionId`, inside the
+ * question's trace context so the answer span is correlated with the
+ * original HTTP request and the on-chain settlement that follows. Shared by
  * the direct-submission path and the pub/sub delivery path so both count
  * toward quorum identically. Returns false when there is no local collector
- * (e.g. the owning instance died and this is a stale delivery).
+ * (e.g. the owning instance died and this is a stale delivery), when the
+ * worker already answered, or when content screening rejects the answer —
+ * a filtered answer must never count toward quorum.
  */
-function handleAnswer(questionId, workerId, answer, traceparent) {
-  const collector = collectors.get(questionId);
-  if (!collector || collector.finished) return false;
-  if (collector.submissions.has(workerId)) return false;
-  collector.submissions.set(workerId, answer);
-  if (collector.submissions.size >= collector.quorumSize) {
-    collector.finished = true;
-    unsubscribeFromAnswers(questionId);
-    collector.finish(collector.submissions);
-  }
-  return true;
+async function handleAnswer(questionId, workerId, answer, traceparent) {
+  const parentCtx = contextFromTraceparent(traceparent);
+  return context.with(parentCtx, async () => {
+    const span = tracer().startSpan('dispatch.answer', {
+      kind: SpanKind.CONSUMER,
+      attributes: {
+        'question.id': questionId.toString(),
+        'worker.id': workerId,
+      },
+    });
+    try {
+      const collector = collectors.get(questionId);
+      if (!collector || collector.finished) {
+        span.setAttribute('dispatch.answer_accepted', false);
+        return false;
+      }
+      if (collector.submissions.has(workerId)) {
+        span.setAttribute('dispatch.answer_accepted', false);
+        span.setAttribute('dispatch.answer_duplicate', true);
+        return false;
+      }
+      const screened = screenAnswer(answer);
+      if (!screened.ok) {
+        span.setAttribute('dispatch.answer_accepted', false);
+        span.setAttribute('dispatch.answer_filtered', screened.reason);
+        return false;
+      }
+      collector.submissions.set(workerId, answer);
+      span.setAttribute('dispatch.answer_accepted', true);
+      span.setAttribute('dispatch.submissions', collector.submissions.size);
+      if (collector.submissions.size >= collector.quorumSize) {
+        collector.finished = true;
+        unsubscribeFromAnswers(questionId);
+        await collector.finish(collector.submissions);
+      }
+      span.setStatus({ code: SpanStatusCode.OK });
+      return true;
+    } catch (err) {
+      span.recordException(err);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
 }
 
 const REPUTATION_PREFIX = 'rep:';
@@ -465,55 +503,6 @@ export async function broadcast(questionId, questionText, { category, quorumSize
       }
       span.setStatus({ code: SpanStatusCode.OK });
       return targets.length;
-    } catch (err) {
-      span.recordException(err);
-      span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
-      throw err;
-    } finally {
-      span.end();
-    }
-  });
-}
-
-/**
- * Record a worker's answer inside the question's trace context. The worker
- * echoes the traceparent it received on the SSE frame, so the answer span is
- * correlated with the original HTTP request and the on-chain settlement that
- * follows — this is the middle link in the end-to-end trace.
- */
-export async function submitAnswer(questionId, workerId, answer, { traceparent } = {}) {
-  const parentCtx = contextFromTraceparent(traceparent);
-  return context.with(parentCtx, async () => {
-    const span = tracer().startSpan('dispatch.answer', {
-      kind: SpanKind.CONSUMER,
-      attributes: {
-        'question.id': questionId.toString(),
-        'worker.id': workerId,
-      },
-    });
-    try {
-      const collector = collectors.get(questionId.toString());
-      if (!collector || collector.finished) {
-        span.setAttribute('dispatch.answer_accepted', false);
-        return false;
-      }
-      // Screen before recording: a filtered answer must never count
-      // toward quorum or consensus.
-      const screened = screenAnswer(answer);
-      if (!screened.ok) {
-        span.setAttribute('dispatch.answer_accepted', false);
-        span.setAttribute('dispatch.answer_filtered', screened.reason);
-        return false;
-      }
-      collector.submissions.set(workerId, answer);
-      span.setAttribute('dispatch.answer_accepted', true);
-      span.setAttribute('dispatch.submissions', collector.submissions.size);
-      if (collector.submissions.size >= collector.quorumSize) {
-        collector.finished = true;
-        await collector.finish(collector.submissions);
-      }
-      span.setStatus({ code: SpanStatusCode.OK });
-      return true;
     } catch (err) {
       span.recordException(err);
       span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
