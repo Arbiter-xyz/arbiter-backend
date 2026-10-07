@@ -19,10 +19,12 @@
 // caller is safe, not just resolveTier()'s explicit hasOwnProperty check.
 export const PRICING_TIERS = Object.freeze(
   Object.assign(Object.create(null), {
-    instant: Object.freeze({ key: 'instant', quorumSize: 0, priceStroops: 500_000n }),
-    standard: Object.freeze({ key: 'standard', quorumSize: 3, priceStroops: 2_500_000n }),
-    express: Object.freeze({ key: 'express', quorumSize: 2, priceStroops: 4_000_000n }),
-    priority: Object.freeze({ key: 'priority', quorumSize: 5, priceStroops: 6_000_000n }),
+    // instant: no-quorum AI draft, fulfilled directly and never dispatched.
+    instant: Object.freeze({ key: 'instant', instant: true, quorumSize: 0, timeoutMs: 0, priceStroops: 500_000n }),
+    standard: Object.freeze({ key: 'standard', instant: false, quorumSize: 3, timeoutMs: 45_000, preferEstablished: false, priceStroops: 2_500_000n }),
+    express: Object.freeze({ key: 'express', instant: false, quorumSize: 2, timeoutMs: 12_000, preferEstablished: false, priceStroops: 4_000_000n }),
+    // Priority buys the highest-confidence consensus: route to proven workers first.
+    priority: Object.freeze({ key: 'priority', instant: false, quorumSize: 5, timeoutMs: 30_000, preferEstablished: true, priceStroops: 6_000_000n }),
   }),
 );
 
@@ -46,9 +48,9 @@ export function resolveTier(tierKey) {
 
 /** Stroops (BigInt or numeric string) to a USDC decimal string for display. */
 export function stroopsToUsdc(stroops) {
-  const n = typeof stroops === 'bigint' ? stroops : BigInt(stroops);
-  const whole = n / 10_000_000n;
-  const frac = (n % 10_000_000n).toString().padStart(7, '0').replace(/0+$/, '') || '0';
+  const s = BigInt(stroops);
+  const whole = s / 10_000_000n;
+  const frac = (s % 10_000_000n).toString().padStart(7, '0');
   return `${whole}.${frac}`;
 }
 
@@ -140,3 +142,27 @@ export function priceForTierWithVolumeDiscount(tierKey, onlineWorkers, volume) {
   return { ...priced, priceStroops, discountMultiplier };
 }
 
+/**
+ * Price actually charged for an escalating tier once the recruited worker
+ * count is known: a share of the ceiling per worker, at least one share, never
+ * more than the ceiling. Tiers without escalation are fixed-price.
+ */
+export function effectiveEscalatedPriceStroops(tier, recruitedWorkers) {
+  if (!tier.escalation) return tier.priceStroops;
+  const { maxQuorum } = tier.escalation;
+  const n = Math.min(Math.max(Math.trunc(Number(recruitedWorkers)) || 0, 1), maxQuorum);
+  return (tier.priceStroops * BigInt(n)) / BigInt(maxQuorum);
+}
+
+export function listTiersForClient() {
+  return Object.values(PRICING_TIERS).map((t) => ({
+    key: t.key,
+    amount: stroopsToUsdc(t.priceStroops),
+    amountStroops: t.priceStroops.toString(),
+    quorumSize: t.quorumSize,
+    timeoutMs: t.timeoutMs,
+    ...(t.escalation
+      ? { escalating: true, initialQuorum: t.escalation.initialQuorum, maxQuorum: t.escalation.maxQuorum }
+      : {}),
+  }));
+}

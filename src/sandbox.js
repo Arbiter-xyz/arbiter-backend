@@ -3,7 +3,13 @@ import { resolveTier } from './pricing.js';
 import { exactMatchVote, draftAnswer } from './reconcile.js';
 import { config } from './config.js';
 import { jobLogger } from './logger.js';
-import { tryConsumeClaudeBudget } from './claudeBudget.js';
+import { reserveClaudeBudget } from './rateLimit.js';
+
+// Conservative per-call estimate for one short draft exchange (roughly
+// 500-1000 input and 200-500 output tokens at current Sonnet pricing). The
+// fleet cap bounds worst-case abuse, not exact spend, so this reservation is
+// treated as final rather than reconciled with settleClaudeBudget.
+const SANDBOX_CLAUDE_COST_CENTS = 2;
 
 /**
  * Sandbox mode: ask a question with zero real payment and get a realistic,
@@ -32,7 +38,7 @@ import { tryConsumeClaudeBudget } from './claudeBudget.js';
  * answer." Cost exposure from a free, unauthenticated endpoint calling a
  * paid API is bounded by the existing per-IP sandbox rate limit
  * (SANDBOX_RATE_LIMIT_MAX) AND by the fleet-wide rolling Claude budget
- * (claudeBudget.js) — when that budget is exhausted, this path cleanly
+ * (rateLimit.js) — when that budget is exhausted, this path cleanly
  * falls back to the canned response instead of calling Claude, so a
  * distributed attacker can't multiply real spend across many IPs.
  * Every response is unambiguously tagged `sandbox: true` and fake tx
@@ -134,7 +140,7 @@ async function runSandboxFulfillment(questionId, questionText, mode) {
     // If the rolling budget is exhausted (e.g. distributed abuse across
     // many IPs), skip Claude entirely and fall through to the canned path
     // below — a clean, deterministic response, never a hung request.
-    const allowed = await tryConsumeClaudeBudget('sandbox');
+    const allowed = await reserveClaudeBudget(SANDBOX_CLAUDE_COST_CENTS);
     if (allowed) {
       const draft = await draftAnswer(questionText, questionId);
       if (draft) {
