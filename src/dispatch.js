@@ -6,6 +6,8 @@ import { getPushEligibleWorkerIds, notifyWorker } from './push.js';
 import { getStakeOnChain, touchWorker } from './stellarClient.js';
 import { jobLogger, logger } from './logger.js';
 import { isCollusionSuspended } from './collusion.js';
+import { recordWorkerActivity } from './workerAnalytics.js';
+import { syncBadges } from './gamification.js';
 import { trace, context, propagation, SpanKind, SpanStatusCode } from '@opentelemetry/api';
 
 // Live worker registry — inherently process-local because it holds open SSE
@@ -106,11 +108,13 @@ async function publishAnswer(questionId, workerId, answer, traceparent) {
  * instance over pub/sub. This is the single routing decision that makes
  * cross-instance quorum collection work.
  */
-export async function submitAnswer(questionId, workerId, answer, traceparent) {
+export function submitAnswer(questionId, workerId, answer, traceparent) {
   if (collectors.has(questionId)) {
     return handleAnswer(questionId, workerId, answer, traceparent);
   }
-  return publishAnswer(questionId, workerId, answer, traceparent);
+  if (typeof store.publish !== 'function') return false;
+  publishAnswer(questionId, workerId, answer, traceparent);
+  return true;
 }
 
 /**
@@ -123,9 +127,9 @@ export async function submitAnswer(questionId, workerId, answer, traceparent) {
  * worker already answered, or when content screening rejects the answer —
  * a filtered answer must never count toward quorum.
  */
-async function handleAnswer(questionId, workerId, answer, traceparent) {
+function handleAnswer(questionId, workerId, answer, traceparent) {
   const parentCtx = contextFromTraceparent(traceparent);
-  return context.with(parentCtx, async () => {
+  return context.with(parentCtx, () => {
     const span = tracer().startSpan('dispatch.answer', {
       kind: SpanKind.CONSUMER,
       attributes: {
@@ -144,6 +148,13 @@ async function handleAnswer(questionId, workerId, answer, traceparent) {
         span.setAttribute('dispatch.answer_duplicate', true);
         return false;
       }
+      // Private pools fail closed: a worker who learns a private question's id
+      // out of band still can't answer unless they were dispatched to.
+      if (collector.whitelist && !collector.whitelist.has(workerId)) {
+        span.setAttribute('dispatch.answer_accepted', false);
+        span.setAttribute('dispatch.answer_not_whitelisted', true);
+        return false;
+      }
       const screened = screenAnswer(answer);
       if (!screened.ok) {
         span.setAttribute('dispatch.answer_accepted', false);
@@ -156,7 +167,8 @@ async function handleAnswer(questionId, workerId, answer, traceparent) {
       if (collector.submissions.size >= collector.quorumSize) {
         collector.finished = true;
         unsubscribeFromAnswers(questionId);
-        await collector.finish(collector.submissions);
+        const settled = collector.finish(collector.submissions);
+        if (settled?.catch) settled.catch((err) => jobLogger(questionId).error({ err }, 'quorum finish failed'));
       }
       span.setStatus({ code: SpanStatusCode.OK });
       return true;
@@ -464,7 +476,7 @@ async function selectTargets(category, { preferEstablished = false, quorumSize =
   return established.length >= quorumSize ? established : pool;
 }
 
-export async function broadcast(questionId, questionText, { category, quorumSize, expiresInMs, preferEstablished, traceparent } = {}) {
+export async function broadcast(questionId, questionText, { category, quorumSize, expiresInMs, preferEstablished, whitelist, traceparent } = {}) {
   // Re-enter the question's trace context (generated at creation time in
   // jobs.js) so the dispatch span is a child of the same trace, and inject
   // the current traceparent into the SSE payload so workers can echo it back
@@ -487,7 +499,7 @@ export async function broadcast(questionId, questionText, { category, quorumSize
         expiresInMs,
         traceparent: currentTraceparent(),
       };
-      const targets = await selectTargets(category, { preferEstablished, quorumSize });
+      const targets = await selectTargets(category, { preferEstablished, quorumSize, whitelist });
       span.setAttribute('dispatch.recipients', targets.length);
       for (const [, w] of targets) writeSse(w.res, 'question', payload);
 
@@ -502,7 +514,7 @@ export async function broadcast(questionId, questionText, { category, quorumSize
         }
       }
       span.setStatus({ code: SpanStatusCode.OK });
-      return targets.length;
+      return targets.map(([id]) => id);
     } catch (err) {
       span.recordException(err);
       span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
@@ -549,12 +561,13 @@ export async function recordSettlement(questionId, txHash, { traceparent } = {})
  * trace context so the eventual finish() callback (which triggers settlement)
  * stays on the same trace.
  */
-export function registerCollector(questionId, { quorumSize, finish, traceparent } = {}) {
+export function registerCollector(questionId, { quorumSize, finish, traceparent, whitelist = null } = {}) {
   const parentCtx = contextFromTraceparent(traceparent);
   const collector = {
     submissions: new Map(),
     quorumSize,
     finished: false,
+    whitelist: whitelist ? new Set(whitelist) : null,
     finish: (submissions) => context.with(parentCtx, () => finish(submissions)),
   };
   collectors.set(questionId.toString(), collector);
@@ -569,4 +582,115 @@ export function clearCollector(questionId) {
   collectors.delete(questionId.toString());
 }
 
-/* … truncated 7639 chars — edit only what you need near the top … */
+/**
+ * Trailing-average worker supply, sampled every SUPPLY_SAMPLE_INTERVAL_MS
+ * over a SUPPLY_WINDOW_SAMPLES window (~60s). Used for surge pricing
+ * instead of the instantaneous onlineWorkerCount(): connecting/
+ * disconnecting an SSE stream is free and instant, so pricing off the raw
+ * count rewards a worker cartel that briefly disconnects right before a
+ * question is asked (spiking the multiplier) and reconnects in time to
+ * answer and split the now-inflated pool. Averaging over a real trailing
+ * window forces that cartel to actually sit out genuine dispatch
+ * opportunities for a meaningful stretch to move the price.
+ */
+const SUPPLY_SAMPLE_INTERVAL_MS = 5_000;
+const SUPPLY_WINDOW_SAMPLES = 12;
+const supplySamples = [];
+
+const supplySamplerHandle = setInterval(() => {
+  supplySamples.push(workers.size);
+  if (supplySamples.length > SUPPLY_WINDOW_SAMPLES) supplySamples.shift();
+}, SUPPLY_SAMPLE_INTERVAL_MS);
+supplySamplerHandle.unref?.();
+
+/** Pure averaging math, factored out so it's testable without waiting on
+ * real timers. Falls back to the live count when no samples exist yet
+ * (e.g. right after process start). */
+export function computeSmoothedCount(samples, currentCount) {
+  if (samples.length === 0) return currentCount;
+  const sum = samples.reduce((a, b) => a + b, 0);
+  return Math.round(sum / samples.length);
+}
+
+export function getSmoothedOnlineWorkerCount() {
+  return computeSmoothedCount(supplySamples, workers.size);
+}
+
+/** True when at least one worker in `whitelist` is currently connected. */
+export function hasOnlineWhitelistedWorker(whitelist) {
+  if (!whitelist || whitelist.length === 0) return false;
+  return whitelist.some((id) => workers.has(id));
+}
+
+/** The SSE `suggestion` frame body. Deliberately unverified: it is a
+ * worker-side hint and is never counted as a submission. */
+export function buildSuggestionPayload(questionId, draft) {
+  return {
+    questionId: questionId.toString(),
+    suggestedAnswer: draft.consensus,
+    suggestedConfidence: draft.confidence,
+    unverified: true,
+  };
+}
+
+/**
+ * Dispatches a question to eligible workers and resolves with the answers
+ * that arrived. Resolves early once quorum is reached, immediately when no
+ * one is reachable, and otherwise at timeoutMs with whatever arrived. Never
+ * rejects, so settlement downstream always gets a list it can reconcile.
+ *
+ * `suggestion` is an optional draft promise. It is delivered as a separate
+ * SSE frame once it resolves, so a slow draft can never delay the question,
+ * and it never counts toward quorum.
+ */
+export function dispatchAndCollect(questionId, questionText, {
+  quorumSize,
+  timeoutMs,
+  category,
+  preferEstablished,
+  whitelist,
+  suggestion,
+} = {}) {
+  const qid = questionId.toString();
+  return new Promise((resolve) => {
+    let done = false;
+    let timer = null;
+    const finish = (submissionsMap) => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      clearCollector(qid);
+      resolve([...submissionsMap.entries()].map(([workerId, answer]) => ({ workerId, answer })));
+    };
+
+    registerCollector(qid, { quorumSize, finish, traceparent: currentTraceparent(), whitelist });
+    timer = setTimeout(() => finish(getCollector(qid)?.submissions ?? new Map()), timeoutMs);
+
+    broadcast(qid, questionText, {
+      category,
+      quorumSize,
+      expiresInMs: timeoutMs,
+      preferEstablished,
+      whitelist,
+      traceparent: currentTraceparent(),
+    })
+      .then((recipientIds) => {
+        if (recipientIds.length === 0) finish(new Map());
+      })
+      .catch((err) => {
+        logger.warn({ err, questionId: qid }, 'broadcast failed during dispatchAndCollect');
+        finish(new Map());
+      });
+
+    if (suggestion) {
+      Promise.resolve(suggestion)
+        .then(async (draft) => {
+          if (!draft || done) return;
+          const targets = await selectTargets(category, { preferEstablished, quorumSize, whitelist });
+          for (const [, w] of targets) writeSse(w.res, 'suggestion', buildSuggestionPayload(qid, draft));
+        })
+        .catch(() => {});
+    }
+  });
+}
+

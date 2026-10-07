@@ -244,6 +244,20 @@ export const config = Object.freeze({
     maxRefundsPerSweep: num(process.env.RECOVERY_MAX_REFUNDS_PER_SWEEP, 50),
   }),
 
+  // Auto-withdraw (autoWithdraw.js): lets a worker opt in to a sweep that
+  // withdraws their Owed balance automatically once it crosses a threshold,
+  // instead of a manual withdraw() every time.
+  autoWithdraw: Object.freeze({
+    // Floor on the threshold a worker can set, so the sweep can't be
+    // configured to fire on dust amounts not worth a network fee.
+    minThresholdStroops: num(process.env.AUTO_WITHDRAW_MIN_THRESHOLD_STROOPS, 10_000_000),
+    // How long a built-but-unsigned withdraw transaction stays valid before
+    // the worker must request a fresh one.
+    pendingTtlMs: num(process.env.AUTO_WITHDRAW_PENDING_TTL_MS, 10 * 60 * 1000),
+    // How often the sweep checks every opted-in worker's Owed balance.
+    sweepIntervalMs: num(process.env.AUTO_WITHDRAW_SWEEP_INTERVAL_MS, 60 * 60 * 1000),
+  }),
+
   // Alert drill only (faultInjection.js). Refused in production by
   // securityPosture.js.
   faultInjection: process.env.ARBITER_FAULT_INJECTION === 'true',
@@ -364,6 +378,12 @@ export const config = Object.freeze({
   // has no user-account system anywhere, so a bearer token is consistent
   // with everything else here. Multi-operator auth is a real follow-up,
   // not something to invent ahead of need.
+  // Home domain of the SEP-24/SEP-12 fiat anchor (anchorClient.js). Unset
+  // disables /anchor/* entirely.
+  anchor: Object.freeze({
+    homeDomain: process.env.ANCHOR_HOME_DOMAIN || '',
+  }),
+
   admin: Object.freeze({
     token: process.env.ADMIN_TOKEN || '',
   }),

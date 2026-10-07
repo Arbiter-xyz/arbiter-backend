@@ -8,9 +8,34 @@ import { getHorizon } from './sponsor.js';
 import { config } from './config.js';
 import { stroopsToUsdc } from './pricing.js';
 import { getClient } from './reconcile.js';
+import { store } from './store.js';
+import { createAccount, unsuspendAccount } from './billing.js';
 
 const PLATFORM_FEE_BPS = 2000n; // mirrors contracts/oracle-escrow/src/lib.rs's PLATFORM_FEE_BPS
 const BPS_DENOM = 10_000n;
+
+// Page size for every paginated admin listing (listTransactions,
+// listAnchorPayouts, etc.) when the caller doesn't specify one.
+const DEFAULT_LIMIT = 50;
+
+// Bound on concurrent per-item lookups in mapWithConcurrency — keeps a
+// paginated listing from firing e.g. 200 simultaneous anchor API calls.
+const MAX_CONCURRENCY = 5;
+
+/** Maps `items` through `fn`, running at most `limit` calls concurrently.
+ * Preserves input order in the returned array. */
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
 
 /** Tool-forced Claude call, structurally modeled on reconcile.js's
  * REPORT_CONSENSUS_TOOL / reconcileWithClaude() pattern: a single tool whose

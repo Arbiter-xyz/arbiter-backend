@@ -108,6 +108,26 @@ export const probeErrorsTotal = new client.Counter({
   registers: [registry],
 });
 
+export const fiatPoolBalanceStroops = new client.Gauge({
+  name: 'arbiter_fiat_pool_balance_stroops',
+  help: 'Current balance of the pooled fiat-onramp custody address, in stroops.',
+  registers: [registry],
+});
+
+export const billingReservationCount = new client.Counter({
+  name: 'arbiter_billing_reservation_total',
+  help: 'Fiat-credit reservations against a customer balance, by outcome (reserved, insufficient).',
+  labelNames: ['outcome'],
+  registers: [registry],
+});
+
+export const billingSettlementCount = new client.Counter({
+  name: 'arbiter_billing_settlement_total',
+  help: 'Fiat-credit reservations settled against an actual charge, by outcome (charged, refunded).',
+  labelNames: ['outcome'],
+  registers: [registry],
+});
+
 // --- Disaster recovery (disasterRecovery.js) -------------------------------
 
 export const onchainPendingQuestions = new client.Gauge({

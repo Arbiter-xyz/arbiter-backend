@@ -4,8 +4,10 @@ import { dispatchAndCollect, recordOutcome, getReputation, getSmoothedOnlineWork
 import { assessQuorum, recordQuorumObservation } from './collusion.js';
 import { reconcile, draftAnswer } from './reconcile.js';
 import { resolveQuestion, refundQuestion, getQuestionOnChain } from './stellarClient.js';
+import { getDispatchPause, describePause } from './maintenanceWindows.js';
 import { resolveTier, listTiersForClient, stroopsToUsdc, priceForTier, effectiveEscalatedPriceStroops } from './pricing.js';
 import { incrementStat } from './stats.js';
+import { DEFAULT_CONSENSUS_MODE } from './consensus.js';
 import { recordPayerQuestion } from './payerIndex.js';
 import { getPrivatePool } from './privatePools.js';
 import { notifyWorker } from './push.js';
@@ -171,6 +173,10 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
 
   const holdMs = undoWindowFor(tier);
   const cancellableUntil = holdMs > 0 ? Date.now() + holdMs : null;
+  // A payer's private pool (privatePools.js) restricts dispatch to exactly
+  // their whitelisted workers. Empty pool = open network, as before.
+  const poolMembers = await getPrivatePool(payerAddress);
+  const dispatchable = { ...pending, whitelist: poolMembers.length > 0 ? poolMembers : null };
 
   await createJob(questionId, {
     ...(cancellableUntil ? { status: 'holding', cancellableUntil } : {}),
@@ -186,6 +192,7 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
     // of the job record: GET /oracle/:jobId, GET /payers/:address/questions
     // and GET /admin/transactions all spread the full record.
     category: pending.category || null,
+    ...(poolMembers.length > 0 ? { privatePool: true, privatePoolSize: poolMembers.length } : {}),
   });
 
   if (ownerAccountId) {
@@ -197,7 +204,7 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
   if (ownerAccountId) await setJobWebhookOwner(questionId, `account:${ownerAccountId}`);
 
   if (!cancellableUntil) {
-    dispatchUnlessPaused(questionId, pending, tier).catch((err) =>
+    dispatchUnlessPaused(questionId, dispatchable, tier).catch((err) =>
       jobLogger(questionId).error({ err }, 'failed to start dispatch'),
     );
     return { jobId: questionId };
@@ -212,7 +219,7 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
       const pause = await getDispatchPause();
       if (pause) return refundForDispatchPause(questionId, tier, pause);
       await updateJob(questionId, { status: 'awaiting_workers', cancellableUntil: null, dispatchedAt: Date.now() });
-      runFulfillment(questionId, pending, tier);
+      runFulfillment(questionId, dispatchable, tier);
     },
     (err) => jobLogger(questionId).error({ err }, 'failed to start dispatch after the undo window'),
   );
@@ -380,6 +387,7 @@ async function fulfillOracleCall(questionId, pending, tier) {
       timeoutMs: tier.timeoutMs,
       category: pending.category,
       preferEstablished: tier.preferEstablished,
+      whitelist: pending.whitelist,
       suggestion,
     });
   } catch (err) {
@@ -391,6 +399,21 @@ async function fulfillOracleCall(questionId, pending, tier) {
   }
 
   await updateJob(questionId, { status: 'reconciling', totalAnswers: submissions.length });
+
+  // A private pool with nobody online can't be answered by anyone else, so
+  // refund instead of falling back to the open network (fail closed).
+  if (pending.whitelist && submissions.length === 0 && !hasOnlineWhitelistedWorker(pending.whitelist)) {
+    await settleRefunded(questionId, [], {
+      consensus: null,
+      confidence: 0,
+      matchingWorkerIds: [],
+      method: 'no-private-pool-workers',
+      reason: "no worker from this payer's private pool was online to answer",
+    });
+    const owner = await store.get(JOB_OWNER_PREFIX + questionId);
+    if (owner?.apiKeyAccountId) await restoreCredit(owner.apiKeyAccountId, Number(tier.priceStroops));
+    return;
+  }
 
   // A flagged pair (collusion.js) that gave the same answer in this quorum
   // loses the reconcile fast path: their shared track record is exactly
