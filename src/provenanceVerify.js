@@ -96,9 +96,18 @@ function rederive(record) {
       check('fast path correctly not taken', !(vote.allAgree && submissions.every((s) => s.established)));
       const request = reconciliation.llm?.request;
       const prompt = request?.messages?.[0]?.content || '';
-      const submissionsBlock = submissions.map((s) => `Worker ${s.workerId}: "${s.answer}"`).join('\n');
+      const rawBlock = submissions.map((s) => `Worker ${s.workerId}: "${s.answer}"`).join('\n');
+      const wrappedBlock = submissions
+        .map(
+          (s) =>
+            `Worker ${s.workerId}: "<untrusted_worker_answer>${String(s.answer).replace(/<\/?untrusted_worker_answer>/gi, '')}</untrusted_worker_answer>"`,
+        )
+        .join('\n');
       check('LLM prompt contains the committed question', prompt.includes(`Question: "${question}"`));
-      check('LLM prompt contains exactly the committed submissions', prompt.includes(`Worker answers:\n${submissionsBlock}\n\n`));
+      check(
+        'LLM prompt contains exactly the committed submissions',
+        prompt.includes(`Worker answers:\n${wrappedBlock}\n\n`) || prompt.includes(`Worker answers:\n${rawBlock}\n\n`),
+      );
       const input = toolInput(reconciliation.llm?.response, 'report_consensus');
       check('LLM response contains a report_consensus tool call', input !== null);
       if (input) {

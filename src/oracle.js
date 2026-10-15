@@ -573,6 +573,11 @@ async function settleInstantResolved(questionId, result) {
 
 async function settleResolved(questionId, submissions, result) {
   try {
+    const validWorkerIds = new Set(submissions.map((s) => s.workerId));
+    const unknownWorkerIds = (result.matchingWorkerIds || []).filter((id) => !validWorkerIds.has(id));
+    if (unknownWorkerIds.length > 0) {
+      throw new Error(`refusing to resolve with unknown matchingWorkerIds not in submissions: ${unknownWorkerIds.join(', ')}`);
+    }
     const matchingSet = new Set(result.matchingWorkerIds);
     const losingWorkerIds = submissions.map((s) => s.workerId).filter((id) => !matchingSet.has(id));
 
