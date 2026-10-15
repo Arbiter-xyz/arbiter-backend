@@ -368,6 +368,24 @@ export const config = Object.freeze({
     token: process.env.ADMIN_TOKEN || '',
   }),
 
+  // The non-crypto onramp (see billing.js): API-key customers pay in fiat or
+  // crypto via Stripe, PayPal, or Coinbase Commerce and are settled on-chain
+  // from ONE pooled balance under this dedicated identity.
+  billing: {
+    stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
+    stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
+    paypalClientId: process.env.PAYPAL_CLIENT_ID || '',
+    paypalClientSecret: process.env.PAYPAL_CLIENT_SECRET || '',
+    paypalWebhookId: process.env.PAYPAL_WEBHOOK_ID || '',
+    paypalApiBase: process.env.PAYPAL_API_BASE || 'https://api-m.paypal.com',
+    coinbaseCommerceApiKey: process.env.COINBASE_COMMERCE_API_KEY || '',
+    coinbaseCommerceWebhookSecret: process.env.COINBASE_COMMERCE_WEBHOOK_SECRET || '',
+    fiatPoolSecret: process.env.FIAT_POOL_SECRET || '',
+    fiatPoolAddress: process.env.FIAT_POOL_ADDRESS || '',
+    usdToStroops: 10_000_000n,
+    minTopupUsd: num(process.env.MIN_TOPUP_USD, 10),
+  },
+
   // Settlement webhooks (see webhooks.js for registration/validation and
   // webhookDelivery.js for signing/retry). Delivery is best-effort and
   // never on the settlement path; these bound how hard it tries.
