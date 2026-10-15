@@ -106,7 +106,19 @@ export async function erasePayerRecords(payerAddress) {
  * broken row.
  */
 export function summarizePayerQuestions(ids, jobs) {
-  const questions = ids.map((questionId, i) => ({ questionId, ...jobs[i] })).filter((q) => q.status);
+  const questions = ids
+    .map((questionId, i) => {
+      const job = jobs[i];
+      if (!job) return { questionId };
+      return {
+        questionId,
+        ...job,
+        ...(job.cancellableUntil
+          ? { cancelableUntil: job.cancellableUntil, cancelUrl: `/oracle/${questionId}/cancel` }
+          : {}),
+      };
+    })
+    .filter((q) => q.status);
 
   const totalSpendStroops = questions.reduce((sum, q) => sum + BigInt(q.amountStroops || 0), 0n);
   const resolved = questions.filter((q) => q.outcome === 'resolved').length;

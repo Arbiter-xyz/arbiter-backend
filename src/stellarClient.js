@@ -253,19 +253,19 @@ export async function resolveQuestion(questionId, matchingWorkerAddresses, losin
   ]);
 }
 
-/** Batch-aware variant of resolve(): settles several questions' worth of
- * fee/slash bookkeeping in ONE platform-signed transaction, cutting the
- * per-question serialization + network-fee cost that resolveQuestion()
- * pays individually. Each entry carries its own matching/losing worker
- * sets, so a batch can mix questions with different outcomes.
- *
- * The contract's resolve_batch() is expected to settle each member
- * independently and return a per-question outcome vector (e.g. one of
- * "resolved" / "not_pending" / "already_refunded"), so a single member
- * losing the refund_timeout() race does NOT fail the whole batch — the
- * caller inspects the returned outcomes and tags only the racing member
- * as lost_race_to_timeout_refund. */
-export async function resolveQuestionsBatch(entries) {
+/**
+ * NOTE (Speculative / Pending arbiter-contract#20 — see #233):
+ * `resolve_batch` and `refund_batch` do not exist yet in `arbiter-contract`
+ * (`src/lib.rs`). These helpers encode the intended batch ABI and will fail
+ * on-chain until `arbiter-contract#20` ships the matching contract functions.
+ * Pass `{ allowSpeculativeBatch: true }` once the contract entry point is
+ * deployed; otherwise callers receive a clear error upfront rather than an
+ * opaque Soroban host error at transaction submission time.
+ */
+export async function resolveQuestionsBatch(entries, { allowSpeculativeBatch = false } = {}) {
+  if (!allowSpeculativeBatch) {
+    throw new Error('resolve_batch is not yet implemented in arbiter-contract (see arbiter-contract#20 / #233)');
+  }
   const questionIds = entries.map((e) => u64Arg(e.questionId));
   const matching = entries.map((e) => vecOfAddresses(e.matchingWorkerAddresses ?? []));
   const losing = entries.map((e) => vecOfAddresses(e.losingWorkerAddresses ?? []));
@@ -276,12 +276,15 @@ export async function resolveQuestionsBatch(entries) {
   ]);
 }
 
-/** Batch-aware variant of refund(): force-refunds several questions in one
- * platform-signed transaction. Mirrors resolveQuestionsBatch()'s
- * per-question independence — a member already resolved or already
- * refunded is reported in the returned outcome vector rather than
- * aborting the whole batch. */
-export async function refundQuestionsBatch(questionIds) {
+/**
+ * NOTE (Speculative / Pending arbiter-contract#20 — see #233):
+ * `refund_batch` does not exist yet in `arbiter-contract` (`src/lib.rs`).
+ * Throws upfront unless `{ allowSpeculativeBatch: true }` is passed.
+ */
+export async function refundQuestionsBatch(questionIds, { allowSpeculativeBatch = false } = {}) {
+  if (!allowSpeculativeBatch) {
+    throw new Error('refund_batch is not yet implemented in arbiter-contract (see arbiter-contract#20 / #233)');
+  }
   return invokeAsAdmin('refund_batch', [
     nativeToScVal(questionIds.map((id) => u64Arg(id)), { type: 'Vec' }),
   ]);
