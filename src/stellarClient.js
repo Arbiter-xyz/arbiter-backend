@@ -1,7 +1,29 @@
+import { createHash } from 'node:crypto';
 import { Keypair, TransactionBuilder, Contract, Account, Address, nativeToScVal, scValToNative, rpc } from '@stellar/stellar-sdk';
 import { config } from './config.js';
 import { withRetry } from './retry.js';
 import { recordAdminInvocation } from './metrics.js';
+import { canonicalJson } from './provenanceVerify.js';
+
+/**
+ * Machine-readable mapping of `arbiter-contract`'s `#[repr(u32)] pub enum ContractError`
+ * (see repo-root `src/lib.rs` and `docs/versioning.md` in `Arbiter-xyz/arbiter-contract`).
+ * Keeping numeric codes in one exported table rather than hand-typed regexes in route
+ * handlers ensures any contract error-code renumbering (Class D breaking change) has a
+ * single explicit source of truth (#236).
+ */
+export const CONTRACT_ERROR_CODES = Object.freeze({
+  INSUFFICIENT_BALANCE: 13,
+});
+
+export function isContractError(err, code) {
+  const msg = typeof err === 'string' ? err : err?.message || '';
+  return new RegExp(`Error\\(Contract,\\s*#${Number(code)}\\)`).test(msg);
+}
+
+export function isInsufficientBalanceError(err) {
+  return isContractError(err, CONTRACT_ERROR_CODES.INSUFFICIENT_BALANCE);
+}
 
 /** Chaos fault injection: env-gated, inert unless CHAOS_FAULT is set to a
  * recognized scenario. Follows config.js's "everything is an env var with a
@@ -121,6 +143,34 @@ export function vecOfAddresses(addresses) {
     addresses.map((a) => new Address(a)),
     { type: 'Vec' },
   );
+}
+
+/**
+ * Computes the 32-byte SHA-256 notarization digest (`BytesN<32>`) over the
+ * canonical JSON `{ question, answer }` pair for `resolve(env, question_id,
+ * workers, losing_workers, answer_hash)` (#232, arbiter-contract #59/#173).
+ */
+export function computeAnswerHash(question, consensusAnswer) {
+  const payload = canonicalJson({
+    question: String(question ?? ''),
+    answer: String(consensusAnswer ?? ''),
+  });
+  return createHash('sha256').update(payload, 'utf8').digest();
+}
+
+export function bytes32Arg(hashInput) {
+  let buf;
+  if (Buffer.isBuffer(hashInput) || hashInput instanceof Uint8Array) {
+    buf = Buffer.from(hashInput);
+  } else if (typeof hashInput === 'string' && /^[0-9a-fA-F]{64}$/.test(hashInput)) {
+    buf = Buffer.from(hashInput, 'hex');
+  } else {
+    throw new Error('answerHash must be a 32-byte Buffer/Uint8Array or 64-char hex string');
+  }
+  if (buf.length !== 32) {
+    throw new Error(`answerHash must be 32 bytes, got ${buf.length}`);
+  }
+  return nativeToScVal(buf, { type: 'bytes' });
 }
 
 /** Builds, prepares (simulates + assembles auth/footprint), signs as the
@@ -245,11 +295,17 @@ export function rotateContractIdAfterDrain(newContractId) {
   return serializeAdminCall(() => rotateContractId(newContractId));
 }
 
-export async function resolveQuestion(questionId, matchingWorkerAddresses, losingWorkerAddresses = []) {
+export async function resolveQuestion(
+  questionId,
+  matchingWorkerAddresses,
+  losingWorkerAddresses = [],
+  answerHash = computeAnswerHash('', ''),
+) {
   return invokeAsAdmin('resolve', [
     u64Arg(questionId),
     vecOfAddresses(matchingWorkerAddresses),
     vecOfAddresses(losingWorkerAddresses),
+    bytes32Arg(answerHash),
   ]);
 }
 

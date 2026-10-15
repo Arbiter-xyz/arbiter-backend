@@ -3,7 +3,7 @@ import { createJob, updateJob, getJob, claimJob } from './jobs.js';
 import { dispatchAndCollect, recordOutcome, getReputation, getSmoothedOnlineWorkerCount, hasOnlineWhitelistedWorker } from './dispatch.js';
 import { assessQuorum, recordQuorumObservation } from './collusion.js';
 import { reconcile, draftAnswer } from './reconcile.js';
-import { resolveQuestion, refundQuestion, getQuestionOnChain } from './stellarClient.js';
+import { resolveQuestion, refundQuestion, getQuestionOnChain, computeAnswerHash } from './stellarClient.js';
 import { resolveTier, listTiersForClient, stroopsToUsdc, priceForTier, effectiveEscalatedPriceStroops } from './pricing.js';
 import { incrementStat } from './stats.js';
 import { recordPayerQuestion } from './payerIndex.js';
@@ -423,7 +423,7 @@ async function fulfillOracleCall(questionId, pending, tier) {
   await commitProvenance(questionId, pending, tier, submissions, result, shouldResolve ? 'resolve' : 'refund');
 
   if (shouldResolve) {
-    await settleResolved(questionId, submissions, result);
+    await settleResolved(questionId, submissions, result, pending);
   } else {
     await settleRefunded(questionId, submissions, result);
   }
@@ -524,16 +524,17 @@ async function fulfillInstant(questionId, pending, tier) {
   await commitProvenance(questionId, pending, tier, [], result, resolved ? 'resolve' : 'refund');
 
   if (resolved) {
-    await settleInstantResolved(questionId, result);
+    await settleInstantResolved(questionId, result, pending);
   } else {
     await settleRefunded(questionId, [], result);
   }
   await recordSettlementProvenance(questionId);
 }
 
-async function settleInstantResolved(questionId, result) {
+async function settleInstantResolved(questionId, result, pending) {
   try {
-    const { hash } = await resolveQuestion(questionId, [config.platformAddress], []);
+    const answerHash = computeAnswerHash(pending?.question, result.consensus);
+    const { hash } = await resolveQuestion(questionId, [config.platformAddress], [], answerHash);
     await dropStashedQuestion(questionId);
     await incrementStat('resolved');
     const job = await updateJob(questionId, {
@@ -571,12 +572,13 @@ async function settleInstantResolved(questionId, result) {
   }
 }
 
-async function settleResolved(questionId, submissions, result) {
+async function settleResolved(questionId, submissions, result, pending) {
   try {
     const matchingSet = new Set(result.matchingWorkerIds);
     const losingWorkerIds = submissions.map((s) => s.workerId).filter((id) => !matchingSet.has(id));
+    const answerHash = computeAnswerHash(pending?.question, result.consensus);
 
-    const { hash } = await resolveQuestion(questionId, result.matchingWorkerIds, losingWorkerIds);
+    const { hash } = await resolveQuestion(questionId, result.matchingWorkerIds, losingWorkerIds, answerHash);
     await recordReputationOutcomes(questionId, submissions, result.matchingWorkerIds);
     await dropStashedQuestion(questionId);
     await incrementStat('resolved');
