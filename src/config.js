@@ -55,20 +55,51 @@ const SESSION_SECRET = sessionSecret();
 // Graceful SESSION_SECRET rotation (#7): during a bounded grace window,
 // session verification also accepts tokens signed by the immediately-prior
 // secret (SESSION_SECRET_PREVIOUS). The window is measured from process
-// start (i.e. from when the rotation was deployed). 0 disables it.
+// start (i.e. from when the rotation was deployed) or an explicit
+// SESSION_SECRET_ROTATED_AT timestamp. 0 disables it.
 const SESSION_SECRET_PREVIOUS = process.env.SESSION_SECRET_PREVIOUS || '';
-const SESSION_SECRET_ROTATION_GRACE_MS = num(process.env.SESSION_SECRET_ROTATION_GRACE_MS, 0);
-const SESSION_SECRET_ROTATION_STARTED_AT = Date.now();
+const SESSION_SECRET_ROTATION_GRACE_MS = num(
+  process.env.SESSION_SECRET_ROTATION_GRACE_MS ?? process.env.SESSION_SECRET_GRACE_MS,
+  0,
+);
+const SESSION_SECRET_ROTATION_STARTED_AT = num(process.env.SESSION_SECRET_ROTATED_AT, Date.now());
 
-function sessionSecrets() {
-  const secrets = [SESSION_SECRET];
+function activeSessionSecret() {
+  const envVal = process.env.SESSION_SECRET;
+  if (envVal && envVal !== 'undefined') return envVal;
+  return SESSION_SECRET;
+}
+
+function previousSessionSecret() {
+  const envVal = process.env.SESSION_SECRET_PREVIOUS;
+  if (envVal === 'undefined') return SESSION_SECRET;
+  return envVal || SESSION_SECRET_PREVIOUS;
+}
+
+function rotationGraceMs() {
+  return num(
+    process.env.SESSION_SECRET_ROTATION_GRACE_MS ?? process.env.SESSION_SECRET_GRACE_MS,
+    SESSION_SECRET_ROTATION_GRACE_MS,
+  );
+}
+
+function rotatedAtMs() {
+  return num(process.env.SESSION_SECRET_ROTATED_AT, SESSION_SECRET_ROTATION_STARTED_AT);
+}
+
+function sessionSecrets(now = Date.now()) {
+  const current = activeSessionSecret();
+  const previous = previousSessionSecret();
+  const graceMs = rotationGraceMs();
+  const rotatedAt = rotatedAtMs();
+  const secrets = [current];
   if (
-    SESSION_SECRET_PREVIOUS &&
-    SESSION_SECRET_PREVIOUS !== SESSION_SECRET &&
-    SESSION_SECRET_ROTATION_GRACE_MS > 0 &&
-    Date.now() - SESSION_SECRET_ROTATION_STARTED_AT < SESSION_SECRET_ROTATION_GRACE_MS
+    previous &&
+    previous !== current &&
+    graceMs > 0 &&
+    now - rotatedAt <= graceMs
   ) {
-    secrets.push(SESSION_SECRET_PREVIOUS);
+    secrets.push(previous);
   }
   return secrets;
 }
@@ -346,7 +377,12 @@ export const config = Object.freeze({
   }),
 
   session: Object.freeze({
-    secret: SESSION_SECRET,
+    get secret() {
+      return activeSessionSecret();
+    },
+    get previousSecret() {
+      return previousSessionSecret();
+    },
     // How long a worker's session (proven once via a signed challenge
     // transaction) stays valid before they'd need to re-authenticate.
     ttlMs: num(process.env.WORKER_SESSION_TTL_MS, 12 * 60 * 60 * 1000),
@@ -355,9 +391,16 @@ export const config = Object.freeze({
     // window is open). Verification must accept a match from any of these;
     // signing always uses `secret`. Empty/absent previous secret or a 0
     // grace window yields a single-element list — identical to today.
-    secrets: sessionSecrets,
+    get secrets() {
+      return sessionSecrets();
+    },
     // Length of the rotation grace window in ms (0 = disabled).
-    rotationGraceMs: SESSION_SECRET_ROTATION_GRACE_MS,
+    get rotationGraceMs() {
+      return rotationGraceMs();
+    },
+    get rotatedAt() {
+      return rotatedAtMs();
+    },
   }),
 
   // Single shared operator secret for the /admin/* console — this codebase
