@@ -1,6 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { decodeStatus, createSerialQueue } from '../src/stellarClient.js';
+import { scValToNative } from '@stellar/stellar-sdk';
+import {
+  decodeStatus,
+  createSerialQueue,
+  computeAnswerHash,
+  bytes32Arg,
+  CONTRACT_ERROR_CODES,
+  isContractError,
+  isInsufficientBalanceError,
+} from '../src/stellarClient.js';
 
 // Regression coverage for a real bug found running against a live deployed
 // contract on Stellar testnet (round 6): scValToNative decodes a data-less
@@ -94,3 +103,30 @@ test('createSerialQueue preserves each call\'s own success/failure outcome to it
   assert.equal(c.status, 'fulfilled');
   assert.equal(c.value, 'c');
 });
+
+test('computeAnswerHash produces a deterministic 32-byte SHA-256 digest and bytes32Arg encodes it as ScVal Bytes (#232)', () => {
+  const h1 = computeAnswerHash('What is 2+2?', '4');
+  const h2 = computeAnswerHash('What is 2+2?', '4');
+  const h3 = computeAnswerHash('What is 2+2?', '5');
+
+  assert.equal(Buffer.isBuffer(h1), true);
+  assert.equal(h1.length, 32);
+  assert.deepEqual(h1, h2);
+  assert.notDeepEqual(h1, h3);
+
+  const scValFromBuf = bytes32Arg(h1);
+  const scValFromHex = bytes32Arg(h1.toString('hex'));
+  assert.deepEqual(Buffer.from(scValToNative(scValFromBuf)), h1);
+  assert.deepEqual(Buffer.from(scValToNative(scValFromHex)), h1);
+
+  assert.throws(() => bytes32Arg(Buffer.alloc(16)), /32 bytes/);
+});
+
+test('CONTRACT_ERROR_CODES and isInsufficientBalanceError match Soroban ContractError #13 (#236)', () => {
+  assert.equal(CONTRACT_ERROR_CODES.INSUFFICIENT_BALANCE, 13);
+  assert.equal(isInsufficientBalanceError(new Error('HostError: Error(Contract, #13)')), true);
+  assert.equal(isInsufficientBalanceError(new Error('HostError: Error(Contract, #130)')), false);
+  assert.equal(isContractError('Error(Contract, #13)', 13), true);
+  assert.equal(isContractError('Error(Contract, #14)', 13), false);
+});
+

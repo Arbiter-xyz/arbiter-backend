@@ -26,7 +26,7 @@ import {
   feeBumpWithdrawTo,
 } from './sponsor.js';
 import { getStashedQuestion, nextQuestionId } from './pendingQuestions.js';
-import { getOwedOnChain, getStakeOnChain } from './stellarClient.js';
+import { getOwedOnChain, getStakeOnChain, isInsufficientBalanceError } from './stellarClient.js';
 import { askMetered, getMeteredBalance, depositInstructions } from './metered.js';
 import { getLeaderboard } from './leaderboard.js';
 import { getWorkerDashboard } from './workerAnalytics.js';
@@ -330,11 +330,9 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
       const result = await askMetered(payerAddress, question, tier, category, consensus.rule);
       return res.status(202).json({ ...result, statusUrl: `/oracle/${result.jobId}` });
     } catch (err) {
-      // #13 is ContractError::InsufficientBalance — see contracts/oracle-escrow/src/lib.rs.
-      // Simulation failures surface the raw Soroban error string, not a typed
-      // exception, so this is the same string-matching pattern stellarClient.js
-      // already uses for QuestionNotFound.
-      if (/Error\(Contract, #13\)/.test(err.message || '')) {
+      // ContractError::InsufficientBalance (see stellarClient.js's CONTRACT_ERROR_CODES
+      // and arbiter-contract's repo-root src/lib.rs / docs/versioning.md).
+      if (isInsufficientBalanceError(err)) {
         return res.status(402).json({
           error: 'insufficient prepaid balance',
           ...depositInstructions(payerAddress),
@@ -1232,11 +1230,13 @@ app.get('/admin/fees', requireAdmin, async (req, res) => {
 });
 
 app.get('/admin/payouts', requireAdmin, async (req, res) => {
-  res.json({ payouts: await listAnchorPayouts() });
+  const result = await listAnchorPayouts();
+  res.json({ payouts: Array.isArray(result) ? result : (result?.payouts || []) });
 });
 
 app.get('/admin/kyc', requireAdmin, async (req, res) => {
-  res.json({ customers: await listAnchorKyc() });
+  const result = await listAnchorKyc();
+  res.json({ customers: Array.isArray(result) ? result : (result?.kyc || result?.customers || []) });
 });
 
 app.get('/admin/referrals', requireAdmin, async (req, res) => {
