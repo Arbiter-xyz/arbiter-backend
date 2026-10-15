@@ -107,7 +107,10 @@ function issueSessionToken(address) {
  * deadline passes the old secret is dropped entirely, so a leaked key
  * stops being useful after a bounded, operator-controlled period.
  */
-function acceptedSessionSecrets(now = Date.now()) {
+export function acceptedSessionSecrets(now = Date.now()) {
+  if (now === undefined && Array.isArray(config.session.secrets)) {
+    return config.session.secrets;
+  }
   const secrets = [config.session.secret];
   const previous = config.session.previousSecret;
   const graceMs = config.session.rotationGraceMs;
