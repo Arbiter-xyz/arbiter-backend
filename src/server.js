@@ -416,6 +416,14 @@ app.get('/oracle/:jobId', async (req, res) => {
   return res.status(httpStatus).json({ jobId: req.params.jobId, ...job });
 });
 
+app.post('/oracle/:jobId/cancel', rateLimited('oracle', byIp), async (req, res) => {
+  const apiKeyAccountId = await resolveApiKey(req);
+  const sessionToken = req.body?.token ?? req.body?.sessionToken ?? req.query?.token;
+  const result = await cancelJob(req.params.jobId, { sessionToken, apiKeyAccountId });
+  if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+  return res.json({ jobId: req.params.jobId, ...result.job });
+});
+
 // Public, unauthenticated, same as GET /oracle/:jobId: the full committed
 // reconciliation inputs for a settled question (raw worker submissions, the
 // exact LLM request/response when one was used), the sha256 commitment, and
@@ -458,6 +466,13 @@ app.get('/payers/:address/questions', async (req, res) => {
     spendByCategory,
     spendByDay,
   });
+});
+
+app.post('/payers/:address/questions/:questionId/cancel', rateLimited('oracle', byIp), async (req, res) => {
+  const sessionToken = req.body?.token ?? req.body?.sessionToken ?? req.query?.token;
+  const result = await cancelJob(req.params.questionId, { sessionToken });
+  if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+  return res.json({ jobId: req.params.questionId, ...result.job });
 });
 
 // ---------------------------------------------------------------------
