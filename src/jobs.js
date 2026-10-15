@@ -280,7 +280,7 @@ export async function markPendingReview(jobId, extra = {}) {
     updatedAt: Date.now(),
   };
   await store.set(key, next, config.jobResultTtlMs);
-  settlementsTotal.inc({ outcome: outcome || 'unknown' });
+  await indexReview(jobId);
   return true;
 }
 
@@ -299,7 +299,12 @@ export async function markPendingReview(jobId, extra = {}) {
 export async function approveReview(jobId, outcome, settle) {
   const job = await getJob(jobId);
   if (!job || job.status !== 'pending_review') return null;
-  const settled = await settle(job, outcome);
+  if (outcome !== 'resolved' && outcome !== 'refunded') {
+    throw new Error(`invalid review outcome: ${outcome}`);
+  }
+  const settled = typeof settle === 'function'
+    ? await settle(job, outcome)
+    : await updateJob(jobId, { status: 'settled', outcome, reviewed: true, settledAt: Date.now() });
   await unindexReview(jobId);
   await unescalateItem('review', jobId);
   return settled;

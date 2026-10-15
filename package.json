@@ -1,11 +1,16 @@
 {
-  "name": "backend",
+  "name": "arbiter-backend",
   "version": "1.0.0",
   "description": "Dispatch, settlement, and billing backend",
-  "main": "src/index.js",
+  "type": "module",
+  "main": "src/server.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "lint": "node -e \"import('node:fs').then(async fs => { const { execFileSync } = await import('node:child_process'); for (const f of fs.readdirSync('src').filter(x => x.endsWith('.js'))) execFileSync(process.execPath, ['--check', 'src/' + f], { stdio: 'inherit' }); })\"",
+    "check": "node -e \"import('node:fs').then(async fs => { const { execFileSync } = await import('node:child_process'); for (const f of fs.readdirSync('src').filter(x => x.endsWith('.js'))) execFileSync(process.execPath, ['--check', 'src/' + f], { stdio: 'inherit' }); })\"",
+    "test": "node --test --test-timeout=30000 test/*.test.js",
+    "verify-provenance": "node scripts/verify-provenance.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.0",
