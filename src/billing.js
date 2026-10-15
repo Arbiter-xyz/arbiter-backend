@@ -122,10 +122,7 @@ export async function getCreditBalanceStroops(accountId) {
  * going negative — accruing a balance owed — is the entire point for them.
  */
 export async function reserveCredit(accountId, maxStroops) {
-  const ok = await store.decrIfAtLeast(`credit:${accountId}`, maxStroops);
-  if (ok) billingReservationCount.inc({ outcome: 'reserved' });
-  else billingReservationCount.inc({ outcome: 'insufficient' });
-  return ok;
+  return store.decrIfAtLeast(`credit:${accountId}`, maxStroops);
 }
 
 /** Credits back the unused portion of a reservation. Pass actualStroops=0
@@ -136,23 +133,8 @@ export async function reserveCredit(accountId, maxStroops) {
 export async function settleReservation(accountId, reservedStroops, actualStroops, questionId) {
   const refund = reservedStroops - actualStroops;
   if (refund > 0) await store.incrBy(`credit:${accountId}`, refund);
-  billingSettlementCount.inc({ outcome: actualStroops > 0 ? 'charged' : 'refunded' });
 }
 
-/** Creates a fresh account (and its one API key) and a Stripe Checkout
- * Session to fund it. The raw key is embedded in success_url and shown
- * exactly once on redirect — the same one-time-reveal pattern Stripe
- * itself uses for webhook signing secrets. Losing it means starting over;
- * proactive rotation (with the current key in hand) is available via
- * rotateApiKey(); recovery of a lost key is a deliberate v1 gap.
- *
- * successUrl/cancelUrl are caller-supplied, and the raw key is appended
- * directly to successUrl's query string — without validating the origin,
- * any caller could point successUrl at a domain they control and have
- * Stripe hand a freshly-minted API key straight to them once a real payer
- * completes checkout. Restricted to the same allowlist CORS already
- * enforces (config.allowedOrigins) — a redirect target has to be
- * somewhere this backend already trusts to run frontend code at all. */
 /**
  * Puts credit back on an API-key account — used when the customer cancels a
  * question inside the undo window (see oracle.js's cancelJob). The on-chain
@@ -174,23 +156,6 @@ export function isAllowedRedirectUrl(url) {
 
 /**
  * Apple Pay / Google Pay quick-checkout (issue #105).
- *
- * Stripe Checkout auto-detects and offers Apple Pay / Google Pay on
- * supporting devices/browsers whenever the account has those payment
- * methods enabled — no `payment_method_types` array is needed here, and
- * passing one would actually *narrow* the methods offered. The only
- * code-side requirement is that the Checkout Session's redirect URLs
- * (success_url/cancel_url) live on a domain that has been registered with
- * Stripe for Apple Pay domain verification; that domain is exactly the
- * origin isAllowedRedirectUrl() already restricts to config.allowedOrigins,
- * so the existing allowlist is the single source of truth for both the
- * redirect-safety check and Apple Pay's domain-association requirement.
- *
- * This helper exists so the domain-verification requirement is explicit
- * and testable rather than an implicit assumption: it returns the origin
- * Stripe will associate with the session, or null when the URL is not on
- * an allowed origin (in which case createCheckoutSession() would already
- * have rejected it).
  */
 export function getApplePayVerificationOrigin(url) {
   if (!isAllowedRedirectUrl(url)) return null;
@@ -201,9 +166,15 @@ export function getApplePayVerificationOrigin(url) {
   }
 }
 
-export async function createCheckoutSession(amountUsd, successUrl, cancelUrl) {
-  if (!Number.isFinite(amountUsd) || amountUsd < config.billing.minTopupUsd) {
-    throw new Error(`amountUsd must be a number >= ${config.billing.minTopupUsd}`);
+export const SUPPORTED_CURRENCIES = {
+  usd: { minorUnits: 100, usdPerUnit: 1 },
+  eur: { minorUnits: 100, usdPerUnit: 1.08 },
+  gbp: { minorUnits: 100, usdPerUnit: 1.27 },
+};
+
+export function resolveCurrency(currency) {
+  if (typeof currency !== 'string') {
+    throw new Error('currency must be a string');
   }
   const code = currency.trim().toLowerCase();
   if (!/^[a-z]{3}$/.test(code) || !SUPPORTED_CURRENCIES[code]) {
@@ -232,7 +203,7 @@ function fiatToStroops(amount, currency) {
  * abstraction: same account creation, same session metadata snapshot, same
  * signature verification and idempotent event handling.
  */
-const stripeProcessor = {
+export const stripeProcessor = {
   name: 'stripe',
   isConfigured: () => isProcessorConfigured('stripe'),
 
@@ -306,7 +277,7 @@ const stripeProcessor = {
  * endpoint for signature validation. Event ids are namespaced under
  * `paypal-event:` so they can never collide with Stripe's dedup keys.
  */
-const paypalProcessor = {
+export const paypalProcessor = {
   name: 'paypal',
   isConfigured: () => isProcessorConfigured('paypal'),
 
@@ -398,7 +369,7 @@ const paypalProcessor = {
  * for webhook verification. Event ids are namespaced under
  * `coinbase-event:`.
  */
-const coinbaseProcessor = {
+export const coinbaseProcessor = {
   name: 'coinbase',
   isConfigured: () => isProcessorConfigured('coinbase'),
 
@@ -483,6 +454,35 @@ export function getProcessor(name) {
 /** Names of every processor that is currently configured. */
 export function configuredProcessors() {
   return Object.keys(PROCESSORS).filter((name) => PROCESSORS[name].isConfigured());
+}
+
+/**
+ * Processor-agnostic checkout entry point. Defaults to Stripe so existing
+ * callers (POST /billing/checkout) keep their exact behavior; callers may
+ * pass a processor name to route to PayPal or Coinbase Commerce instead.
+ */
+export async function createCheckoutSession(amountUsd, successUrl, cancelUrl, currency = 'usd', processor = 'stripe') {
+  return getProcessor(processor).createCheckoutSession(amountUsd, successUrl, cancelUrl, currency);
+}
+
+/**
+ * Processor-agnostic webhook entry point. Verifies and parses the event
+ * with the named processor, then applies the shared idempotent credit
+ * grant. The dedup key is namespaced per processor so event ids from
+ * different processors can never collide.
+ */
+export async function handleWebhook(processorName, rawBody, headers) {
+  const processor = getProcessor(processorName);
+  const event = await processor.verifyAndParseWebhook(rawBody, headers);
+  if (!event) return { handled: false };
+
+  const dedupKey = `${processor.name}-event:${event.id}`;
+  const firstSeen = await store.setNX(dedupKey, { at: Date.now() }, THIRTY_DAYS_MS);
+  if (!firstSeen) return { handled: true, duplicate: true };
+
+  await store.incrBy(`credit:${event.accountId}`, Number(event.stroops));
+  logger.info({ processor: processor.name, eventId: event.id, accountId: event.accountId }, 'billing credit granted');
+  return { handled: true, duplicate: false };
 }
 
 /**
