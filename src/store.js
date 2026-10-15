@@ -51,12 +51,26 @@ class MemoryStore {
    * limiter — can interleave and both read the same stale value). Only the
    * function's return value is wrapped in a Promise asynchronously.
    */
-  async incr(key, ttlMs) {
+  async incr(key, ttlMs, delta = 1) {
     const entry = this.map.get(key);
     const now = Date.now();
-    const current = entry && (!entry.expiresAt || entry.expiresAt >= now) ? entry.value : 0;
-    const next = current + 1;
-    this.map.set(key, { value: next, expiresAt: ttlMs ? now + ttlMs : null });
+    const alive = Boolean(entry && (!entry.expiresAt || entry.expiresAt >= now));
+    const current = alive ? entry.value : 0;
+    const next = current + delta;
+    this.map.set(key, { value: next, expiresAt: alive ? entry.expiresAt : ttlMs ? now + ttlMs : null });
+    return next;
+  }
+
+  /** Decrements an integer counter by `delta` (defaults to 1), preserving any
+   * existing TTL on the key. Used by rateLimit.js's settleClaudeBudget() when
+   * refunding an overestimated budget reservation (#251). */
+  async decr(key, delta = 1) {
+    const entry = this.map.get(key);
+    const now = Date.now();
+    const alive = Boolean(entry && (!entry.expiresAt || entry.expiresAt >= now));
+    const current = alive ? entry.value : 0;
+    const next = current - delta;
+    this.map.set(key, { value: next, expiresAt: alive ? entry.expiresAt : null });
     return next;
   }
 
@@ -154,10 +168,14 @@ export class RedisStore {
     await this.client.del(key);
   }
 
-  async incr(key, ttlMs) {
-    const next = await this.client.incr(key);
-    if (next === 1 && ttlMs) await this.client.pexpire(key, ttlMs);
+  async incr(key, ttlMs, delta = 1) {
+    const next = delta === 1 ? await this.client.incr(key) : await this.client.incrby(key, delta);
+    if (next === delta && ttlMs) await this.client.pexpire(key, ttlMs);
     return next;
+  }
+
+  async decr(key, delta = 1) {
+    return delta === 1 ? this.client.decr(key) : this.client.decrby(key, delta);
   }
 
   getClient() {

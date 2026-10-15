@@ -4,7 +4,7 @@ import { dispatchAndCollect, recordOutcome, getReputation, getSmoothedOnlineWork
 import { assessQuorum, recordQuorumObservation } from './collusion.js';
 import { reconcile, draftAnswer } from './reconcile.js';
 import { resolveQuestion, refundQuestion, getQuestionOnChain } from './stellarClient.js';
-import { resolveTier, listTiersForClient, stroopsToUsdc, priceForTier, effectiveEscalatedPriceStroops } from './pricing.js';
+import { resolveTier, listTiersForClient, stroopsToUsdc, priceForTier } from './pricing.js';
 import { incrementStat } from './stats.js';
 import { recordPayerQuestion } from './payerIndex.js';
 import { getPrivatePool } from './privatePools.js';
@@ -372,8 +372,6 @@ async function fulfillOracleCall(questionId, pending, tier) {
     : undefined;
 
   let submissions = [];
-  // Only set for escalating tiers; see dispatchEscalating's return shape.
-  let escalated = null;
   try {
     submissions = await dispatchAndCollect(questionId, pending.question, {
       quorumSize: tier.quorumSize,
@@ -406,16 +404,6 @@ async function fulfillOracleCall(questionId, pending, tier) {
   }
 
   const result = await reconcile(pending.question, submissions, questionId, consensusRuleFromPending(pending));
-
-  // A lone answer has no peers to be reconciled against, so reconcile()'s
-  // "unanimous + established" fast path reports confidence 1 for it. Settling
-  // on one worker must not get to skip the confidence bar by construction:
-  // cap it at the confidence dispatch actually had in that worker, so the
-  // shouldResolve / MIN_CONFIDENCE gate below judges the real number, exactly
-  // as it does for every other path.
-  if (escalated && submissions.length === 1 && escalated.confidence !== null) {
-    result.confidence = Math.min(result.confidence, escalated.confidence);
-  }
 
   const shouldResolve =
     submissions.length > 0 && result.matchingWorkerIds.length > 0 && result.confidence >= config.minConfidence;
@@ -467,32 +455,6 @@ async function recordSettlementProvenance(questionId) {
     });
   } catch (err) {
     jobLogger(questionId).error({ err }, 'failed to record settlement provenance');
-  }
-}
-
-/**
- * Persists what an escalating question really cost — recruited-worker count,
- * final quorum target, and the effective price against the ceiling that was
- * charged — on the job record (surfaced by GET /oracle/:jobId and the admin
- * console), then lets the caller refund the difference if its billing flow
- * can (see startFulfillment). `amountStroops` stays the amount actually
- * charged; `effectiveAmountStroops` is what the recruited quorum was worth.
- */
-async function recordEscalationCost(questionId, tier, escalated, hooks) {
-  const effective = effectiveEscalatedPriceStroops(tier, escalated.recruitedWorkers);
-  await updateJob(questionId, {
-    recruitedWorkers: escalated.recruitedWorkers,
-    quorumSizeUsed: escalated.finalQuorumSize,
-    dispatchSettledBy: escalated.settledBy,
-    effectiveAmountStroops: effective.toString(),
-    effectiveAmount: stroopsToUsdc(effective),
-  });
-  if (hooks.onEffectiveCost) {
-    try {
-      await hooks.onEffectiveCost(effective);
-    } catch (err) {
-      jobLogger(questionId).error({ err }, 'onEffectiveCost hook failed');
-    }
   }
 }
 
