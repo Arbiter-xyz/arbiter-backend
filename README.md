@@ -253,7 +253,7 @@ one fails open. Operators review pairs at `GET /admin/collusion` and
 `POST /admin/collusion/clear`. After a pair is cleared, only a worse score
 suspends it again. These are heuristics: nothing here slashes stake.
 
-## Dependency updates
+## Teams and member roles
 
 A team is a named group of Stellar addresses that share one view of their
 question history and spend. It adds no new credential: every call
@@ -308,7 +308,7 @@ are grouped into one PR, and each major bump gets its own. It's scoped to
 the repo root (`/`) because this split-out repo carries a single npm package.
 Nothing is auto-merged: these PRs need human review.
 
-## Running i
+## Load testing and capacity
 
 Load-test tooling (`scripts/loadtest.js`), measured limits, and the current
 bottleneck (serialized on-chain settlement) are in
