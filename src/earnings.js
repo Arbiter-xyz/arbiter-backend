@@ -34,8 +34,10 @@ function yearOf(ts) {
  * division matching the contract's own i128 arithmetic (any remainder
  * stroop stays in the contract, never credited to a worker). */
 export function workerShareStroops(amountStroops, matchingCount) {
-  if (!matchingCount) return 0n;
-  const net = BigInt(amountStroops) - (BigInt(amountStroops) * PLATFORM_FEE_BPS) / BPS_DENOM;
+  if (!matchingCount || matchingCount <= 0) return 0n;
+  const gross = BigInt(amountStroops);
+  if (gross <= 0n) return 0n;
+  const net = gross - (gross * PLATFORM_FEE_BPS) / BPS_DENOM;
   return net / BigInt(matchingCount);
 }
 
