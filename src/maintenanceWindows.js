@@ -86,16 +86,14 @@ export function computePause(windows, now = Date.now()) {
   if (active.length === 0) return null;
 
   let resumesAt = Math.max(...active.map((w) => w.endsAt));
-  // Extend across any window that starts at or before the current end.
+  // Because `sorted` is ordered by `startsAt` ascending and `resumesAt` only
+  // grows monotonically, a single forward pass merges every overlapping or
+  // touching window in O(n) after sorting without re-scanning from index 0.
   const sorted = [...windows].sort((a, b) => a.startsAt - b.startsAt);
-  let extended = true;
-  while (extended) {
-    extended = false;
-    for (const w of sorted) {
-      if (w.startsAt <= resumesAt && w.endsAt > resumesAt) {
-        resumesAt = w.endsAt;
-        extended = true;
-      }
+  for (const w of sorted) {
+    if (w.startsAt > resumesAt) break;
+    if (w.endsAt > resumesAt) {
+      resumesAt = w.endsAt;
     }
   }
 
