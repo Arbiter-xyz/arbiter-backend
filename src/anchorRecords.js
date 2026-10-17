@@ -51,7 +51,10 @@ export async function recordAnchorTransaction(address, { kind, status, amount, a
   // Replace an existing report for the same anchor transaction id (status
   // moves e.g. pending_user_transfer_start -> completed) rather than
   // accumulating duplicate rows for one real transaction.
-  const next = [record, ...existing.filter((r) => r.anchorTransactionId !== anchorTransactionId)].slice(
+  const next = [
+    record,
+    ...existing.filter((r) => anchorTransactionId == null || r.anchorTransactionId !== anchorTransactionId),
+  ].slice(
     0,
     MAX_TRACKED_PER_ADDRESS,
   );
@@ -81,8 +84,8 @@ export async function getAnchorKyc(address) {
  * personal information remains keyed by that address.
  */
 export async function eraseAnchorRecords(address) {
-  await store.del(TX_PREFIX + address);
-  await store.del(KYC_PREFIX + address);
+  await store.delete(TX_PREFIX + address);
+  await store.delete(KYC_PREFIX + address);
   const known = (await store.get(ADDRESS_INDEX_KEY)) || [];
   if (known.includes(address)) {
     await store.set(
