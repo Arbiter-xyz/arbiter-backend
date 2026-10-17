@@ -52,6 +52,22 @@ function isValidBeneficiary(address) {
   return StrKey.isValidEd25519PublicKey(address) || StrKey.isValidContract(address);
 }
 
+export const DEFAULT_MIN_THRESHOLD_STROOPS = 10_000_000n; // 1.00 USDC
+const DEFAULT_PENDING_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+
+function minThresholdStroops() {
+  return BigInt(config.autoWithdraw?.minThresholdStroops ?? DEFAULT_MIN_THRESHOLD_STROOPS);
+}
+
+function pendingTtlMs() {
+  return Number(config.autoWithdraw?.pendingTtlMs ?? DEFAULT_PENDING_TTL_MS);
+}
+
+function sweepIntervalMs() {
+  return Number(config.autoWithdraw?.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS);
+}
+
 function parseThreshold(value) {
   let stroops;
   try {
@@ -59,9 +75,10 @@ function parseThreshold(value) {
   } catch {
     throw new AutoWithdrawError('thresholdStroops must be an integer number of stroops');
   }
-  if (stroops < config.autoWithdraw.minThresholdStroops) {
+  const minStroops = minThresholdStroops();
+  if (stroops < minStroops) {
     throw new AutoWithdrawError(
-      `thresholdStroops must be at least ${config.autoWithdraw.minThresholdStroops} (${stroopsToUsdc(config.autoWithdraw.minThresholdStroops)} USDC)`,
+      `thresholdStroops must be at least ${minStroops} (${stroopsToUsdc(minStroops)} USDC)`,
     );
   }
   return stroops;
@@ -165,6 +182,8 @@ export async function deleteAutoWithdrawSettings(workerAddress) {
   await unindexWorker(workerAddress);
 }
 
+export const SWEEP_CONCURRENCY = 5;
+
 /**
  * Checks one worker's Owed balance against their threshold and, if it's
  * reached, prepares and pushes the withdraw transaction. Safe to call as
@@ -176,7 +195,14 @@ export async function deleteAutoWithdrawSettings(workerAddress) {
  * 'below_threshold', 'pending' (one already outstanding), 'prepared'
  * (just created), 'busy' (another check holds the lock).
  */
-export async function checkAutoWithdraw(workerAddress) {
+export async function checkAutoWithdraw(
+  workerAddress,
+  {
+    getOwed = getOwedOnChain,
+    buildWithdrawTx = buildWorkerWithdrawTx,
+    notify = notifyWorker,
+  } = {},
+) {
   const settings = await store.get(SETTINGS_PREFIX + workerAddress);
   if (!settings?.enabled) return { status: 'disabled' };
 
@@ -184,7 +210,7 @@ export async function checkAutoWithdraw(workerAddress) {
   if (!locked) return { status: 'busy' };
 
   try {
-    const owed = await getOwedOnChain(workerAddress);
+    const owed = await getOwed(workerAddress);
     const pending = await store.get(PENDING_PREFIX + workerAddress);
 
     if (pending) {
@@ -202,8 +228,8 @@ export async function checkAutoWithdraw(workerAddress) {
       return { status: 'below_threshold', owedStroops: owed.toString(), thresholdStroops: threshold.toString() };
     }
 
-    const ttlMs = config.autoWithdraw.pendingTtlMs;
-    const xdr = await buildWorkerWithdrawTx(workerAddress, owed, settings.beneficiaryAddress, Math.floor(ttlMs / 1000));
+    const ttlMs = pendingTtlMs();
+    const xdr = await buildWithdrawTx(workerAddress, owed, settings.beneficiaryAddress, Math.floor(ttlMs / 1000));
     const now = Date.now();
     const record = {
       xdr,
@@ -214,12 +240,14 @@ export async function checkAutoWithdraw(workerAddress) {
     };
     await store.set(PENDING_PREFIX + workerAddress, record, ttlMs);
 
-    notifyWorker(workerAddress, {
-      title: 'Your Arbiter balance is ready to withdraw',
-      body: `Your earnings reached ${stroopsToUsdc(threshold)} USDC. Sign to withdraw ${stroopsToUsdc(owed)} USDC.`,
-      type: 'auto_withdraw_ready',
-      amountStroops: owed.toString(),
-    }).catch(() => {});
+    Promise.resolve(
+      notify(workerAddress, {
+        title: 'Your Arbiter balance is ready to withdraw',
+        body: `Your earnings reached ${stroopsToUsdc(threshold)} USDC. Sign to withdraw ${stroopsToUsdc(owed)} USDC.`,
+        type: 'auto_withdraw_ready',
+        amountStroops: owed.toString(),
+      }),
+    ).catch(() => {});
 
     logger.info({ workerAddress, amountStroops: owed.toString() }, 'auto-withdraw transaction prepared');
     return { status: 'prepared', pending: presentPending(record) };
@@ -233,7 +261,15 @@ export async function checkAutoWithdraw(workerAddress) {
  * the usual causes (stale sequence number, expired time bound, Owed
  * changed) all mean it can never succeed as-is, and the next check
  * prepares a fresh one. */
-export async function submitAutoWithdraw(workerAddress, signedXdr) {
+export async function submitAutoWithdraw(
+  workerAddress,
+  signedXdr,
+  {
+    relayWithdraw = feeBumpWithdraw,
+    relayWithdrawTo = feeBumpWithdrawTo,
+    recordWithdrawal = recordWorkerWithdrawal,
+  } = {},
+) {
   const pending = await store.get(PENDING_PREFIX + workerAddress);
   if (!pending) {
     throw new AutoWithdrawError('no pending auto-withdraw for this worker; it may have expired or already been submitted', 404);
@@ -242,52 +278,64 @@ export async function submitAutoWithdraw(workerAddress, signedXdr) {
   let result;
   try {
     result = pending.beneficiaryAddress
-      ? await feeBumpWithdrawTo(signedXdr, workerAddress, pending.beneficiaryAddress, pending.amountStroops)
-      : await feeBumpWithdraw(signedXdr, workerAddress, pending.amountStroops);
+      ? await relayWithdrawTo(signedXdr, workerAddress, pending.beneficiaryAddress, pending.amountStroops)
+      : await relayWithdraw(signedXdr, workerAddress, pending.amountStroops);
   } catch (err) {
     await store.delete(PENDING_PREFIX + workerAddress);
     throw new AutoWithdrawError(`auto-withdraw relay failed: ${err.message}. A fresh transaction will be prepared on the next check.`);
   }
 
   await store.delete(PENDING_PREFIX + workerAddress);
-  await recordWorkerWithdrawal(workerAddress, {
-    amountStroops: pending.amountStroops,
-    txHash: result.hash,
-    beneficiaryAddress: pending.beneficiaryAddress,
-    auto: true,
-  }).catch((err) => logger.error({ err, workerAddress }, 'failed to record auto-withdraw in earnings ledger'));
+  await Promise.resolve(
+    recordWithdrawal(workerAddress, {
+      amountStroops: pending.amountStroops,
+      txHash: result.hash,
+      beneficiaryAddress: pending.beneficiaryAddress,
+      auto: true,
+    }),
+  ).catch((err) => logger.error({ err, workerAddress }, 'failed to record auto-withdraw in earnings ledger'));
 
   return { hash: result.hash, amountStroops: pending.amountStroops, amount: stroopsToUsdc(pending.amountStroops) };
 }
 
 /** Settlement hook: checks every credited worker who has auto-withdraw on.
  * Fire-and-forget from the caller's side; never throws. */
-export async function checkAutoWithdrawForWorkers(workerIds) {
+export async function checkAutoWithdrawForWorkers(workerIds, deps) {
   for (const workerId of workerIds) {
     if (!StrKey.isValidEd25519PublicKey(workerId)) continue;
     try {
-      await checkAutoWithdraw(workerId);
+      await checkAutoWithdraw(workerId, deps);
     } catch (err) {
       logger.error({ err, workerId }, 'auto-withdraw check failed after settlement');
     }
   }
 }
 
-/** Backstop sweep over every opted-in worker. Sequential rather than a
- * Promise.all() fan-out: each check is one or two RPC simulations, and
- * there's no latency target here worth hammering the RPC for. */
-export async function sweepAutoWithdraw() {
+/** Backstop sweep over every opted-in worker. Runs in bounded concurrent
+ * batches (SWEEP_CONCURRENCY = 5) so the sweep stays well within its
+ * interval as INDEX_KEY grows toward MAX_TRACKED_WORKERS without hammering
+ * the Soroban RPC with an unbounded fan-out (#287). */
+export async function sweepAutoWithdraw({
+  concurrency = SWEEP_CONCURRENCY,
+  checkWorker = checkAutoWithdraw,
+} = {}) {
   const workers = (await store.get(INDEX_KEY)) || [];
   const summary = { checked: 0, prepared: 0, failed: 0 };
-  for (const workerAddress of workers) {
-    try {
-      const { status } = await checkAutoWithdraw(workerAddress);
-      summary.checked += 1;
-      if (status === 'prepared') summary.prepared += 1;
-    } catch (err) {
-      summary.failed += 1;
-      logger.error({ err, workerAddress }, 'auto-withdraw sweep check failed');
-    }
+  const step = Math.max(1, Math.floor(concurrency));
+  for (let i = 0; i < workers.length; i += step) {
+    const batch = workers.slice(i, i + step);
+    await Promise.all(
+      batch.map(async (workerAddress) => {
+        try {
+          const { status } = await checkWorker(workerAddress);
+          summary.checked += 1;
+          if (status === 'prepared') summary.prepared += 1;
+        } catch (err) {
+          summary.failed += 1;
+          logger.error({ err, workerAddress }, 'auto-withdraw sweep check failed');
+        }
+      }),
+    );
   }
   return summary;
 }
@@ -295,7 +343,7 @@ export async function sweepAutoWithdraw() {
 let sweepHandle = null;
 
 export function startAutoWithdrawSweep() {
-  const intervalMs = config.autoWithdraw.sweepIntervalMs;
+  const intervalMs = sweepIntervalMs();
   if (!intervalMs || sweepHandle || !config.contractId) return null;
   sweepHandle = setInterval(() => {
     sweepAutoWithdraw()
