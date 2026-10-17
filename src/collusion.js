@@ -72,8 +72,17 @@ function splitPair(key) {
   return [key.slice(0, i), key.slice(i + 1)];
 }
 
-function hashIp(ip) {
-  return createHmac('sha256', config.session.secret).update(`ip:${ip}`).digest('hex').slice(0, 32);
+/**
+ * Derives a domain-separated subkey from the session secret (or uses an
+ * explicit config.collusion?.ipHashSecret when configured) so worker IP HMACs
+ * never reuse the raw session-signing key directly (#278).
+ */
+export function deriveIpHmacKey(secret = config.collusion?.ipHashSecret || config.session.secret) {
+  return createHmac('sha256', String(secret)).update('arbiter:collusion:ip-hmac-key:v1').digest();
+}
+
+export function hashIp(ip, secret) {
+  return createHmac('sha256', deriveIpHmacKey(secret)).update(`ip:${ip}`).digest('hex').slice(0, 32);
 }
 
 async function pushBounded(key, value, max, ttlMs) {

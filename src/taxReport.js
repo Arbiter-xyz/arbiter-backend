@@ -51,9 +51,15 @@ export function parseTaxYear(value, now = new Date()) {
   return year;
 }
 
-/** USD with 2 decimals, rounded half-up to the cent, from USDC stroops. */
+/**
+ * USD with 2 decimals, rounded half-up to the cent, from USDC stroops.
+ * Standard IRS Form 1099-NEC commercial rounding rounds exact half-cents
+ * (.005 USD, i.e. 50,000 stroops at 10^7 stroops/USDC) up to the next cent.
+ */
 export function stroopsToUsd(stroops) {
-  const cents = (BigInt(stroops) + STROOPS_PER_CENT / 2n) / STROOPS_PER_CENT;
+  const raw = BigInt(stroops);
+  if (raw < 0n) throw new TaxReportError('stroops must be non-negative');
+  const cents = (raw + STROOPS_PER_CENT / 2n) / STROOPS_PER_CENT;
   return `${cents / 100n}.${(cents % 100n).toString().padStart(2, '0')}`;
 }
 
