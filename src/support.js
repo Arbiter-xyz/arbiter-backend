@@ -1,9 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { verifySessionToken } from './workerAuth.js';
 import { getPayerQuestionIds } from './payerIndex.js';
-import { getKnownWorkerIds, getReputation } from './dispatch.js';
 import { getJob } from './jobs.js';
-import { appendAuditLog } from './auditLog.js';
+import { checkRateLimit } from './rateLimit.js';
 
 /**
  * In-app support chat widget backend (#133).
@@ -22,6 +21,9 @@ const OPEN_TICKETS_KEY = 'support:open';
 
 const TICKET_STATUSES = ['open', 'answered', 'closed'];
 
+export const SUPPORT_TICKET_RATE_LIMIT_MAX = 10;
+export const SUPPORT_TICKET_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
+
 // In-memory fallback store, mirroring the pattern used by the other index
 // modules when no durable backend is wired up. Kept module-local so tests
 // and single-process deployments work without extra configuration.
@@ -32,6 +34,17 @@ const memory = {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+async function recordAudit(entry) {
+  try {
+    const mod = await import('./auditLog.js');
+    if (typeof mod.appendAuditLog === 'function') {
+      await mod.appendAuditLog(entry);
+    }
+  } catch {
+    // Audit log module is optional in standalone/unit environments.
+  }
 }
 
 async function persistTicket(ticket) {
@@ -49,11 +62,13 @@ async function persistTicket(ticket) {
 export async function isQuestionLinkedToAddress(address, questionId) {
   if (!address || !questionId) return false;
 
-  const payerIds = await getPayerQuestionIds(address).catch(() => []);
-  if (payerIds.includes(questionId)) return true;
+  const payerIds = await Promise.resolve(getPayerQuestionIds(address)).catch(() => []);
+  if (Array.isArray(payerIds) && payerIds.includes(questionId)) return true;
 
-  const job = await getJob(questionId).catch(() => null);
-  if (job && job.workerId === address) return true;
+  const job = await Promise.resolve(getJob(questionId)).catch(() => null);
+  if (job && (job.workerId === address || (Array.isArray(job.workerIds) && job.workerIds.includes(address)))) {
+    return true;
+  }
 
   return false;
 }
@@ -66,10 +81,22 @@ export async function isQuestionLinkedToAddress(address, questionId) {
  * and payer flows. A token that does not verify for `address` is rejected,
  * mirroring the impersonation case workerAuth.test.js covers.
  *
+ * Rate-limited per authenticated address so a single session cannot flood
+ * the admin support queue (#280).
+ *
  * `questionId` is optional; when provided it must be a real question this
  * address is associated with (payer history or worker answer history).
  */
-export async function createTicket(address, questionId, message, { sessionToken } = {}) {
+export async function createTicket(
+  address,
+  questionId,
+  message,
+  {
+    sessionToken,
+    maxTicketsPerWindow = SUPPORT_TICKET_RATE_LIMIT_MAX,
+    rateLimitWindowMs = SUPPORT_TICKET_RATE_LIMIT_WINDOW_MS,
+  } = {},
+) {
   if (!address || typeof address !== 'string') {
     const err = new Error('address is required');
     err.status = 400;
@@ -81,8 +108,9 @@ export async function createTicket(address, questionId, message, { sessionToken 
     throw err;
   }
 
-  const session = await verifySessionToken(address, sessionToken).catch(() => null);
-  if (!session || session.address !== address) {
+  const verified = await Promise.resolve(verifySessionToken(sessionToken)).catch(() => null);
+  const sessionAddress = typeof verified === 'string' ? verified : verified?.address;
+  if (!sessionAddress || sessionAddress !== address) {
     const err = new Error('invalid or missing session token for address');
     err.status = 401;
     throw err;
@@ -97,6 +125,13 @@ export async function createTicket(address, questionId, message, { sessionToken 
     }
   }
 
+  const allowed = await checkRateLimit(`support:ticket:${address}`, maxTicketsPerWindow, rateLimitWindowMs);
+  if (!allowed) {
+    const err = new Error('rate limit exceeded for support ticket creation');
+    err.status = 429;
+    throw err;
+  }
+
   const ticket = {
     ticketId: randomUUID(),
     address,
@@ -109,12 +144,12 @@ export async function createTicket(address, questionId, message, { sessionToken 
   };
 
   await persistTicket(ticket);
-  await appendAuditLog({
+  await recordAudit({
     action: 'support.ticket.create',
     actor: address,
     target: ticket.ticketId,
     metadata: { questionId: ticket.questionId },
-  }).catch(() => {});
+  });
 
   return ticket;
 }
@@ -159,11 +194,11 @@ export async function respondToTicket(ticketId, message, { adminId, close = fals
   ticket.updatedAt = nowIso();
   await persistTicket(ticket);
 
-  await appendAuditLog({
+  await recordAudit({
     action: close ? 'support.ticket.close' : 'support.ticket.respond',
     actor: adminId || 'admin',
     target: ticketId,
-  }).catch(() => {});
+  });
 
   return ticket;
 }
