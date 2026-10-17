@@ -83,6 +83,23 @@ describe('snapshotPendingIds', () => {
     assert.equal(snap.consistent, true);
     assert.deepEqual(snap.ids, ['1', '2']);
   });
+
+  test('retains union of all seen IDs when all attempts are inconsistent due to swap-remove churn (#291)', async () => {
+    // Each attempt sees before !== after (6 calls total for 3 attempts).
+    // Attempt 1 sees ['1', '2'], Attempt 2 sees ['2', '3'], Attempt 3 sees ['3', '4'] (missed '1' & '2' due to swap-remove).
+    const counts = [4, 3, 3, 2, 2, 1];
+    const pages = [['1', '2'], ['2', '3'], ['3', '4']];
+    const snap = await snapshotPendingIds(
+      {
+        getPendingCount: async () => counts.shift(),
+        listPending: async () => pages.shift(),
+      },
+      { pageSize: 100, attempts: 3 },
+    );
+    assert.equal(snap.consistent, false);
+    assert.deepEqual(snap.ids, ['1', '2', '3', '4']);
+    assert.equal(snap.count, 4);
+  });
 });
 
 /** A fake contract + store, enough to run whole sweeps against. */

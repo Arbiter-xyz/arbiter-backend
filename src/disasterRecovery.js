@@ -110,17 +110,24 @@ export function classifyPendingQuestion({ question, job, stash, currentLedger },
  * missed by an inconsistent scan is simply picked up by the next sweep.
  */
 export async function snapshotPendingIds({ getPendingCount, listPending }, { pageSize = 100, attempts = 3 } = {}) {
-  let ids = new Set();
+  const allSeenIds = new Set();
+  let lastAfter = 0;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    ids = new Set();
+    const ids = new Set();
     const before = await getPendingCount();
     for (let start = 0; start < before; start += pageSize) {
-      for (const id of await listPending(start, pageSize)) ids.add(String(id));
+      for (const id of await listPending(start, pageSize)) {
+        const normalized = String(id);
+        ids.add(normalized);
+        allSeenIds.add(normalized);
+      }
     }
     const after = await getPendingCount();
+    lastAfter = after;
     if (before === after) return { ids: [...ids], count: after, consistent: true };
   }
-  return { ids: [...ids], count: ids.size, consistent: false };
+  const unionIds = [...allSeenIds];
+  return { ids: unionIds, count: Math.max(lastAfter, unionIds.length), consistent: false };
 }
 
 /**
@@ -138,7 +145,16 @@ export async function sweepPendingQuestions(deps, options = {}) {
   const opts = { ...DEFAULT_SWEEP_OPTIONS, ...options };
   const startedAt = Date.now();
 
-  const snapshot = await snapshotPendingIds(deps, { pageSize: opts.pageSize });
+  const snapshot = await snapshotPendingIds(deps, {
+    pageSize: opts.pageSize,
+    ...(opts.snapshotAttempts != null ? { attempts: opts.snapshotAttempts } : {}),
+  });
+  if (!snapshot.consistent) {
+    logger.warn(
+      { onChainPending: snapshot.count, inspectedIds: snapshot.ids.length },
+      'recovery sweep: pending index remained inconsistent across retry attempts; inspecting union of seen IDs',
+    );
+  }
   const currentLedger = await deps.getLatestLedger();
 
   const items = [];
