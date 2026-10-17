@@ -35,7 +35,7 @@ import { stroopsToUsdc, resolveTier, MAX_SURGE_MULTIPLIER } from './pricing.js';
 import { checkRateLimit } from './rateLimit.js';
 import { issueSandboxChallenge, startSandboxFulfillment } from './sandbox.js';
 import { requireAdmin } from './adminAuth.js';
-import { listTransactions, listWorkers, listPayers, getTreasury, getFeeRevenue, listAnchorPayouts, listAnchorKyc } from './admin.js';
+import { listTransactions, listWorkers, listPayers, getTreasury, getFeeRevenue, listAnchorPayouts, listAnchorKyc, getFraudScore } from './admin.js';
 import { listPaymentReversals } from './paymentReversals.js';
 import { getAnchorConfig, isAnchorConfigured } from './anchorClient.js';
 import { recordAnchorTransaction, recordAnchorKyc } from './anchorRecords.js';
@@ -133,8 +133,8 @@ const byIp = (req) => req.ip;
 
 app.get('/metrics', metricsHandler({ token: config.metrics.token }));
 
-app.get('/health', (req, res) => {
-  res.json({ ok: true, onlineWorkers: onlineWorkerCount(), contractId: config.contractId });
+app.get('/health', async (req, res) => {
+  res.json({ ok: true, onlineWorkers: await onlineWorkerCount(), contractId: config.contractId });
 });
 
 // Public, like /health: the dispatch pause in effect (if any) and every
@@ -200,8 +200,8 @@ app.get('/gamification/badges', (req, res) => {
 });
 
 app.get('/stats', async (req, res) => {
-  const stats = await getStats();
-  res.json({ onlineWorkers: onlineWorkerCount(), ...stats });
+  const [stats, onlineWorkers] = await Promise.all([getStats(), onlineWorkerCount()]);
+  res.json({ onlineWorkers, ...stats });
 });
 
 // ---------------------------------------------------------------------
@@ -1217,6 +1217,10 @@ app.get('/admin/transactions', requireAdmin, async (req, res) => {
 
 app.get('/admin/workers', requireAdmin, async (req, res) => {
   res.json({ workers: await listWorkers() });
+});
+
+app.get('/admin/workers/:address/risk', requireAdmin, async (req, res) => {
+  res.json(await getFraudScore(req.params.address));
 });
 
 app.get('/admin/payers', requireAdmin, async (req, res) => {

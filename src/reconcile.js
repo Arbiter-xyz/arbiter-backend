@@ -137,7 +137,7 @@ const REPORT_CONSENSUS_TOOL = {
 };
 
 let anthropicClient = null;
-function getClient() {
+export function getClient() {
   if (!config.anthropicApiKey) return null;
   if (!anthropicClient) {
     // The SDK's own defaults (2 retries, but a 10-MINUTE timeout) are tuned
@@ -354,7 +354,10 @@ export async function reconcile(question, submissions, questionId, rule = null) 
 export const TERMINAL_JOB_STATES = ['resolved', 'refunded', 'failed'];
 
 export function isTerminalJob(job) {
-  return !job || TERMINAL_JOB_STATES.includes(job.state);
+  if (!job) return true;
+  if (job.status === 'settled') return true;
+  if (job.outcome && TERMINAL_JOB_STATES.includes(job.outcome)) return true;
+  return TERMINAL_JOB_STATES.includes(job.state);
 }
 
 /**
@@ -364,10 +367,13 @@ export function isTerminalJob(job) {
 export function terminalStateForOnChainStatus(status) {
   switch (status) {
     case 'Resolved':
+    case 'resolved':
       return 'resolved';
     case 'Refunded':
+    case 'refunded':
       return 'refunded';
     case 'Open':
+    case 'pending':
       return null;
     default:
       // Unknown/absent status: fail closed, do not settle.
@@ -391,7 +397,7 @@ export function terminalStateForOnChainStatus(status) {
 export async function reconcileJob(job, deps) {
   const { getOnChainStatus, settleResolved, settleRefunded, markTerminal } = deps;
 
-  if (isTerminalJob(job)) return job.state;
+  if (isTerminalJob(job)) return job?.outcome || job?.state || 'settled';
 
   const status = await getOnChainStatus(job.questionId);
   const terminal = terminalStateForOnChainStatus(status);
@@ -414,8 +420,13 @@ export async function reconcileJob(job, deps) {
 
   // Still Open: safe to settle exactly once. A job that was mid-
   // fulfillOracleCall when the process died is re-driven from its persisted
-  // phase; the on-chain status check above guarantees we never double-settle.
-  if (job.phase === 'refund' || job.outcome === 'refund') {
+  // phase/status/outcome; the on-chain status check above guarantees we never double-settle.
+  if (
+    job.phase === 'refund' ||
+    job.outcome === 'refund' ||
+    job.outcome === 'refunded' ||
+    job.status === 'cancelling'
+  ) {
     await settleRefunded(job);
     await markTerminal(job, 'refunded');
     return 'refunded';

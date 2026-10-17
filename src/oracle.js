@@ -1,6 +1,7 @@
 import { nextQuestionId, stashQuestion, getStashedQuestion, dropStashedQuestion } from './pendingQuestions.js';
 import { createJob, updateJob, getJob, claimJob } from './jobs.js';
-import { dispatchAndCollect, recordOutcome, getReputation, getSmoothedOnlineWorkerCount, hasOnlineWhitelistedWorker } from './dispatch.js';
+import { dispatchAndCollect, dispatchEscalating, recordOutcome, getReputation, getSmoothedOnlineWorkerCount, hasOnlineWhitelistedWorker } from './dispatch.js';
+import { DEFAULT_CONSENSUS_MODE } from './consensus.js';
 import { assessQuorum, recordQuorumObservation } from './collusion.js';
 import { reconcile, draftAnswer } from './reconcile.js';
 import { resolveQuestion, refundQuestion, getQuestionOnChain } from './stellarClient.js';
@@ -165,7 +166,8 @@ export async function verifyPayment(questionId) {
  * funded through the API-key path, whose `payerAddress` is the platform's
  * pooled fiat address — it's what cancelJob() authenticates against there.
  */
-export async function startFulfillment(questionId, pending, tier, payerAddress, { ownerAccountId } = {}) {
+export async function startFulfillment(questionId, pending, tier, payerAddress, hooks = {}) {
+  const { ownerAccountId } = hooks;
   const claimed = await claimJob(questionId);
   if (!claimed) return { jobId: questionId };
 
@@ -181,23 +183,18 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
     amountStroops: tier.priceStroops.toString(),
     amount: stroopsToUsdc(tier.priceStroops),
     payer: payerAddress || null,
-    // Persisted past dispatch time (it already routes dispatch in
-    // fulfillOracleCall) so per-category spend is visible to every reader
-    // of the job record: GET /oracle/:jobId, GET /payers/:address/questions
-    // and GET /admin/transactions all spread the full record.
     category: pending.category || null,
+    ...(tier.escalation ? { escalating: true, maxQuorum: tier.escalation.maxQuorum } : {}),
   });
 
   if (ownerAccountId) {
     await store.set(JOB_OWNER_PREFIX + questionId, { apiKeyAccountId: ownerAccountId }, config.jobResultTtlMs);
   }
   if (payerAddress) await recordPayerQuestion(payerAddress, questionId);
-  // API-key customers are charged from the shared fiat pool, so `payer`
-  // can't identify them; record who to send settlement webhooks to instead.
   if (ownerAccountId) await setJobWebhookOwner(questionId, `account:${ownerAccountId}`);
 
   if (!cancellableUntil) {
-    dispatchUnlessPaused(questionId, pending, tier).catch((err) =>
+    dispatchUnlessPaused(questionId, pending, tier, hooks).catch((err) =>
       jobLogger(questionId).error({ err }, 'failed to start dispatch'),
     );
     return { jobId: questionId };
@@ -207,12 +204,10 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
     questionId,
     holdMs,
     async () => {
-      // Checked again here, not just at payment time: a maintenance window
-      // can open while the job is sitting in its undo-window hold.
       const pause = await getDispatchPause();
       if (pause) return refundForDispatchPause(questionId, tier, pause);
       await updateJob(questionId, { status: 'awaiting_workers', cancellableUntil: null, dispatchedAt: Date.now() });
-      runFulfillment(questionId, pending, tier);
+      runFulfillment(questionId, pending, tier, hooks);
     },
     (err) => jobLogger(questionId).error({ err }, 'failed to start dispatch after the undo window'),
   );
@@ -220,10 +215,10 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
   return { jobId: questionId, cancellableUntil };
 }
 
-async function dispatchUnlessPaused(questionId, pending, tier) {
-  const pause = await getDispatchPause();
+async function dispatchUnlessPaused(questionId, pending, tier, hooks = {}) {
+  const pause = typeof getDispatchPause === 'function' ? await getDispatchPause() : null;
   if (pause) return refundForDispatchPause(questionId, tier, pause);
-  runFulfillment(questionId, pending, tier);
+  runFulfillment(questionId, pending, tier, hooks);
 }
 
 /**
@@ -247,8 +242,8 @@ async function refundForDispatchPause(questionId, tier, pause) {
   if (owner?.apiKeyAccountId) await restoreCredit(owner.apiKeyAccountId, Number(tier.priceStroops));
 }
 
-function runFulfillment(questionId, pending, tier) {
-  fulfillOracleCall(questionId, pending, tier).catch((err) => {
+function runFulfillment(questionId, pending, tier, hooks = {}) {
+  fulfillOracleCall(questionId, pending, tier, hooks).catch((err) => {
     // fulfillOracleCall is written to always settle the escrow before
     // returning; this catch is a last-resort net so a bug there can't leave
     // the job record stuck in 'awaiting_workers' forever.
@@ -358,35 +353,36 @@ export function shouldDraftSuggestion(tier, settings = { ...config.draftSuggesti
   return settings.tiers.includes(tier.key);
 }
 
-async function fulfillOracleCall(questionId, pending, tier) {
+async function fulfillOracleCall(questionId, pending, tier, hooks = {}) {
   if (tier.instant) {
     return fulfillInstant(questionId, pending, tier);
   }
 
-  // Started concurrently with dispatch, never awaited here — the suggestion
-  // is additive, so it can't be allowed to delay or fail the broadcast (see
-  // dispatchAndCollect's `suggestion` option for the delivery side).
-  // draftAnswer() never throws and resolves null on any failure.
   const suggestion = shouldDraftSuggestion(tier)
     ? draftAnswer(pending.question, questionId, { purpose: 'worker-suggestion' })
     : undefined;
 
   let submissions = [];
-  // Only set for escalating tiers; see dispatchEscalating's return shape.
   let escalated = null;
   try {
-    submissions = await dispatchAndCollect(questionId, pending.question, {
-      quorumSize: tier.quorumSize,
-      timeoutMs: tier.timeoutMs,
-      category: pending.category,
-      preferEstablished: tier.preferEstablished,
-      suggestion,
-    });
+    if (tier.escalation) {
+      escalated = await dispatchEscalating(questionId, pending.question, {
+        timeoutMs: tier.timeoutMs,
+        category: pending.category,
+        escalation: tier.escalation,
+      });
+      submissions = escalated.submissions;
+      await recordEscalationCost(questionId, tier, escalated, hooks);
+    } else {
+      submissions = await dispatchAndCollect(questionId, pending.question, {
+        quorumSize: tier.quorumSize,
+        timeoutMs: tier.timeoutMs,
+        category: pending.category,
+        preferEstablished: tier.preferEstablished,
+        suggestion,
+      });
+    }
   } catch (err) {
-    // dispatchAndCollect is designed to never reject, but guard anyway — an
-    // empty submissions list still routes through reconcile()'s no-answers
-    // path below, which forces a refund. Never let a dispatch failure be
-    // the reason a payment goes unsettled.
     jobLogger(questionId).error({ err }, 'dispatch threw unexpectedly');
   }
 

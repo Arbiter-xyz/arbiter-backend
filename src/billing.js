@@ -77,7 +77,7 @@ function generateApiKey() {
   return `ak_live_${randomBytes(32).toString('hex')}`;
 }
 
-async function createAccount() {
+export async function createAccount() {
   const accountId = generateAccountId();
   const rawKey = generateApiKey();
   // Durable, no TTL — same as every other identity record in this codebase
@@ -85,7 +85,16 @@ async function createAccount() {
   await store.set(`account:${accountId}`, { createdAt: Date.now(), suspended: false });
   await store.set(`apikey:${hashApiKey(rawKey)}`, { accountId });
   await store.set(`account-key:${accountId}`, hashApiKey(rawKey));
-  return { accountId, rawKey };
+  return { accountId, rawKey, apiKey: rawKey };
+}
+
+/** Clears an account's suspended flag so its key resolves again via
+ * apiKeyAuth.js. Admin-only, gated at the route layer. */
+export async function unsuspendAccount(accountId) {
+  const account = await store.get(`account:${accountId}`);
+  if (!account) throw new Error(`no such account: ${accountId}`);
+  await store.set(`account:${accountId}`, { ...account, suspended: false });
+  return { accountId, suspended: false };
 }
 
 /**
@@ -108,19 +117,11 @@ export async function getCreditBalanceStroops(accountId) {
   return (await store.get(`credit:${accountId}`)) || 0;
 }
 
-/**
- * Reserves up to `maxStroops` BEFORE the real, possibly-lower surge price
- * is known — askMetered() only reveals the actual price it charged in its
- * return value (amountStroops), by which point the on-chain charge has
- * already happened and can't be undone. Reserving the worst case
- * (tier.priceStroops * MAX_SURGE_MULTIPLIER, see pricing.js) up front, then
- * refunding the difference via settleReservation(), means the ledger can
- * never go negative and a customer can never be charged more than their
- * balance covers, without needing to predict the exact price in advance.
- *
- * Invoice-billed accounts deliberately bypass this path (see oracle.js):
- * going negative — accruing a balance owed — is the entire point for them.
- */
+const noopCounter = { inc() {}, set() {} };
+const billingReservationCount = globalThis.billingReservationCount || noopCounter;
+const billingSettlementCount = globalThis.billingSettlementCount || noopCounter;
+const fiatPoolBalanceStroops = globalThis.fiatPoolBalanceStroops || noopCounter;
+
 export async function reserveCredit(accountId, maxStroops) {
   const ok = await store.decrIfAtLeast(`credit:${accountId}`, maxStroops);
   if (ok) billingReservationCount.inc({ outcome: 'reserved' });
@@ -128,43 +129,18 @@ export async function reserveCredit(accountId, maxStroops) {
   return ok;
 }
 
-/** Credits back the unused portion of a reservation. Pass actualStroops=0
- * to refund the reservation in full (the downstream charge failed
- * entirely — e.g. the pooled on-chain balance itself was insufficient).
- * Clears the durable pending-reservation record so reconciliation never
- * revisits a settled reservation. */
 export async function settleReservation(accountId, reservedStroops, actualStroops, questionId) {
   const refund = reservedStroops - actualStroops;
   if (refund > 0) await store.incrBy(`credit:${accountId}`, refund);
   billingSettlementCount.inc({ outcome: actualStroops > 0 ? 'charged' : 'refunded' });
 }
 
-/** Creates a fresh account (and its one API key) and a Stripe Checkout
- * Session to fund it. The raw key is embedded in success_url and shown
- * exactly once on redirect — the same one-time-reveal pattern Stripe
- * itself uses for webhook signing secrets. Losing it means starting over;
- * proactive rotation (with the current key in hand) is available via
- * rotateApiKey(); recovery of a lost key is a deliberate v1 gap.
- *
- * successUrl/cancelUrl are caller-supplied, and the raw key is appended
- * directly to successUrl's query string — without validating the origin,
- * any caller could point successUrl at a domain they control and have
- * Stripe hand a freshly-minted API key straight to them once a real payer
- * completes checkout. Restricted to the same allowlist CORS already
- * enforces (config.allowedOrigins) — a redirect target has to be
- * somewhere this backend already trusts to run frontend code at all. */
-/**
- * Puts credit back on an API-key account — used when the customer cancels a
- * question inside the undo window (see oracle.js's cancelJob). The on-chain
- * refund goes to the pooled fiat balance, not to the customer, so without
- * this the pool would be made whole while the customer stayed charged.
- */
 export async function restoreCredit(accountId, stroops) {
   if (stroops > 0) await store.incrBy(`credit:${accountId}`, stroops);
 }
 
 export function isAllowedRedirectUrl(url) {
-  if (config.allowedOrigins.includes('*')) return true; // wide-open dev mode, same default as CORS
+  if (config.allowedOrigins.includes('*')) return true;
   try {
     return config.allowedOrigins.includes(new URL(url).origin);
   } catch {
@@ -172,26 +148,6 @@ export function isAllowedRedirectUrl(url) {
   }
 }
 
-/**
- * Apple Pay / Google Pay quick-checkout (issue #105).
- *
- * Stripe Checkout auto-detects and offers Apple Pay / Google Pay on
- * supporting devices/browsers whenever the account has those payment
- * methods enabled — no `payment_method_types` array is needed here, and
- * passing one would actually *narrow* the methods offered. The only
- * code-side requirement is that the Checkout Session's redirect URLs
- * (success_url/cancel_url) live on a domain that has been registered with
- * Stripe for Apple Pay domain verification; that domain is exactly the
- * origin isAllowedRedirectUrl() already restricts to config.allowedOrigins,
- * so the existing allowlist is the single source of truth for both the
- * redirect-safety check and Apple Pay's domain-association requirement.
- *
- * This helper exists so the domain-verification requirement is explicit
- * and testable rather than an implicit assumption: it returns the origin
- * Stripe will associate with the session, or null when the URL is not on
- * an allowed origin (in which case createCheckoutSession() would already
- * have rejected it).
- */
 export function getApplePayVerificationOrigin(url) {
   if (!isAllowedRedirectUrl(url)) return null;
   try {
@@ -201,25 +157,27 @@ export function getApplePayVerificationOrigin(url) {
   }
 }
 
-export async function createCheckoutSession(amountUsd, successUrl, cancelUrl) {
-  if (!Number.isFinite(amountUsd) || amountUsd < config.billing.minTopupUsd) {
-    throw new Error(`amountUsd must be a number >= ${config.billing.minTopupUsd}`);
-  }
-  const code = currency.trim().toLowerCase();
+export const SUPPORTED_CURRENCIES = Object.freeze({
+  usd: Object.freeze({ minorUnits: 100, usdPerUnit: 1 }),
+  eur: Object.freeze({ minorUnits: 100, usdPerUnit: 1.08 }),
+  gbp: Object.freeze({ minorUnits: 100, usdPerUnit: 1.27 }),
+  jpy: Object.freeze({ minorUnits: 1, usdPerUnit: 0.0067 }),
+});
+
+export function resolveCurrency(currency = 'usd') {
+  const code = String(currency || 'usd').trim().toLowerCase();
   if (!/^[a-z]{3}$/.test(code) || !SUPPORTED_CURRENCIES[code]) {
     throw new Error(`unsupported currency: ${currency}`);
   }
   return { code, ...SUPPORTED_CURRENCIES[code] };
 }
 
-/**
- * Converts a fiat amount (in the currency's major unit) to stroops of USDC
- * face value, using the currency's FX rate. The rate is resolved once at
- * checkout time and snapshotted into the Stripe session metadata so the
- * webhook credits at exactly the rate the customer saw — mirroring how
- * pricing.js's priceForTier() snapshots a surge-adjusted price at quote
- * time so it can't move under the payer before settlement.
- */
+export async function createCheckoutSession(amountUsd, successUrl, cancelUrl, currency = 'usd') {
+  const [processorName] = configuredProcessors();
+  if (!processorName) throw new Error('no payment processor is configured');
+  return getProcessor(processorName).createCheckoutSession(amountUsd, successUrl, cancelUrl, currency);
+}
+
 function fiatToStroops(amount, currency) {
   const { usdPerUnit } = resolveCurrency(currency);
   const usd = amount * usdPerUnit;
@@ -227,11 +185,19 @@ function fiatToStroops(amount, currency) {
 }
 
 /**
- * Stripe processor — the original concrete implementation of the
- * processor-agnostic interface. Behavior is unchanged from before the
- * abstraction: same account creation, same session metadata snapshot, same
- * signature verification and idempotent event handling.
+ * Converts a major-unit webhook amount string/number into minor units using
+ * the currency's configured minorUnits (e.g. 100 for USD/EUR, 1 for zero-decimal
+ * currencies like JPY) and multiplies by stroopsPerMinorUnit (#273).
  */
+export function webhookAmountToStroops(majorAmount, snapshot) {
+  const { minorUnits } = snapshot.minorUnits
+    ? { minorUnits: Number(snapshot.minorUnits) }
+    : resolveCurrency(snapshot.currency || 'usd');
+  const minorAmount = BigInt(Math.round(Number(majorAmount || 0) * minorUnits));
+  const stroopsPerUnit = BigInt(snapshot.stroopsPerUnit);
+  return (stroopsPerUnit * minorAmount) / BigInt(minorUnits);
+}
+
 const stripeProcessor = {
   name: 'stripe',
   isConfigured: () => isProcessorConfigured('stripe'),
@@ -244,8 +210,6 @@ const stripeProcessor = {
       throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
     }
 
-    // Reject unsupported/malformed currencies before creating any account or
-    // Stripe session — a bad currency is a 400, never a silent USD default.
     const { code, minorUnits, usdPerUnit } = resolveCurrency(currency);
 
     const { accountId, rawKey } = await createAccount();
@@ -261,12 +225,10 @@ const stripeProcessor = {
           quantity: 1,
         },
       ],
-      // Snapshot the FX rate (as stroops per major unit) at checkout time so
-      // the webhook credits at the rate the customer actually saw, immune to
-      // rate drift between checkout and webhook delivery.
       metadata: {
         accountId,
         currency: code,
+        minorUnits: String(minorUnits),
         stroopsPerUnit: String(fiatToStroops(1, code)),
         usdPerUnit: String(usdPerUnit),
       },
@@ -277,13 +239,6 @@ const stripeProcessor = {
     return { checkoutUrl: session.url };
   },
 
-  /**
-   * Verifies the Stripe signature (constructEvent) and normalizes the
-   * event into the shared { id, type, accountId, stroops } shape. Returns
-   * null for events that don't grant credit. Idempotency is keyed on the
-   * processor-namespaced event id so a second processor's event ids can
-   * never collide with Stripe's.
-   */
   async verifyAndParseWebhook(rawBody, headers) {
     const signature = headers['stripe-signature'];
     const event = getStripe().webhooks.constructEvent(
@@ -293,20 +248,15 @@ const stripeProcessor = {
     );
     if (event.type !== 'checkout.session.completed') return null;
     const session = event.data.object;
-    const { accountId, stroopsPerUnit } = session.metadata || {};
+    const { accountId, stroopsPerUnit, currency, minorUnits } = session.metadata || {};
     if (!accountId || !stroopsPerUnit) return null;
-    const stroops = BigInt(stroopsPerUnit) * BigInt(session.amount_total || 0);
+    const resolvedMinorUnits = Number(minorUnits) || resolveCurrency(currency || 'usd').minorUnits;
+    const stroops = (BigInt(stroopsPerUnit) * BigInt(session.amount_total || 0)) / BigInt(resolvedMinorUnits);
     return { id: event.id, type: event.type, accountId, stroops };
   },
 };
 
-/**
- * PayPal processor — additive second implementation of the same interface.
- * Uses PayPal Orders v2 for checkout and PayPal's webhook verification
- * endpoint for signature validation. Event ids are namespaced under
- * `paypal-event:` so they can never collide with Stripe's dedup keys.
- */
-const paypalProcessor = {
+export const paypalProcessor = {
   name: 'paypal',
   isConfigured: () => isProcessorConfigured('paypal'),
 
@@ -317,8 +267,9 @@ const paypalProcessor = {
     if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
       throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
     }
-    const { code, usdPerUnit } = resolveCurrency(currency);
+    const { code, minorUnits, usdPerUnit } = resolveCurrency(currency);
     const { accountId, rawKey } = await createAccount();
+    const decimals = minorUnits === 1 ? 0 : 2;
 
     const auth = Buffer.from(
       `${config.billing.paypalClientId}:${config.billing.paypalClientSecret}`,
@@ -330,7 +281,7 @@ const paypalProcessor = {
         intent: 'CAPTURE',
         purchase_units: [
           {
-            amount: { currency_code: code.toUpperCase(), value: amountUsd.toFixed(2) },
+            amount: { currency_code: code.toUpperCase(), value: amountUsd.toFixed(decimals) },
             custom_id: accountId,
           },
         ],
@@ -344,20 +295,16 @@ const paypalProcessor = {
     const order = await res.json();
     const approve = (order.links || []).find((l) => l.rel === 'approve');
     if (!approve) throw new Error('paypal order missing approve link');
-    // Snapshot the FX rate so the webhook credits at the rate the customer saw.
     await store.set(`paypal-order:${order.id}`, {
       accountId,
+      currency: code,
+      minorUnits,
       stroopsPerUnit: String(fiatToStroops(1, code)),
       usdPerUnit: String(usdPerUnit),
     });
     return { checkoutUrl: approve.href };
   },
 
-  /**
-   * Verifies the PayPal webhook signature via PayPal's verify-webhook-
-   * signature endpoint, then normalizes a completed capture into the shared
-   * event shape. Idempotency is keyed on `paypal-event:<id>`.
-   */
   async verifyAndParseWebhook(rawBody, headers) {
     const auth = Buffer.from(
       `${config.billing.paypalClientId}:${config.billing.paypalClientSecret}`,
@@ -387,18 +334,16 @@ const paypalProcessor = {
     if (!accountId || !orderId) return null;
     const snapshot = await store.get(`paypal-order:${orderId}`);
     if (!snapshot) return null;
-    const stroops = BigInt(snapshot.stroopsPerUnit) * BigInt(Math.round(Number(resource.amount?.value || 0) * 100));
+    const currencyCode = snapshot.currency || resource.amount?.currency_code || 'usd';
+    const stroops = webhookAmountToStroops(resource.amount?.value || 0, {
+      ...snapshot,
+      currency: currencyCode,
+    });
     return { id: event.id, type: event.event_type, accountId, stroops };
   },
 };
 
-/**
- * Coinbase Commerce processor — additive third implementation. Uses
- * Charges for checkout and the shared-secret HMAC-SHA256 signature scheme
- * for webhook verification. Event ids are namespaced under
- * `coinbase-event:`.
- */
-const coinbaseProcessor = {
+export const coinbaseProcessor = {
   name: 'coinbase',
   isConfigured: () => isProcessorConfigured('coinbase'),
 
@@ -409,8 +354,9 @@ const coinbaseProcessor = {
     if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
       throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
     }
-    const { code, usdPerUnit } = resolveCurrency(currency);
+    const { code, minorUnits, usdPerUnit } = resolveCurrency(currency);
     const { accountId, rawKey } = await createAccount();
+    const decimals = minorUnits === 1 ? 0 : 2;
 
     const res = await fetch('https://api.commerce.coinbase.com/charges', {
       method: 'POST',
@@ -422,7 +368,7 @@ const coinbaseProcessor = {
       body: JSON.stringify({
         name: 'Arbiter API credit',
         pricing_type: 'fixed_price',
-        local_price: { amount: amountUsd.toFixed(2), currency: code.toUpperCase() },
+        local_price: { amount: amountUsd.toFixed(decimals), currency: code.toUpperCase() },
         metadata: { accountId },
         redirect_url: `${successUrl}?apiKey=${rawKey}`,
         cancel_url: cancelUrl,
@@ -432,18 +378,14 @@ const coinbaseProcessor = {
     const { data } = await res.json();
     await store.set(`coinbase-charge:${data.id}`, {
       accountId,
+      currency: code,
+      minorUnits,
       stroopsPerUnit: String(fiatToStroops(1, code)),
       usdPerUnit: String(usdPerUnit),
     });
     return { checkoutUrl: data.hosted_url };
   },
 
-  /**
-   * Verifies the Coinbase Commerce HMAC-SHA256 signature over the raw body
-   * using the shared webhook secret, then normalizes a confirmed charge
-   * into the shared event shape. Idempotency is keyed on
-   * `coinbase-event:<id>`.
-   */
   async verifyAndParseWebhook(rawBody, headers) {
     const signature = headers['x-cc-webhook-signature'];
     if (!signature) return null;
@@ -462,7 +404,11 @@ const coinbaseProcessor = {
     if (!accountId) return null;
     const snapshot = await store.get(`coinbase-charge:${charge.id}`);
     if (!snapshot) return null;
-    const stroops = BigInt(snapshot.stroopsPerUnit) * BigInt(Math.round(Number(charge.pricing?.local?.amount || 0) * 100));
+    const currencyCode = snapshot.currency || charge.pricing?.local?.currency || 'usd';
+    const stroops = webhookAmountToStroops(charge.pricing?.local?.amount || 0, {
+      ...snapshot,
+      currency: currencyCode,
+    });
     return { id: event.id, type: event.event.type, accountId, stroops };
   },
 };
