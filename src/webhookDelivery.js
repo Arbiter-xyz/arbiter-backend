@@ -8,8 +8,16 @@ import { logger } from './logger.js';
 import { getDeliveryTargets, resolveJobOwner, deactivateWebhook, isBlockedAddress } from './webhooks.js';
 
 /**
- * Signed settlement webhooks: the sending-side mirror of billing.js's
- * handleStripeWebhook(), which verifies Stripe's signed webhooks.
+ * Signed settlement webhook delivery and retry engine.
+ *
+ * ── Module boundary (webhooks.js vs. webhookDelivery.js, #324) ───────────
+ * - `src/webhooks.js` owns registration lifecycle, secret generation and
+ *   encryption-at-rest, owner-to-target resolution (`getDeliveryTargets`,
+ *   `resolveJobOwner`), and SSRF IP-range classification (`isBlockedAddress`).
+ * - `src/webhookDelivery.js` (this module) owns HMAC-SHA256 signing and
+ *   constant-time verification (`signPayload`, `verifyWebhookSignature`),
+ *   DNS-rebinding-guarded HTTP transport, exponential-backoff retries, and
+ *   durable in-flight retry recovery across process restarts (#289).
  *
  * ── Signing convention (what an integrator verifies) ─────────────────────
  *
@@ -23,34 +31,14 @@ import { getDeliveryTargets, resolveJobOwner, deactivateWebhook, isBlockedAddres
  *
  *   v1 = hex(HMAC-SHA256(key = the whsec_... secret shown at registration,
  *                        message = "<t>" + "." + <raw request body bytes>))
- *
- * The receiver recomputes v1 over the RAW body exactly as received, before
- * any JSON parsing, and compares in constant time. It should also reject a
- * `t` more than ~5 minutes old, so a captured delivery can't be replayed
- * later. Every attempt is re-signed with a fresh `t`, so a late retry still
- * passes that check. verifyWebhookSignature() below is the reference
- * implementation.
- *
- * Body: { id, type: 'question.settled', createdAt, data: { jobId, ...job } }.
- * `data` has the same shape GET /oracle/:jobId returns (status 'settled',
- * outcome, answer, confidence, ...).
- *
- * ── Delivery guarantees ──────────────────────────────────────────────────
- *
- * Settlement never waits on this. enqueueSettlementWebhooks() returns
- * synchronously and never throws; all work happens after the settle path
- * has moved on, the same fail-safe posture as push.js's notifyWorker().
- * Failures (network error, timeout, any non-2xx, including redirects, which
- * are not followed) are retried with exponential backoff, up to
- * config.webhooks.maxAttempts attempts in total, then abandoned with an
- * error log. 410 Gone deactivates the registration. Retries are in-process
- * timers, so a restart mid-backoff drops the remaining attempts for that
- * event. That's acceptable for v1 because GET /oracle/:jobId remains the
- * source of truth, and it's logged so operators can see it.
  */
 
 export const SIGNATURE_HEADER = 'x-arbiter-signature';
 const USER_AGENT = 'Arbiter-Webhooks/1.0';
+const INFLIGHT_INDEX_KEY = 'webhook-inflight-index';
+const INFLIGHT_PREFIX = 'webhook-inflight:';
+const MAX_INFLIGHT_RETRIES = 1_000;
+const INFLIGHT_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function computeSignature(secret, timestamp, rawBody) {
   return createHmac('sha256', secret).update(`${timestamp}.`).update(rawBody).digest('hex');
@@ -95,7 +83,7 @@ export function buildSettlementEvent(jobId, job) {
 function guardedLookup(hostname, options, callback) {
   dns.lookup(hostname, { ...options, all: false }, (err, address, family) => {
     if (err) return callback(err);
-    if (!config.webhooks.allowInsecureTargets && isBlockedAddress(address)) {
+    if (!config.webhooks?.allowInsecureTargets && isBlockedAddress(address)) {
       return callback(Object.assign(new Error(`webhook host ${hostname} resolved to a blocked address`), { code: 'EBLOCKED' }));
     }
     callback(null, address, family);
@@ -133,7 +121,7 @@ function postOnce(url, body, headers, timeoutMs) {
 // maxAttempts x backoff, so it can't hold a process open indefinitely.
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-export function backoffDelayMs(retryNumber, baseDelayMs = config.webhooks.retryBaseDelayMs, random = Math.random) {
+export function backoffDelayMs(retryNumber, baseDelayMs = config.webhooks?.retryBaseDelayMs ?? 1_000, random = Math.random) {
   const exp = baseDelayMs * 2 ** (retryNumber - 1);
   return Math.round(exp + exp * 0.2 * random());
 }
@@ -149,22 +137,55 @@ async function recordDelivery(webhookId, patch) {
   await store.set(key, next);
 }
 
+function inflightId(targetId, eventId) {
+  return `${targetId}:${eventId}`;
+}
+
+async function saveInflightRetry(target, event, nextAttempt, maxAttempts) {
+  const id = inflightId(target.id, event.id);
+  await store.set(
+    INFLIGHT_PREFIX + id,
+    { target, event, nextAttempt, maxAttempts, updatedAt: Date.now() },
+    INFLIGHT_TTL_MS,
+  );
+  const index = (await store.get(INFLIGHT_INDEX_KEY)) || [];
+  if (!index.includes(id)) {
+    await store.set(INFLIGHT_INDEX_KEY, [id, ...index].slice(0, MAX_INFLIGHT_RETRIES));
+  }
+}
+
+async function clearInflightRetry(targetId, eventId) {
+  const id = inflightId(targetId, eventId);
+  await store.delete(INFLIGHT_PREFIX + id);
+  const index = (await store.get(INFLIGHT_INDEX_KEY)) || [];
+  if (index.includes(id)) {
+    await store.set(
+      INFLIGHT_INDEX_KEY,
+      index.filter((item) => item !== id),
+    );
+  }
+}
+
 /**
- * Delivers one event to one registration, retrying with backoff. Resolves
- * (never rejects) with { ok, attempts, status }.
+ * Delivers one event to one registration, retrying with backoff. Persists
+ * in-flight retry state before sleeping between attempts so a restart
+ * mid-backoff can resume remaining attempts via recoverPendingWebhookDeliveries() (#289).
+ * Resolves (never rejects) with { ok, attempts, status }.
  */
 export async function deliverWithRetry(target, event, options = {}) {
   const {
-    maxAttempts = config.webhooks.maxAttempts,
-    baseDelayMs = config.webhooks.retryBaseDelayMs,
-    timeoutMs = config.webhooks.timeoutMs,
+    maxAttempts = config.webhooks?.maxAttempts ?? 4,
+    baseDelayMs = config.webhooks?.retryBaseDelayMs ?? 1_000,
+    timeoutMs = config.webhooks?.timeoutMs ?? 5_000,
+    startAttempt = 1,
+    post = postOnce,
   } = options;
   const body = JSON.stringify(event);
   const log = logger.child({ webhookId: target.id, eventId: event.id, jobId: event.data?.jobId });
   let lastStatus = null;
   let lastError = null;
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+  for (let attempt = Math.max(1, startAttempt); attempt <= maxAttempts; attempt += 1) {
     const headers = {
       'content-type': 'application/json',
       'user-agent': USER_AGENT,
@@ -175,7 +196,7 @@ export async function deliverWithRetry(target, event, options = {}) {
       [SIGNATURE_HEADER]: signPayload(target.secret, body),
     };
     try {
-      lastStatus = await postOnce(target.url, body, headers, timeoutMs);
+      lastStatus = await post(target.url, body, headers, timeoutMs);
       lastError = null;
     } catch (err) {
       lastStatus = null;
@@ -185,11 +206,13 @@ export async function deliverWithRetry(target, event, options = {}) {
     const at = Date.now();
     if (lastStatus >= 200 && lastStatus < 300) {
       log.info({ attempt, status: lastStatus }, 'webhook delivered');
+      await clearInflightRetry(target.id, event.id).catch(() => {});
       await recordDelivery(target.id, { lastAttemptAt: at, lastStatus, lastError: null, lastEventId: event.id, outcome: 'delivered' }).catch(() => {});
       return { ok: true, attempts: attempt, status: lastStatus };
     }
     if (lastStatus === 410) {
       log.warn({ attempt }, 'webhook receiver answered 410 Gone — deactivating registration');
+      await clearInflightRetry(target.id, event.id).catch(() => {});
       await deactivateWebhook(target.id, 'receiver answered 410 Gone').catch(() => {});
       await recordDelivery(target.id, { lastAttemptAt: at, lastStatus, lastError: null, lastEventId: event.id, outcome: 'failed' }).catch(() => {});
       return { ok: false, attempts: attempt, status: lastStatus };
@@ -197,6 +220,7 @@ export async function deliverWithRetry(target, event, options = {}) {
 
     await recordDelivery(target.id, { lastAttemptAt: at, lastStatus, lastError, lastEventId: event.id }).catch(() => {});
     if (attempt < maxAttempts) {
+      await saveInflightRetry(target, event, attempt + 1, maxAttempts).catch(() => {});
       const delayMs = backoffDelayMs(attempt, baseDelayMs);
       log.warn({ attempt, maxAttempts, status: lastStatus, error: lastError, delayMs }, 'webhook delivery failed, retrying');
       await sleep(delayMs);
@@ -204,8 +228,32 @@ export async function deliverWithRetry(target, event, options = {}) {
   }
 
   log.error({ attempts: maxAttempts, status: lastStatus, error: lastError }, 'webhook delivery abandoned after max attempts');
+  await clearInflightRetry(target.id, event.id).catch(() => {});
   await recordDelivery(target.id, { outcome: 'failed' }).catch(() => {});
   return { ok: false, attempts: maxAttempts, status: lastStatus };
+}
+
+/**
+ * Replays any in-flight webhook deliveries that were mid-backoff when the
+ * process restarted (#289). Safe to call on boot.
+ */
+export async function recoverPendingWebhookDeliveries(options = {}) {
+  const index = (await store.get(INFLIGHT_INDEX_KEY)) || [];
+  const results = [];
+  for (const id of index) {
+    const entry = await store.get(INFLIGHT_PREFIX + id);
+    if (!entry?.target || !entry?.event) {
+      await store.delete(INFLIGHT_PREFIX + id);
+      continue;
+    }
+    const res = await deliverWithRetry(entry.target, entry.event, {
+      ...options,
+      startAttempt: entry.nextAttempt || 1,
+      maxAttempts: entry.maxAttempts ?? options.maxAttempts,
+    });
+    results.push({ id, ...res });
+  }
+  return results;
 }
 
 /** Looks up the settled job's owner and delivers to each of their active
