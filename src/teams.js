@@ -193,25 +193,52 @@ export async function addMembers(teamId, actor, addresses, role = 'member') {
   return saveTeam(team);
 }
 
+const teamMutationLocks = new Map();
+
+async function withTeamLock(teamId, fn) {
+  const prev = teamMutationLocks.get(teamId) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => {
+    release = resolve;
+  });
+  const chained = prev.then(() => current);
+  teamMutationLocks.set(teamId, chained);
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (teamMutationLocks.get(teamId) === chained) {
+      teamMutationLocks.delete(teamId);
+    }
+  }
+}
+
 /**
  * Changes a member's role. Only the owner may do this. Setting another
  * member's role to 'owner' transfers ownership: they become owner and the
  * previous owner becomes an admin, so there's always exactly one owner.
+ * Serialized per teamId so concurrent ownership transfers cannot race and
+ * leave a team with two owners (#275).
  */
 export async function setMemberRole(teamId, actor, target, role) {
   if (!ROLES.includes(role)) throw new TeamError(`role must be one of ${ROLES.join(', ')}`);
-  const team = await requireTeamRole(teamId, actor, 'owner');
-  const member = team.members.find((m) => m.address === target);
-  if (!member) throw new TeamError('that address is not a member of this team', 404);
-  if (target === actor) {
-    throw new TeamError('the owner cannot change their own role — transfer ownership to another member instead', 409);
-  }
+  return withTeamLock(teamId, async () => {
+    const team = await requireTeamRole(teamId, actor, 'owner');
+    const member = team.members.find((m) => m.address === target);
+    if (!member) throw new TeamError('that address is not a member of this team', 404);
+    if (target === actor) {
+      throw new TeamError('the owner cannot change their own role — transfer ownership to another member instead', 409);
+    }
 
-  if (role === 'owner') {
-    team.members.find((m) => m.address === actor).role = 'admin';
-  }
-  member.role = role;
-  return saveTeam(team);
+    if (role === 'owner') {
+      for (const m of team.members) {
+        if (m.role === 'owner') m.role = 'admin';
+      }
+    }
+    member.role = role;
+    return saveTeam(team);
+  });
 }
 
 /**

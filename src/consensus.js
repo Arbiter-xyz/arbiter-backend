@@ -60,14 +60,16 @@ const APPROX_PREFIX = /^(?:about|approximately|approx\.?|around|roughly|circa|ca
 const CURRENCY_SYMBOLS = /[$€£¥₹]/g;
 const PLAIN_NUMBER = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/;
 const THOUSANDS_GROUPED = /^[+-]?\d{1,3}(?:,\d{3})+(?:\.\d*)?$/;
+const EU_THOUSANDS_WITH_DECIMAL = /^[+-]?\d{1,3}(?:\.\d{3})+,\d+$/;
 
 /**
  * Parses a worker's answer as a number, or returns null if it isn't one.
  * Handles an approximation prefix ("about", "~"), currency symbols, a
  * trailing percent sign ("42%" parses as 42, since every answer to one
- * question is presumably in the same unit), and comma thousands separators
- * in groups of three. A bare decimal comma ("3,5") is ambiguous and is NOT
- * parsed; it goes down the string path instead of risking a 1000x misread.
+ * question is presumably in the same unit), comma thousands separators in
+ * groups of three, and unambiguous European thousands-with-decimal formatting
+ * ("1.234,56"). A bare decimal comma ("3,5") is ambiguous and is NOT parsed;
+ * it goes down the string path instead of risking a 1000x misread.
  */
 export function parseNumericAnswer(text) {
   if (typeof text !== 'string') return null;
@@ -77,7 +79,11 @@ export function parseNumericAnswer(text) {
   s = s.replace(/\s+/g, '');
   s = s.replace(/\.$/, ''); // trailing sentence period: "42."
   if (s.endsWith('%')) s = s.slice(0, -1);
-  if (THOUSANDS_GROUPED.test(s)) s = s.replace(/,/g, '');
+  if (EU_THOUSANDS_WITH_DECIMAL.test(s)) {
+    s = s.replace(/\./g, '').replace(',', '.');
+  } else if (THOUSANDS_GROUPED.test(s)) {
+    s = s.replace(/,/g, '');
+  }
   if (!PLAIN_NUMBER.test(s)) return null;
   const n = Number(s);
   return Number.isFinite(n) ? n : null;
