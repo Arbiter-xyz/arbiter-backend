@@ -122,23 +122,24 @@ function sumRange(days, endTs, count) {
  * immediately before it.
  */
 export function buildDashboard({ workerId, reputation, activity, window = 30, now = Date.now(), rank = null }) {
+  const w = Math.min(Math.max(Math.floor(Number(window)) || 30, 1), MAX_WINDOW_DAYS);
   const days = activity.days || {};
   const daily = [];
-  for (let i = window - 1; i >= 0; i--) {
+  for (let i = w - 1; i >= 0; i--) {
     const date = dayKey(now - i * DAY_MS);
     const b = days[date] || { answered: 0, matched: 0 };
     daily.push({ date, answered: b.answered, matched: b.matched, matchRatio: ratio(b.matched, b.answered) });
   }
 
-  const current = sumRange(days, now, window);
-  const previous = sumRange(days, now - window * DAY_MS, window);
+  const current = sumRange(days, now, w);
+  const previous = sumRange(days, now - w * DAY_MS, w);
   const streak = computeStreak(days, now);
 
   const bestDay = daily.reduce((best, d) => (d.answered > (best?.answered || 0) ? d : best), null);
 
   return {
     workerId,
-    window: { days: window, from: daily[0].date, to: daily[daily.length - 1].date },
+    window: { days: w, from: daily[0].date, to: daily[daily.length - 1].date },
     lifetime: {
       totalAnswers: reputation.total,
       matched: reputation.matched,
