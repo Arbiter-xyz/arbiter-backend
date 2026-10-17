@@ -50,8 +50,8 @@ export class MemoryPubSub {
 }
 
 export class RedisPubSub {
-  constructor() {
-    const base = getClient();
+  constructor(client = getClient()) {
+    const base = client;
     if (!base) {
       throw new Error('RedisPubSub requires a configured Redis client');
     }
@@ -59,6 +59,22 @@ export class RedisPubSub {
     this.sub = typeof base.duplicate === 'function' ? base.duplicate() : base;
     this.pub = base;
     this.handlers = new Map();
+    this.sub.on('error', (err) => {
+      // Prevent unhandled 'error' events on the duplicated subscriber connection
+      // from crashing the process during transient Redis disconnects.
+      // eslint-disable-next-line no-console
+      console.error('[pubsub] subscriber connection error', err);
+    });
+    this.sub.on('ready', () => {
+      // Re-subscribe active channels after a reconnect so cross-instance
+      // fan-out recovers automatically if subscription state was reset.
+      for (const channel of this.handlers.keys()) {
+        Promise.resolve(this.sub.subscribe(channel)).catch((err) => {
+          // eslint-disable-next-line no-console
+          console.error('[pubsub] resubscribe error', err);
+        });
+      }
+    });
     this.sub.on('message', (channel, message) => {
       const set = this.handlers.get(channel);
       if (!set) return;
@@ -78,7 +94,7 @@ export class RedisPubSub {
     if (!set) {
       set = new Set();
       this.handlers.set(channel, set);
-      this.sub.subscribe(channel).catch((err) => {
+      Promise.resolve(this.sub.subscribe(channel)).catch((err) => {
         // eslint-disable-next-line no-console
         console.error('[pubsub] subscribe error', err);
       });
@@ -88,14 +104,14 @@ export class RedisPubSub {
       set.delete(handler);
       if (set.size === 0) {
         this.handlers.delete(channel);
-        this.sub.unsubscribe(channel).catch(() => {});
+        Promise.resolve(this.sub.unsubscribe(channel)).catch(() => {});
       }
     };
   }
 
   publish(channel, message) {
     const payload = typeof message === 'string' ? message : JSON.stringify(message);
-    this.pub.publish(channel, payload).catch((err) => {
+    Promise.resolve(this.pub.publish(channel, payload)).catch((err) => {
       // eslint-disable-next-line no-console
       console.error('[pubsub] publish error', err);
     });
