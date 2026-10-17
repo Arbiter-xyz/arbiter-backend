@@ -9,7 +9,10 @@ import {
   notifyWorker,
   isPushConfigured,
   rebuildSubscribedWorkers,
+  clearSubscribedWorkersCache,
+  waitForInitialPushRebuild,
 } from '../src/push.js';
+import { store } from '../src/store.js';
 
 const fakeSubscription = (id) => ({
   endpoint: `https://push.example.com/fake-endpoint/${id}`,
@@ -17,6 +20,7 @@ const fakeSubscription = (id) => ({
 });
 
 test('save/has/remove subscription round-trips correctly', async () => {
+  await waitForInitialPushRebuild();
   const worker = `w-${Date.now()}`;
   assert.equal(await hasSubscription(worker), false);
 
@@ -50,20 +54,30 @@ test('getPushEligibleWorkerIds: a specialist only matches its declared categorie
   }
 });
 
-test('getPushEligibleWorkerIds: rebuilds from durable store after a simulated restart', async () => {
+test('getPushEligibleWorkerIds: rebuilds from durable store after a simulated restart (#293)', async () => {
   const worker = `restart-${Date.now()}`;
+  const staleWorker = `stale-${Date.now()}`;
   await saveSubscription(worker, fakeSubscription(worker), ['Math']);
+  await saveSubscription(staleWorker, fakeSubscription(staleWorker), ['Math']);
   try {
-    // Simulate a process restart: the in-process index is rebuilt purely from
-    // the durable store records, without calling saveSubscription() again.
+    // Wipe the in-process index to simulate a real process restart where
+    // subscribedWorkers starts empty before rebuildSubscribedWorkers() runs.
+    clearSubscribedWorkersCache();
+    assert.deepEqual(getPushEligibleWorkerIds('math'), []);
+
+    // Also delete staleWorker's durable record directly to verify rebuild prunes stale entries.
+    await store.delete(`push-sub:${staleWorker}`);
+
     await rebuildSubscribedWorkers();
     assert.ok(
       getPushEligibleWorkerIds('math').includes(worker),
       'a previously-subscribed worker must be eligible after a restart'
     );
+    assert.ok(!getPushEligibleWorkerIds('math').includes(staleWorker));
     assert.ok(!getPushEligibleWorkerIds('history').includes(worker));
   } finally {
     await removeSubscription(worker);
+    await removeSubscription(staleWorker);
   }
 });
 

@@ -84,7 +84,7 @@ export function toLeaderboardV2(rows) {
       workerId: r.workerId,
       totalAnswers: r.totalAnswers,
       matched: r.matched,
-      matchRatioPct: r.matchRatio === null ? null : Math.round(r.matchRatio * 100),
+      matchRatioPct: r.matchRatio == null || !Number.isFinite(r.matchRatio) ? null : Math.round(r.matchRatio * 100),
       stake: {
         stroops: r.stakeStroops,
         usdc: r.stake,

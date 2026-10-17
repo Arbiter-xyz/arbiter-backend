@@ -87,21 +87,46 @@ export async function hasSubscription(workerId) {
   return (await store.get(SUB_PREFIX + workerId)) !== null;
 }
 
+/** Clears the in-process subscribedWorkers index (used to simulate process restarts in tests). */
+export function clearSubscribedWorkersCache() {
+  subscribedWorkers.clear();
+}
+
 /** Rebuilds the in-process subscribedWorkers index from the durable
- * SUB_PREFIX records via SUB_INDEX_KEY. Called on startup so a fresh
- * process (no saveSubscription() calls yet) still returns previously-
- * subscribed workers from getPushEligibleWorkerIds(). */
+ * SUB_PREFIX records via SUB_INDEX_KEY. Called automatically on module
+ * load and available for explicit re-syncs so a fresh process (with no
+ * saveSubscription() calls yet) still returns previously-subscribed
+ * workers from getPushEligibleWorkerIds(). */
 export async function rebuildSubscribedWorkers() {
+  const snapshotBefore = new Set(subscribedWorkers.keys());
   const ids = await readSubIndex();
   const live = [];
+  const rebuilt = new Map();
   for (const workerId of ids) {
     const record = await store.get(SUB_PREFIX + workerId);
     if (!record) continue;
-    subscribedWorkers.set(workerId, normalizeCategories(record.categories));
+    rebuilt.set(workerId, normalizeCategories(record.categories));
     live.push(workerId);
+  }
+  for (const workerId of snapshotBefore) {
+    if (!rebuilt.has(workerId)) {
+      subscribedWorkers.delete(workerId);
+    }
+  }
+  for (const [workerId, categories] of rebuilt) {
+    subscribedWorkers.set(workerId, categories);
   }
   if (live.length !== ids.length) await store.set(SUB_INDEX_KEY, live);
   return live.length;
+}
+
+const initialRebuildPromise = rebuildSubscribedWorkers().catch((err) => {
+  logger.error({ err }, 'failed to rebuild subscribed workers on startup');
+  return 0;
+});
+
+export function waitForInitialPushRebuild() {
+  return initialRebuildPromise;
 }
 
 /** Worker ids with a push subscription matching `category` (or all of
