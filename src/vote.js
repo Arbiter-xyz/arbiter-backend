@@ -6,7 +6,7 @@
  */
 
 export function normalize(text) {
-  return text
+  return String(text ?? '')
     .trim()
     .toLowerCase()
     .replace(/[^\p{L}\p{N}\s]/gu, '')
@@ -15,6 +15,15 @@ export function normalize(text) {
 }
 
 export function exactMatchVote(submissions) {
+  if (!Array.isArray(submissions) || submissions.length === 0) {
+    return {
+      consensus: null,
+      confidence: 0,
+      matchingWorkerIds: [],
+      allAgree: false,
+    };
+  }
+
   const groups = new Map(); // normalized -> { representative, workerIds }
   for (const { workerId, answer } of submissions) {
     const norm = normalize(answer);
