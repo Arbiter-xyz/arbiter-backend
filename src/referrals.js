@@ -90,20 +90,25 @@ export async function getReferralCodeFor(owner) {
   return record ? describeCode(record) : null;
 }
 
+// Keyspace is 32^8 = 2^40 (~1.1e12). At MAX_REFERRERS_TRACKED = 5,000 active
+// codes, single-try collision probability is p = 5,000 / 2^40 ≈ 4.55e-9, so
+// failing all 5 independent attempts has probability p^5 ≈ 1.95e-42.
+const MAX_CODE_MINT_ATTEMPTS = 5;
+
 /**
  * Returns the owner's code, minting one on first call. Idempotent: two
  * concurrent first calls both end up with the same code, since the owner
  * key is claimed with setNX and the loser discards its candidate.
  */
-export async function getOrCreateReferralCode(owner) {
+export async function getOrCreateReferralCode(owner, { codeGenerator = generateCode } = {}) {
   if (!StrKey.isValidEd25519PublicKey(owner)) {
     throw new ReferralError('referral codes can only be minted for a valid Stellar address');
   }
   const existing = await getReferralCodeFor(owner);
   if (existing) return existing;
 
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const code = generateCode();
+  for (let attempt = 0; attempt < MAX_CODE_MINT_ATTEMPTS; attempt += 1) {
+    const code = codeGenerator();
     const record = { code, owner, createdAt: Date.now() };
     if (!(await store.setNX(CODE_PREFIX + code, record))) continue; // code collision, try another
 
@@ -186,7 +191,7 @@ export async function redeemReferralCode(referee, code) {
  */
 export function referralStatus(rep, flaggedWithReferrer, worker = config.worker) {
   if (flaggedWithReferrer) return 'disqualified';
-  if (rep.total < worker.minAnswersBeforeReputationGate) return 'pending';
+  if (rep.total <= 0 || rep.total < worker.minAnswersBeforeReputationGate) return 'pending';
   return rep.matched / rep.total >= worker.minMatchRatio ? 'qualified' : 'disqualified';
 }
 
