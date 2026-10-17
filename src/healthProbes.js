@@ -64,13 +64,23 @@ export async function probeChain(getLatestLedgerSequence, { timeoutMs = 5_000 } 
   }
 }
 
-/** Walks the job index and publishes the in-flight counts and the oldest
- * in-flight job's age (the QuestionsStuckInFlight alert). */
-export async function probeJobs({ getKnownJobIds, getJob }, now = Date.now()) {
+const JOB_SCAN_BATCH_SIZE = 50;
+
+/** Walks the job index in bounded concurrent batches and publishes the
+ * in-flight counts and the oldest in-flight job's age (the QuestionsStuckInFlight alert). */
+export async function probeJobs(
+  { getKnownJobIds, getJob },
+  now = Date.now(),
+  { batchSize = JOB_SCAN_BATCH_SIZE } = {},
+) {
   try {
     const ids = await getKnownJobIds();
+    const step = Math.max(1, Math.floor(batchSize));
     const jobs = [];
-    for (const id of ids) jobs.push(await getJob(id));
+    for (let i = 0; i < ids.length; i += step) {
+      const batch = await Promise.all(ids.slice(i, i + step).map((id) => getJob(id)));
+      jobs.push(...batch);
+    }
     recordJobScan(jobs, now);
     return { scanned: ids.length };
   } catch (err) {
@@ -105,7 +115,7 @@ export function startHealthProbes({
   const timers = [
     every(intervalMs, () => probeStore(store)),
     every(intervalMs, () => probeChain(getLatestLedgerSequence)),
-    every(intervalMs, async () => onlineWorkers.set(getOnlineWorkerCount())),
+    every(intervalMs, async () => onlineWorkers.set(Number(await getOnlineWorkerCount()))),
     every(jobScanIntervalMs, () => probeJobs({ getKnownJobIds, getJob })),
   ];
   return () => timers.forEach(clearInterval);
