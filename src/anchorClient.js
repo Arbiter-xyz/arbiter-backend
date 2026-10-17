@@ -1,4 +1,4 @@
-import { StellarToml } from '@stellar/stellar-sdk';
+import { StellarToml, StrKey } from '@stellar/stellar-sdk';
 import { withRetry } from './retry.js';
 import { logger } from './logger.js';
 
@@ -19,35 +19,81 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 
 let cache = { value: null, expiresAt: 0 };
 
+function validateHttpsEndpoint(fieldName, raw) {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== 'string' || !raw.trim()) {
+    throw new Error(`Invalid anchor stellar.toml: ${fieldName} must be a non-empty URL string`);
+  }
+  let parsed;
+  try {
+    parsed = new URL(raw.trim());
+  } catch {
+    throw new Error(`Invalid anchor stellar.toml: ${fieldName} is not a valid URL`);
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new Error(`Invalid anchor stellar.toml: ${fieldName} must use https:`);
+  }
+  if (parsed.username || parsed.password || parsed.hash) {
+    throw new Error(`Invalid anchor stellar.toml: ${fieldName} must not contain credentials or fragments`);
+  }
+  return parsed.toString();
+}
+
+export function validateAnchorToml(toml) {
+  if (!toml || typeof toml !== 'object' || Array.isArray(toml)) {
+    throw new Error('Invalid anchor stellar.toml: expected a top-level TOML object');
+  }
+
+  let signingKey = null;
+  if (toml.SIGNING_KEY !== undefined && toml.SIGNING_KEY !== null) {
+    if (typeof toml.SIGNING_KEY !== 'string' || !StrKey.isValidEd25519PublicKey(toml.SIGNING_KEY)) {
+      throw new Error('Invalid anchor stellar.toml: SIGNING_KEY must be a valid Stellar Ed25519 public key');
+    }
+    signingKey = toml.SIGNING_KEY;
+  }
+
+  const webAuthEndpoint = validateHttpsEndpoint('WEB_AUTH_ENDPOINT', toml.WEB_AUTH_ENDPOINT);
+  const rawTransfer = toml.TRANSFER_SERVER_SEP0024 ?? toml.TRANSFER_SERVER ?? null;
+  const transferServer = validateHttpsEndpoint('TRANSFER_SERVER', rawTransfer);
+
+  return { signingKey, webAuthEndpoint, transferServer };
+}
+
 /**
- * Fetch and cache the anchor's stellar.toml. The resolve call is wrapped in
- * `withRetry` (which applies `withTimeout`) so a hanging third-party domain
- * rejects within the configured bound instead of hanging the request.
+ * Fetch, validate, and cache the anchor's stellar.toml. The resolve call is
+ * wrapped in `withRetry` (which applies `withTimeout`) so a hanging
+ * third-party domain rejects within the configured bound instead of hanging
+ * the request, and `validateAnchorToml` ensures malformed or non-HTTPS fields
+ * are never cached (#281).
  */
-export async function getAnchorConfig(config) {
+export async function getAnchorConfig(
+  config,
+  { resolver = (domain) => StellarToml.Resolver.resolve(domain) } = {},
+) {
+  const homeDomain = config?.anchor?.homeDomain;
+  if (!homeDomain || typeof homeDomain !== 'string') {
+    throw new Error('anchor.homeDomain is required');
+  }
+
   const now = Date.now();
-  if (cache.value && cache.expiresAt > now) {
+  if (cache.value && cache.value.homeDomain === homeDomain && cache.expiresAt > now) {
     return cache.value;
   }
 
-  const toml = await withRetry(
-    () => StellarToml.Resolver.resolve(config.anchor.homeDomain),
-    {
-      attempts: TOML_FETCH_ATTEMPTS,
-      timeoutMs: TOML_FETCH_TIMEOUT_MS,
-      label: 'stellar.toml resolve',
-    },
-  );
+  const toml = await withRetry(() => resolver(homeDomain), {
+    attempts: TOML_FETCH_ATTEMPTS,
+    timeoutMs: TOML_FETCH_TIMEOUT_MS,
+    label: 'stellar.toml resolve',
+  });
 
+  const validated = validateAnchorToml(toml);
   const value = {
-    homeDomain: config.anchor.homeDomain,
-    signingKey: toml?.SIGNING_KEY ?? null,
-    webAuthEndpoint: toml?.WEB_AUTH_ENDPOINT ?? null,
-    transferServer: toml?.TRANSFER_SERVER_SEP0024 ?? toml?.TRANSFER_SERVER ?? null,
+    homeDomain,
+    ...validated,
   };
 
   cache = { value, expiresAt: now + CACHE_TTL_MS };
-  logger.info({ homeDomain: config.anchor.homeDomain }, 'anchor config resolved');
+  logger.info({ homeDomain }, 'anchor config resolved');
   return value;
 }
 
