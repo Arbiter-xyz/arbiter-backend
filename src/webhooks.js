@@ -2,6 +2,7 @@ import { randomBytes, createCipheriv, createDecipheriv, createHash } from 'node:
 import { BlockList, isIP } from 'node:net';
 import { store } from './store.js';
 import { config } from './config.js';
+import { logger } from './logger.js';
 
 /**
  * Webhook registrations: an owner tells Arbiter where to POST when one of
@@ -91,20 +92,83 @@ for (const [net, prefix] of [
   blocked.addSubnet(net, prefix, 'ipv6');
 }
 
+/**
+ * Parses a valid IPv6 address into 8 16-bit hextets and returns the embedded
+ * dotted-quad IPv4 string if the address is IPv4-mapped (`::ffff:0:0/96`),
+ * SIIT IPv4-translated (`::ffff:0:0:0/96`), or IPv4-compatible (`::/96`),
+ * covering both dotted-quad (`::ffff:127.0.0.1`) and WHATWG URL canonical
+ * hex-hextet (`::ffff:7f00:1`) representations (#338).
+ */
+function extractEmbeddedIpv4(ipv6) {
+  let normalized = ipv6.toLowerCase();
+  const zoneIdx = normalized.indexOf('%');
+  if (zoneIdx !== -1) normalized = normalized.slice(0, zoneIdx);
+
+  // Convert trailing dotted-quad (e.g. ::ffff:127.0.0.1) into two hex hextets.
+  const dottedMatch = /^(.*:)(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(normalized);
+  if (dottedMatch) {
+    const octets = dottedMatch.slice(2, 6).map(Number);
+    if (octets.some((o) => o < 0 || o > 255)) return null;
+    const hi = ((octets[0] << 8) | octets[1]).toString(16);
+    const lo = ((octets[2] << 8) | octets[3]).toString(16);
+    normalized = `${dottedMatch[1]}${hi}:${lo}`;
+  }
+
+  const halves = normalized.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - (left.length + right.length);
+  if ((halves.length === 1 && missing !== 0) || missing < 0) return null;
+
+  const words = [...left, ...Array(missing).fill('0'), ...right].map((w) => parseInt(w, 16));
+  if (words.length !== 8 || words.some((w) => Number.isNaN(w) || w < 0 || w > 0xffff)) return null;
+
+  const isMapped =
+    words[0] === 0 &&
+    words[1] === 0 &&
+    words[2] === 0 &&
+    words[3] === 0 &&
+    words[4] === 0 &&
+    words[5] === 0xffff;
+  const isTranslated =
+    words[0] === 0 &&
+    words[1] === 0 &&
+    words[2] === 0 &&
+    words[3] === 0 &&
+    words[4] === 0xffff &&
+    words[5] === 0;
+  const isCompatible =
+    words[0] === 0 &&
+    words[1] === 0 &&
+    words[2] === 0 &&
+    words[3] === 0 &&
+    words[4] === 0 &&
+    words[5] === 0 &&
+    (words[6] !== 0 || words[7] > 1);
+
+  if (!isMapped && !isTranslated && !isCompatible) return null;
+  const hi = words[6];
+  const lo = words[7];
+  return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+}
+
 /** True for any address a webhook must never be delivered to. */
 export function isBlockedAddress(address) {
-  const family = isIP(address);
+  if (typeof address !== 'string') return true;
+  const clean = address.replace(/^\[|\]$/g, '');
+  const family = isIP(clean);
   if (family === 0) return true;
   if (family === 6) {
-    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
-    if (mapped) return blocked.check(mapped[1], 'ipv4');
-    return blocked.check(address, 'ipv6');
+    const embeddedV4 = extractEmbeddedIpv4(clean);
+    if (embeddedV4) return blocked.check(embeddedV4, 'ipv4');
+    return blocked.check(clean, 'ipv6');
   }
-  return blocked.check(address, 'ipv4');
+  return blocked.check(clean, 'ipv4');
 }
 
 /** Returns the normalized URL string, or throws WebhookError. */
-export function validateWebhookUrl(raw, { allowInsecure = config.webhooks.allowInsecureTargets } = {}) {
+export function validateWebhookUrl(raw, { allowInsecure = config.webhooks?.allowInsecureTargets } = {}) {
   if (typeof raw !== 'string' || raw.trim() === '') throw new WebhookError('url (string) is required');
   if (raw.length > MAX_URL_LENGTH) throw new WebhookError(`url must be at most ${MAX_URL_LENGTH} characters`);
 
@@ -133,25 +197,40 @@ export function validateWebhookUrl(raw, { allowInsecure = config.webhooks.allowI
 
 // ── Secret storage ───────────────────────────────────────────────────────
 
-function encryptionKey() {
-  const k = config.webhooks.secretEncryptionKey;
+let warnedPlaintextSecret = false;
+
+export function resetPlaintextSecretWarningForTests() {
+  warnedPlaintextSecret = false;
+}
+
+function encryptionKey(overrideKey) {
+  const k = overrideKey !== undefined ? overrideKey : config.webhooks?.secretEncryptionKey;
   return k ? createHash('sha256').update(k).digest() : null;
 }
 
 /** Encrypts a signing secret for storage when WEBHOOK_SECRET_ENCRYPTION_KEY
- * is set (AES-256-GCM, so tampering is detected on read). */
-export function sealSecret(secret) {
-  const key = encryptionKey();
-  if (!key) return `raw:${secret}`;
+ * is set (AES-256-GCM, so tampering is detected on read). Logs a warning
+ * when falling back to plaintext storage (#279). */
+export function sealSecret(secret, { secretKey } = {}) {
+  const key = encryptionKey(secretKey);
+  if (!key) {
+    if (!warnedPlaintextSecret) {
+      warnedPlaintextSecret = true;
+      logger.warn(
+        'WEBHOOK_SECRET_ENCRYPTION_KEY is not set — storing webhook signing secret in plaintext (raw: prefix)',
+      );
+    }
+    return `raw:${secret}`;
+  }
   const iv = randomBytes(12);
   const cipher = createCipheriv('aes-256-gcm', key, iv);
   const ct = Buffer.concat([cipher.update(secret, 'utf8'), cipher.final()]);
   return `gcm:${iv.toString('base64url')}.${cipher.getAuthTag().toString('base64url')}.${ct.toString('base64url')}`;
 }
 
-export function openSecret(sealed) {
+export function openSecret(sealed, { secretKey } = {}) {
   if (sealed.startsWith('raw:')) return sealed.slice(4);
-  const key = encryptionKey();
+  const key = encryptionKey(secretKey);
   if (!key) throw new Error('webhook secret is encrypted but WEBHOOK_SECRET_ENCRYPTION_KEY is not set');
   const [iv, tag, ct] = sealed.slice(4).split('.').map((p) => Buffer.from(p, 'base64url'));
   const decipher = createDecipheriv('aes-256-gcm', key, iv);
@@ -190,9 +269,12 @@ export async function registerWebhook(owner, rawUrl, { description } = {}) {
   }
 
   const ids = await ownerIds(owner);
-  const existing = (await Promise.all(ids.map((id) => store.get(REG_PREFIX + id)))).filter(Boolean);
-  if (existing.length >= config.webhooks.maxPerOwner) {
-    throw new WebhookError(`at most ${config.webhooks.maxPerOwner} webhooks per owner — delete one first`, 409);
+  const recordsAtRead = await Promise.all(ids.map((id) => store.get(REG_PREFIX + id)));
+  const missingIds = new Set(ids.filter((_, idx) => !recordsAtRead[idx]));
+  const existing = recordsAtRead.filter(Boolean);
+  const maxPerOwner = config.webhooks?.maxPerOwner ?? 10;
+  if (existing.length >= maxPerOwner) {
+    throw new WebhookError(`at most ${maxPerOwner} webhooks per owner — delete one first`, 409);
   }
   if (existing.some((r) => r.url === url)) {
     throw new WebhookError('a webhook for this url is already registered', 409);
@@ -214,7 +296,15 @@ export async function registerWebhook(owner, rawUrl, { description } = {}) {
   // No TTL: registrations are identity/config records and must survive
   // restarts, like every other such record in this codebase.
   await store.set(REG_PREFIX + id, record);
-  await store.set(OWNER_PREFIX + owner, [id, ...ids.filter((x) => existing.some((r) => r.id === x))]);
+  // Re-read the owner's index before writing so a concurrent registration
+  // completed between the initial read and now is preserved, while still
+  // pruning only IDs confirmed missing at read time (#277).
+  const latestIds = await ownerIds(owner);
+  const mergedOwnerIds = [
+    id,
+    ...latestIds.filter((x) => x !== id && !missingIds.has(x)),
+  ];
+  await store.set(OWNER_PREFIX + owner, mergedOwnerIds);
   const known = (await store.get(WEBHOOK_INDEX_KEY)) || [];
   await store.set(WEBHOOK_INDEX_KEY, [id, ...known].slice(0, MAX_TRACKED_WEBHOOKS));
 

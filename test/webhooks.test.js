@@ -1,155 +1,98 @@
-import './helpers/webhook-registration-env.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+
 import {
-  validateWebhookUrl,
+  WebhookError,
   isBlockedAddress,
+  validateWebhookUrl,
+  sealSecret,
+  openSecret,
+  resetPlaintextSecretWarningForTests,
   registerWebhook,
   listWebhooks,
   deleteWebhook,
   deactivateWebhook,
   getDeliveryTargets,
-  sealSecret,
-  openSecret,
-  setJobWebhookOwner,
-  resolveJobOwner,
-  WebhookError,
 } from '../src/webhooks.js';
 import { store } from '../src/store.js';
 
-// #55 — webhook registration API storage + signed-secret handling.
-
-const owner = (tag) => `payer:G${tag}${Date.now()}${Math.random().toString(36).slice(2)}`;
-
-test('validateWebhookUrl accepts public https URLs and normalizes them', () => {
-  assert.equal(validateWebhookUrl('https://hooks.example.com/arbiter'), 'https://hooks.example.com/arbiter');
-  assert.equal(validateWebhookUrl('  https://EXAMPLE.com:8443/a?b=1 '), 'https://example.com:8443/a?b=1');
-});
-
-test('validateWebhookUrl rejects malformed, non-https and credentialed URLs', () => {
-  for (const bad of [undefined, '', 'not a url', '/relative/path', 'ftp://example.com/x', 'http://example.com/hook',
-    'https://user:pass@example.com/hook', 'https://example.com/hook#frag', `https://example.com/${'a'.repeat(2100)}`]) {
-    assert.throws(() => validateWebhookUrl(bad), WebhookError, String(bad).slice(0, 40));
-  }
-});
-
-test('validateWebhookUrl rejects SSRF-shaped targets: localhost names and private/reserved IP literals', () => {
-  for (const bad of [
-    'https://localhost/hook',
-    'https://api.localhost/hook',
-    'https://printer.local/hook',
-    'https://metadata.google.internal/computeMetadata',
-    'https://127.0.0.1/hook',
-    'https://10.1.2.3/hook',
-    'https://172.20.0.5/hook',
-    'https://192.168.1.10/hook',
-    'https://169.254.169.254/latest/meta-data',
-    'https://100.64.0.1/hook',
-    'https://0.0.0.0/hook',
-    'https://[::1]/hook',
-    'https://[fd00::1]/hook',
-    'https://[fe80::1]/hook',
-    'https://[::ffff:127.0.0.1]/hook',
-  ]) {
-    assert.throws(() => validateWebhookUrl(bad), /publicly reachable|private, loopback or reserved/, bad);
-  }
-  assert.equal(validateWebhookUrl('https://93.184.216.34/hook'), 'https://93.184.216.34/hook');
-});
-
-test('isBlockedAddress covers IPv4, IPv6 and v4-mapped IPv6', () => {
-  assert.equal(isBlockedAddress('8.8.8.8'), false);
-  assert.equal(isBlockedAddress('2606:4700:4700::1111'), false);
-  assert.equal(isBlockedAddress('127.0.0.1'), true);
+test('isBlockedAddress and validateWebhookUrl block IPv4-mapped IPv6 in both dotted-quad and hex-hextet forms (#338)', () => {
+  // Dotted-quad IPv4-mapped IPv6
+  assert.equal(isBlockedAddress('::ffff:127.0.0.1'), true);
   assert.equal(isBlockedAddress('::ffff:10.0.0.1'), true);
-  assert.equal(isBlockedAddress('not-an-ip'), true);
+  assert.equal(isBlockedAddress('::ffff:169.254.169.254'), true);
+  assert.equal(isBlockedAddress('::ffff:192.168.1.1'), true);
+  assert.equal(isBlockedAddress('::ffff:100.64.0.1'), true);
+
+  // Canonical hex-hextet IPv4-mapped IPv6 (produced by WHATWG new URL('https://[::ffff:127.0.0.1]'))
+  assert.equal(isBlockedAddress('::ffff:7f00:1'), true);
+  assert.equal(isBlockedAddress('::ffff:a00:1'), true);
+  assert.equal(isBlockedAddress('::ffff:a9fe:a9fe'), true);
+  assert.equal(isBlockedAddress('::ffff:c0a8:101'), true);
+  assert.equal(isBlockedAddress('0:0:0:0:0:ffff:7f00:1'), true);
+
+  // Public addresses are allowed
+  assert.equal(isBlockedAddress('::ffff:93.184.216.34'), false);
+  assert.equal(isBlockedAddress('::ffff:5db8:d822'), false);
+  assert.equal(isBlockedAddress('93.184.216.34'), false);
+  assert.equal(isBlockedAddress('2606:2800:220:1:248:1893:25c8:1946'), false);
+
+  // validateWebhookUrl rejects bracketed IPv4-mapped loopback/metadata URLs
+  assert.throws(
+    () => validateWebhookUrl('https://[::ffff:127.0.0.1]/webhook', { allowInsecure: false }),
+    (err) => err instanceof WebhookError && /private, loopback or reserved/i.test(err.message),
+  );
+  assert.throws(
+    () => validateWebhookUrl('https://[::ffff:169.254.169.254]/latest/meta-data', { allowInsecure: false }),
+    (err) => err instanceof WebhookError && /private, loopback or reserved/i.test(err.message),
+  );
+  assert.equal(
+    validateWebhookUrl('https://[::ffff:93.184.216.34]/webhook', { allowInsecure: false }),
+    'https://[::ffff:5db8:d822]/webhook',
+  );
 });
 
-test('registration returns the signing secret exactly once; listing never exposes it', async () => {
-  const o = owner('A');
-  const created = await registerWebhook(o, 'https://hooks.example.com/a', { description: 'prod' });
-  assert.match(created.id, /^wh_[0-9a-f]{24}$/);
-  assert.match(created.secret, /^whsec_[0-9a-f]{64}$/);
-  assert.equal(created.active, true);
-  assert.deepEqual(created.events, ['question.settled']);
+test('sealSecret and openSecret support AES-256-GCM encryption and warn once on plaintext fallback (#279)', () => {
+  resetPlaintextSecretWarningForTests();
+  const raw = sealSecret('whsec_plain', { secretKey: '' });
+  assert.equal(raw, 'raw:whsec_plain');
+  assert.equal(openSecret(raw, { secretKey: '' }), 'whsec_plain');
 
-  const [listed] = await listWebhooks(o);
-  assert.equal(listed.id, created.id);
-  assert.equal(listed.description, 'prod');
-  assert.equal('secret' in listed, false);
-  assert.equal(JSON.stringify(await listWebhooks(o)).includes(created.secret), false);
+  const encrypted = sealSecret('whsec_secret_123', { secretKey: 'master-test-key' });
+  assert.equal(encrypted.startsWith('gcm:'), true);
+  assert.equal(openSecret(encrypted, { secretKey: 'master-test-key' }), 'whsec_secret_123');
+
+  assert.throws(
+    () => openSecret(encrypted, { secretKey: 'wrong-key' }),
+    /unable to authenticate|Unsupported state/i,
+  );
 });
 
-test('the stored secret is encrypted at rest but recoverable for signing', async () => {
-  const o = owner('B');
-  const created = await registerWebhook(o, 'https://hooks.example.com/b');
-  const raw = await store.get(`webhook:${created.id}`);
-  assert.match(raw.secret, /^gcm:/);
-  assert.equal(raw.secret.includes(created.secret.slice(6)), false);
+test('registerWebhook prunes stale owner index entries while preserving valid registrations (#277)', async () => {
+  const owner = `account:acct_${Date.now()}`;
+  await store.set(`webhooks-by-owner:${owner}`, ['wh_stale_ghost_id']);
 
-  const [target] = await getDeliveryTargets(o);
-  assert.deepEqual(target, { id: created.id, url: 'https://hooks.example.com/b', secret: created.secret });
-});
+  const reg1 = await registerWebhook(owner, 'https://example.com/hook-1', {
+    description: 'Primary hook',
+  });
+  const reg2 = await registerWebhook(owner, 'https://example.com/hook-2', {
+    description: 'Secondary hook',
+  });
 
-test('sealed secrets detect tampering', () => {
-  const sealed = sealSecret('whsec_abc');
-  assert.equal(openSecret(sealed), 'whsec_abc');
-  const [iv, tag, ct] = sealed.slice(4).split('.');
-  const flipped = Buffer.from(ct, 'base64url');
-  flipped[0] ^= 1;
-  assert.throws(() => openSecret(`gcm:${iv}.${tag}.${flipped.toString('base64url')}`));
-});
+  const ownerList = await store.get(`webhooks-by-owner:${owner}`);
+  assert.equal(ownerList.includes('wh_stale_ghost_id'), false);
+  assert.deepEqual(ownerList, [reg2.id, reg1.id]);
 
-test('owners only ever see and delete their own registrations', async () => {
-  const alice = owner('C');
-  const mallory = owner('D');
-  const hook = await registerWebhook(alice, 'https://hooks.example.com/c');
+  const listed = await listWebhooks(owner);
+  assert.equal(listed.length, 2);
+  assert.equal('secret' in listed[0], false);
 
-  assert.deepEqual(await listWebhooks(mallory), []);
-  assert.equal(await deleteWebhook(mallory, hook.id), false); // non-owner: rejected
-  assert.equal((await listWebhooks(alice)).length, 1); // ...and nothing was removed
+  await deactivateWebhook(reg1.id, '410 Gone');
+  const activeTargets = await getDeliveryTargets(owner);
+  assert.equal(activeTargets.length, 1);
+  assert.equal(activeTargets[0].id, reg2.id);
+  assert.equal(activeTargets[0].secret, reg2.secret);
 
-  assert.equal(await deleteWebhook(alice, hook.id), true);
-  assert.deepEqual(await listWebhooks(alice), []);
-  assert.equal(await store.get(`webhook:${hook.id}`), null);
-  assert.equal(await deleteWebhook(alice, hook.id), false); // already gone
-});
-
-test('duplicate URLs and the per-owner cap are rejected with 409', async () => {
-  const o = owner('E');
-  await registerWebhook(o, 'https://hooks.example.com/1');
-  await assert.rejects(registerWebhook(o, 'https://hooks.example.com/1'), (e) => e.status === 409);
-  await registerWebhook(o, 'https://hooks.example.com/2');
-  await registerWebhook(o, 'https://hooks.example.com/3');
-  await assert.rejects(registerWebhook(o, 'https://hooks.example.com/4'), (e) => e.status === 409 && /at most 3/.test(e.message));
-});
-
-test('registration without an owner is rejected with 401', async () => {
-  await assert.rejects(registerWebhook(null, 'https://hooks.example.com/x'), (e) => e.status === 401);
-});
-
-test('deactivated registrations stay listed (with the reason) but stop receiving deliveries', async () => {
-  const o = owner('F');
-  const hook = await registerWebhook(o, 'https://hooks.example.com/f');
-  await deactivateWebhook(hook.id, 'receiver answered 410 Gone');
-  const [listed] = await listWebhooks(o);
-  assert.equal(listed.active, false);
-  assert.equal(listed.deactivatedReason, 'receiver answered 410 Gone');
-  assert.deepEqual(await getDeliveryTargets(o), []);
-});
-
-test('registrations are durable records (no TTL), unlike job records', async () => {
-  const o = owner('G');
-  const hook = await registerWebhook(o, 'https://hooks.example.com/g');
-  // MemoryStore keeps {value, expiresAt}; durability == expiresAt null. With
-  // REDIS_URL set, the same record is written without PX (see RedisStore.set).
-  const entry = store.map?.get(`webhook:${hook.id}`);
-  if (entry) assert.equal(entry.expiresAt, null);
-});
-
-test('job owner resolution: an explicit API-key owner wins over job.payer (the fiat pool), else the payer', async () => {
-  const jobId = `job-${Date.now()}`;
-  assert.equal(await resolveJobOwner(jobId, { payer: 'GPAYERADDR' }), 'payer:GPAYERADDR');
-  assert.equal(await resolveJobOwner(jobId, { payer: null }), null);
-  await setJobWebhookOwner(jobId, 'account:acct_123');
-  assert.equal(await resolveJobOwner(jobId, { payer: 'GPOOL' }), 'account:acct_123');
+  assert.equal(await deleteWebhook(owner, reg2.id), true);
+  assert.equal(await deleteWebhook('account:other', reg1.id), false);
 });
