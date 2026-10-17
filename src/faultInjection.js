@@ -17,21 +17,47 @@
  * matching requests affected.
  */
 
+import path from 'node:path';
+
 const FAULT_TYPES = new Set(['http_error', 'latency']);
 const MAX_DELAY_MS = 30_000;
+const PROTECTED_PREFIXES = ['/admin', '/metrics'];
+
+function normalizePathPrefix(rawPrefix) {
+  if (typeof rawPrefix !== 'string' || !rawPrefix.startsWith('/')) {
+    throw new Error('pathPrefix must be a path starting with /');
+  }
+  let decoded;
+  try {
+    decoded = decodeURIComponent(rawPrefix);
+  } catch {
+    throw new Error('pathPrefix must be a valid URI path');
+  }
+  if (decoded.split('/').includes('..')) {
+    throw new Error('faults cannot target /admin or /metrics');
+  }
+  return path.posix.normalize(decoded.replace(/\/+/g, '/'));
+}
+
+function targetsProtectedRoute(normalizedPrefix) {
+  const lower = normalizedPrefix.toLowerCase();
+  return PROTECTED_PREFIXES.some(
+    (protectedPath) => lower.startsWith(protectedPath) || protectedPath.startsWith(lower),
+  );
+}
 
 export function validateFault(input) {
   const fault = { ...input };
   if (!FAULT_TYPES.has(fault.type)) throw new Error(`type must be one of ${[...FAULT_TYPES].join(', ')}`);
-  if (typeof fault.pathPrefix !== 'string' || !fault.pathPrefix.startsWith('/')) {
-    throw new Error('pathPrefix must be a path starting with /');
-  }
-  if (fault.pathPrefix.startsWith('/admin') || fault.pathPrefix.startsWith('/metrics')) {
+  const normalizedPrefix = normalizePathPrefix(fault.pathPrefix);
+  if (targetsProtectedRoute(normalizedPrefix)) {
     // Never let a drill lock itself out of clearing the fault, or blind the scrape.
     throw new Error('faults cannot target /admin or /metrics');
   }
   fault.rate = fault.rate ?? 1;
-  if (typeof fault.rate !== 'number' || fault.rate < 0 || fault.rate > 1) throw new Error('rate must be between 0 and 1');
+  if (typeof fault.rate !== 'number' || !Number.isFinite(fault.rate) || fault.rate < 0 || fault.rate > 1) {
+    throw new Error('rate must be between 0 and 1');
+  }
   if (fault.type === 'http_error') {
     fault.status = fault.status ?? 503;
     if (!Number.isInteger(fault.status) || fault.status < 500 || fault.status > 599) {
@@ -42,17 +68,21 @@ export function validateFault(input) {
       throw new Error(`delayMs must be an integer between 1 and ${MAX_DELAY_MS}`);
     }
   }
-  return { id: fault.id || `${fault.type}:${fault.pathPrefix}`, ...fault };
+  return { id: fault.id || `${fault.type}:${ fault.pathPrefix }`, ...fault };
 }
 
 export function createFaultInjector({ random = Math.random } = {}) {
   const faults = new Map();
 
   function middleware(req, res, next) {
+    const reqPath = String(req.path || '').toLowerCase();
+    if (PROTECTED_PREFIXES.some((p) => reqPath.startsWith(p))) {
+      return next();
+    }
     let delayMs = 0;
     let errorStatus = null;
     for (const fault of faults.values()) {
-      if (!req.path.startsWith(fault.pathPrefix) || random() >= fault.rate) continue;
+      if (!reqPath.startsWith(fault.pathPrefix.toLowerCase()) || random() >= fault.rate) continue;
       if (fault.type === 'latency') delayMs = Math.max(delayMs, fault.delayMs);
       else errorStatus ??= fault.status;
     }
