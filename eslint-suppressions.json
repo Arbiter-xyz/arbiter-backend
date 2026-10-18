@@ -1,0 +1,155 @@
+{
+  "server.js": {
+    "no-undef": {
+      "count": 2
+    },
+    "no-unused-vars": {
+      "count": 1
+    }
+  },
+  "src/admin.js": {
+    "no-undef": {
+      "count": 8
+    },
+    "no-unused-vars": {
+      "count": 2
+    }
+  },
+  "src/adminAuth.js": {
+    "no-unused-vars": {
+      "count": 1
+    }
+  },
+  "src/billing.js": {
+    "no-undef": {
+      "count": 11
+    },
+    "no-unused-vars": {
+      "count": 5
+    }
+  },
+  "src/config.js": {
+    "no-unused-vars": {
+      "count": 1
+    }
+  },
+  "src/dispatch.js": {
+    "no-undef": {
+      "count": 2
+    },
+    "no-unused-vars": {
+      "count": 3
+    }
+  },
+  "src/fraudScoring.js": {
+    "no-unused-vars": {
+      "count": 1
+    }
+  },
+  "src/jobs.js": {
+    "no-unused-vars": {
+      "count": 1
+    }
+  },
+  "src/metered.js": {
+    "local/import-resolve": {
+      "count": 2
+    },
+    "no-undef": {
+      "count": 3
+    }
+  },
+  "src/oracle.js": {
+    "local/import-resolve": {
+      "count": 6
+    },
+    "no-undef": {
+      "count": 4
+    },
+    "no-unused-vars": {
+      "count": 3
+    }
+  },
+  "src/payerIndex.js": {
+    "no-unused-vars": {
+      "count": 3
+    }
+  },
+  "src/reconcile.js": {
+    "no-undef": {
+      "count": 9
+    },
+    "no-unused-vars": {
+      "count": 1
+    }
+  },
+  "src/sandbox.js": {
+    "local/import-resolve": {
+      "count": 1
+    }
+  },
+  "src/server.js": {
+    "local/import-resolve": {
+      "count": 6
+    },
+    "no-undef": {
+      "count": 25
+    },
+    "no-unused-vars": {
+      "count": 3
+    }
+  },
+  "src/stellarClient.js": {
+    "no-unused-vars": {
+      "count": 2
+    }
+  },
+  "src/webhookDelivery.js": {
+    "local/import-resolve": {
+      "count": 4
+    }
+  },
+  "test/anchor.test.js": {
+    "local/import-resolve": {
+      "count": 1
+    }
+  },
+  "test/dispatch.test.js": {
+    "local/import-resolve": {
+      "count": 5
+    },
+    "no-unused-vars": {
+      "count": 3
+    }
+  },
+  "test/draftSuggestions.test.js": {
+    "local/import-resolve": {
+      "count": 2
+    }
+  },
+  "test/escalation.test.js": {
+    "local/import-resolve": {
+      "count": 5
+    }
+  },
+  "test/privatePoolDispatch.test.js": {
+    "local/import-resolve": {
+      "count": 2
+    }
+  },
+  "test/webhookDelivery.test.js": {
+    "local/import-resolve": {
+      "count": 3
+    }
+  },
+  "test/webhooks.test.js": {
+    "local/import-resolve": {
+      "count": 12
+    }
+  },
+  "test/workerAuth.test.js": {
+    "no-unused-vars": {
+      "count": 1
+    }
+  }
+}

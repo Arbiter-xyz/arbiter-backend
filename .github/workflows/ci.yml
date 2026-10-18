@@ -5,6 +5,25 @@ on:
   pull_request:
 
 jobs:
+  # Mark this job ("Lint (ESLint)") as a required status check in branch
+  # protection. It catches the class of bug #218/#219 spent two cleanup PRs
+  # on: names nothing declares or imports, imports a module doesn't export,
+  # duplicate declarations, and dead code (see eslint.config.mjs). Violations
+  # that predate the gate are recorded in eslint-suppressions.json; anything
+  # new fails, and fixing a recorded one requires `npm run lint:prune` so the
+  # baseline only ever shrinks. Needs no `npm ci`: the config has no
+  # dependencies beyond ESLint itself, which the script pins.
+  lint:
+    name: Lint (ESLint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: npm run lint
+
   test:
     name: Check and test
     runs-on: ubuntu-latest
@@ -20,7 +39,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm run lint
+      - run: npm run check
       - run: npm test
       - name: MCP server tests
         working-directory: mcp-server
@@ -53,10 +72,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js ${{ matrix.node-version }}
+      # There is no matrix in this job, so the old ${{ matrix.node-version }}
+      # resolved to nothing and the runner's default Node was used.
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: 22
           cache: npm
 
       - name: Install dependencies

@@ -1,11 +1,20 @@
 {
-  "name": "backend",
-  "version": "1.0.0",
+  "name": "arbiter-backend",
+  "version": "0.2.0",
+  "private": true,
+  "license": "Apache-2.0",
   "description": "Dispatch, settlement, and billing backend",
-  "main": "src/index.js",
+  "type": "module",
+  "main": "src/server.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "check": "for f in src/*.js scripts/*.js; do node --check \"$f\" || exit 1; done",
+    "lint": "npx --yes eslint@10.12.0 .",
+    "lint:prune": "npx --yes eslint@10.12.0 . --prune-suppressions",
+    "test": "node --test --test-timeout=30000",
+    "loadtest": "node scripts/loadtest.js",
+    "verify-provenance": "node scripts/verify-provenance.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.0",
