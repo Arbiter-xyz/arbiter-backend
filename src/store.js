@@ -1,3 +1,4 @@
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { config } from './config.js';
 import { logger } from './logger.js';
 
@@ -252,6 +253,25 @@ export class RedisStore {
     return result;
   }
 }
+
+async function createStore() {
+  if (!config.redisUrl) {
+    logger.info('REDIS_URL not set — using in-memory store (single-instance only)');
+    return new MemoryStore();
+  }
+  try {
+    const { default: Redis } = await import('ioredis');
+    const client = new Redis(config.redisUrl, { lazyConnect: false });
+    await client.ping();
+    logger.info('Connected to Redis store');
+    return new RedisStore(client);
+  } catch (err) {
+    logger.warn({ err }, 'Redis unavailable — falling back to in-memory store (single-instance only)');
+    return new MemoryStore();
+  }
+}
+
+export const store = await createStore();
 
 /**
  * Federation reputation credentials (#86).

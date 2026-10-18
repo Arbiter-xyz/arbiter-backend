@@ -110,7 +110,7 @@ function captureResponse(message) {
 }
 
 let anthropicClient = null;
-function getClient() {
+export function getClient() {
   if (!config.anthropicApiKey) return null;
   if (!anthropicClient) {
     // The SDK's own defaults (2 retries, but a 10-MINUTE timeout) are tuned

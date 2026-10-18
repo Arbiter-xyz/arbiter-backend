@@ -35,6 +35,13 @@ export function getServer() {
   return server;
 }
 
+/** Latest ledger sequence seen by the configured RPC endpoint — used by
+ * healthProbes.js's chain-liveness probe. */
+export async function getLatestLedgerSequence() {
+  const { sequence } = await getServer().getLatestLedger();
+  return sequence;
+}
+
 /** Comma-separated list of configured RPC URLs, mirroring
  * config.allowedOrigins' comma-split parsing convention. The first entry is
  * the primary; the rest are ordered failover candidates. A single-URL

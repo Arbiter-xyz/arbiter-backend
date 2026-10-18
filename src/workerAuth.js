@@ -182,10 +182,46 @@ export async function verifySession(token) {
  * before sids existed can't be revoked individually and are rejected. */
 export async function revokeSession(token) {
   const parsed = parseSessionToken(token);
-  if (!parsed) return null;
-  if (!parsed.sid) return null;
+  if (!parsed || !parsed.sid) return null;
+  if (await store.get(REVOKED_PREFIX + parsed.sid)) return null;
   const remainingMs = parsed.exp - Date.now();
   if (remainingMs <= 0) return null;
   await store.set(REVOKED_PREFIX + parsed.sid, '1', remainingMs);
   return parsed.address;
+}
+
+/**
+ * The single implementation of "prove control of a Stellar address via
+ * challenge/response", mounted at both /payers/:address/session* and
+ * /workers/:address/session* (the token doesn't distinguish the two —
+ * only the route naming does). `middleware` is applied to every route.
+ */
+export function mountSessionRoutes(app, basePath, ...middleware) {
+  app.post(`${basePath}/:address/session/challenge`, ...middleware, async (req, res) => {
+    try {
+      const xdr = await buildChallengeXdr(req.params.address);
+      res.json({ xdr });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post(`${basePath}/:address/session`, ...middleware, async (req, res) => {
+    const { signedXdr } = req.body || {};
+    if (!signedXdr) return res.status(400).json({ error: 'signedXdr is required' });
+    const session = await verifyChallengeAndIssueSession(req.params.address, signedXdr);
+    if (!session) return res.status(401).json({ error: 'challenge verification failed — signature did not match, or the challenge expired' });
+    res.json(session);
+  });
+
+  // Revokes the session making the request — requires the token itself,
+  // not just knowledge of the address.
+  app.post(`${basePath}/:address/session/revoke`, ...middleware, async (req, res) => {
+    const token = req.body?.token;
+    if ((await verifySession(token)) !== req.params.address) {
+      return res.status(401).json({ error: 'a valid session token for this address is required' });
+    }
+    await revokeSession(token);
+    res.json({ ok: true });
+  });
 }

@@ -25,7 +25,7 @@ import { config } from './config.js';
  * route wiring) — without that, anyone could charge against a balance they
  * don't own just by naming someone else's address.
  */
-export async function askMetered(payerAddress, questionText, tierKey, category, { ownerAccountId } = {}) {
+export async function askMetered(payerAddress, questionText, tierKey, category, { ownerAccountId, consensusRule = null } = {}) {
   const questionId = (await nextQuestionId()).toString();
   const priced = priceForTier(tierKey, getSmoothedOnlineWorkerCount());
 
@@ -47,7 +47,7 @@ export async function askMetered(payerAddress, questionText, tierKey, category, 
   await stashQuestion(questionId, pending);
 
   const tier = { ...priced };
-  const { jobId } = await startFulfillment(questionId, pending, tier, payerAddress, { ownerAccountId });
+  const { jobId, cancellableUntil } = await startFulfillment(questionId, pending, tier, payerAddress, { ownerAccountId });
 
   return {
     jobId,

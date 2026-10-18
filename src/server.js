@@ -16,7 +16,7 @@ import {
 import { getStats } from './stats.js';
 import { getVapidPublicKey, isPushConfigured, saveSubscription, removeSubscription } from './push.js';
 import { getPayerQuestionIds, summarizePayerQuestions, bucketPayerSpend } from './payerIndex.js';
-import { requiresAuth, verifySession, mountSessionRoutes } from './workerAuth.js';
+import { requiresAuth, verifySession, mountSessionRoutes, verifySessionToken } from './workerAuth.js';
 import {
   buildSponsoredOnboardTx,
   finalizeSponsoredOnboardTx,
@@ -26,7 +26,7 @@ import {
   feeBumpWithdrawTo,
 } from './sponsor.js';
 import { getStashedQuestion, nextQuestionId } from './pendingQuestions.js';
-import { getOwedOnChain, getStakeOnChain } from './stellarClient.js';
+import { getOwedOnChain, getStakeOnChain, getLatestLedgerSequence } from './stellarClient.js';
 import { askMetered, getMeteredBalance, depositInstructions } from './metered.js';
 import { getLeaderboard } from './leaderboard.js';
 import { getWorkerDashboard } from './workerAnalytics.js';
@@ -44,6 +44,7 @@ import { parseConsensusRule } from './consensus.js';
 import { getPrivatePool, addPoolWorkers, removePoolWorkers, PoolValidationError } from './privatePools.js';
 import { isBillingConfigured, createCheckoutSession, handleStripeWebhook, rotateApiKey, getCreditBalanceStroops, reserveCredit, settleReservation } from './billing.js';
 import { registerWebhook, listWebhooks, deleteWebhook, WebhookError } from './webhooks.js';
+import { getDispatchPause, listUpcomingWindows, describePause } from './maintenanceWindows.js';
 import { logger, httpLogger } from './logger.js';
 import { startTreasuryMonitor } from './alerting.js';
 import { getProvenance } from './provenance.js';
@@ -57,6 +58,47 @@ import {
   ReferralError,
 } from './referrals.js';
 import { recordWorkerIp, noteAnswerTiming, listFlaggedPairs, getWorkerCollusionReport, clearPairFlag } from './collusion.js';
+import { store } from './store.js';
+import { getKnownJobIds, getJob } from './jobs.js';
+import {
+  metricsMiddleware,
+  metricsHandler,
+  buildInfo,
+} from './metrics.js';
+import { createFaultInjector, mountFaultRoutes } from './faultInjection.js';
+import { securityHeadersMiddleware } from './securityHeaders.js';
+import {
+  TeamError,
+  createTeam,
+  listTeamsFor,
+  requireTeamRole,
+  renameTeam,
+  deleteTeam,
+  addMembers,
+  setMemberRole,
+  removeMember,
+} from './teams.js';
+import { recordWorkerWithdrawal } from './earnings.js';
+import {
+  AutoWithdrawError,
+  getAutoWithdrawSettings,
+  setAutoWithdrawSettings,
+  deleteAutoWithdrawSettings,
+  checkAutoWithdraw,
+  submitAutoWithdraw,
+  startAutoWithdrawSweep,
+} from './autoWithdraw.js';
+import {
+  TaxReportError,
+  parseTaxYear,
+  getTaxProfile,
+  saveTaxProfile,
+  buildTaxSummary,
+  listTaxYears,
+  taxSummaryToCsv,
+} from './taxReport.js';
+import { runRecoverySweep, defaultRecoveryDeps, startRecoverySweeper } from './disasterRecovery.js';
+import { startHealthProbes } from './healthProbes.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -134,8 +176,8 @@ const byIp = (req) => req.ip;
 
 app.get('/metrics', metricsHandler({ token: config.metrics.token }));
 
-app.get('/health', (req, res) => {
-  res.json({ ok: true, onlineWorkers: onlineWorkerCount(), contractId: config.contractId });
+app.get('/health', async (req, res) => {
+  res.json({ ok: true, onlineWorkers: await onlineWorkerCount(), contractId: config.contractId });
 });
 
 // Public, like /health: the dispatch pause in effect (if any) and every
@@ -202,7 +244,7 @@ app.get('/gamification/badges', (req, res) => {
 
 app.get('/stats', async (req, res) => {
   const stats = await getStats();
-  res.json({ onlineWorkers: onlineWorkerCount(), ...stats });
+  res.json({ onlineWorkers: await onlineWorkerCount(), ...stats });
 });
 
 // ---------------------------------------------------------------------
@@ -301,6 +343,7 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
     try {
       const result = await askMetered(config.billing.fiatPoolAddress, question, tier, category, {
         ownerAccountId: apiKeyAccountId, // routes this customer's settlement webhooks
+        consensusRule: consensus.rule,
       });
       await settleReservation(apiKeyAccountId, maxStroops, Number(result.amountStroops));
       return res.status(202).json({ ...result, statusUrl: `/oracle/${result.jobId}` });
@@ -328,7 +371,7 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
     }
     if (!consensus.ok) return res.status(400).json({ error: consensus.error });
     try {
-      const result = await askMetered(payerAddress, question, tier, category, consensus.rule);
+      const result = await askMetered(payerAddress, question, tier, category, { consensusRule: consensus.rule });
       return res.status(202).json({ ...result, statusUrl: `/oracle/${result.jobId}` });
     } catch (err) {
       // #13 is ContractError::InsufficientBalance — see contracts/oracle-escrow/src/lib.rs.
@@ -1216,12 +1259,16 @@ app.get('/admin/transactions', requireAdmin, async (req, res) => {
   res.json(await listTransactions({ limit, offset }));
 });
 
+function adminPage(query) {
+  return { limit: Math.min(Number(query.limit) || 50, 200), offset: Number(query.offset) || 0 };
+}
+
 app.get('/admin/workers', requireAdmin, async (req, res) => {
-  res.json({ workers: await listWorkers() });
+  res.json({ workers: await listWorkers(adminPage(req.query)) });
 });
 
 app.get('/admin/payers', requireAdmin, async (req, res) => {
-  res.json({ payers: await listPayers() });
+  res.json({ payers: await listPayers(adminPage(req.query)) });
 });
 
 app.get('/admin/treasury', requireAdmin, async (req, res) => {

@@ -1,8 +1,9 @@
+import { config } from './config.js';
 import { logger } from './logger.js';
 import { numericToleranceVote } from './consensus.js';
-import { llmProvider } from './llmProvider.js';
+import { llmProvider, buildReconcileRequest, buildDraftRequest } from './llmProvider.js';
 
-export { buildReconcileRequest, buildDraftRequest } from './llmProvider.js';
+export { buildReconcileRequest, buildDraftRequest, getClient } from './llmProvider.js';
 
 function normalize(text) {
   return text
@@ -118,6 +119,90 @@ async function reconcileWithClaude(question, submissions, rule = null) {
   return { consensus, confidence, matchingWorkerIds, method: 'claude', llm };
 }
 
+async function draftWithClaude(question) {
+  const draft = await llmProvider.reportDraft(question);
+  if (!draft) throw new Error(`LLM provider "${llmProvider.name}" did not return a report_draft tool call`);
+  return {
+    consensus: draft.answer,
+    confidence: draft.confidence,
+    matchingWorkerIds: [],
+    method: 'llm-draft',
+    llm: draft.llm,
+  };
+}
+
+const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
+// Same ceiling as the Anthropic client. No SDK-style retry here: a failed
+// OpenAI call falls through to the next tier instead of retrying in place.
+const OPENAI_TIMEOUT_MS = 15_000;
+
+/** Re-expresses a Messages API request (tool + prompt) as the equivalent
+ * Chat Completions request, forcing the same tool, so both providers see
+ * the same prompt and return the same shape. */
+function openAIToolRequest(model, anthropicRequest) {
+  const [tool] = anthropicRequest.tools;
+  return {
+    model,
+    max_completion_tokens: anthropicRequest.max_tokens,
+    tool_choice: { type: 'function', function: { name: tool.name } },
+    tools: [{ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.input_schema } }],
+    messages: anthropicRequest.messages,
+  };
+}
+
+/** The OpenAI Chat Completions analogue of buildReconcileRequest(). */
+export function buildOpenAIReconcileRequest(question, submissions, model = config.openaiModel, rule = null) {
+  return openAIToolRequest(model, buildReconcileRequest(question, submissions, config.anthropicModel, rule));
+}
+
+/** The OpenAI analogue of buildDraftRequest(), for the instant tier's fallback. */
+export function buildOpenAIDraftRequest(question, model = config.openaiModel) {
+  return openAIToolRequest(model, buildDraftRequest(question));
+}
+
+async function postOpenAI(request) {
+  if (!config.openaiApiKey) throw new Error('OPENAI_API_KEY not configured');
+  const res = await fetch(OPENAI_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${config.openaiApiKey}` },
+    body: JSON.stringify(request),
+    signal: AbortSignal.timeout(OPENAI_TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`OpenAI API returned HTTP ${res.status}`);
+  return res.json();
+}
+
+/** Normalizes an OpenAI completion's function calls into the same tool_use
+ * block shape llmProvider.js keeps for Claude, so provenance stores and the
+ * verifier re-read both providers' tool calls identically. Throws on
+ * malformed tool arguments, which the dispatcher treats as a failed attempt. */
+function captureOpenAIResponse(completion) {
+  const choice = completion.choices?.[0];
+  const calls = choice?.message?.tool_calls || [];
+  return {
+    id: completion.id,
+    model: completion.model,
+    stop_reason: choice?.finish_reason ?? null,
+    content: calls
+      .filter((c) => c.type === 'function')
+      .map((c) => ({ type: 'tool_use', name: c.function.name, input: JSON.parse(c.function.arguments) })),
+  };
+}
+
+async function reconcileWithOpenAI(question, submissions, rule = null) {
+  const request = buildOpenAIReconcileRequest(question, submissions, config.openaiModel, rule);
+  const response = captureOpenAIResponse(await postOpenAI(request));
+
+  const toolUse = response.content.find((b) => b.name === 'report_consensus');
+  if (!toolUse) throw new Error('OpenAI did not return a report_consensus tool call');
+
+  const { consensus, confidence, matching_worker_ids: matchingWorkerIds } = toolUse.input;
+  if (typeof consensus !== 'string' || !Array.isArray(matchingWorkerIds)) {
+    throw new Error('OpenAI report_consensus tool call was missing required fields');
+  }
+  return { consensus, confidence, matchingWorkerIds, method: 'openai', llm: { request, response } };
+}
+
 async function draftWithOpenAI(question) {
   const request = buildOpenAIDraftRequest(question);
   const response = captureOpenAIResponse(await postOpenAI(request));
@@ -143,12 +228,12 @@ async function draftWithOpenAI(question) {
  * configured provider has failed does the caller use its deterministic path.
  */
 const RECONCILE_PROVIDERS = [
-  { configured: () => Boolean(config.anthropicApiKey), run: reconcileWithClaude },
+  { configured: () => llmProvider.isConfigured(), run: reconcileWithClaude },
   { configured: () => Boolean(config.openaiApiKey), run: reconcileWithOpenAI },
 ];
 
 const DRAFT_PROVIDERS = [
-  { configured: () => Boolean(config.anthropicApiKey), run: draftWithClaude },
+  { configured: () => llmProvider.isConfigured(), run: draftWithClaude },
   { configured: () => Boolean(config.openaiApiKey), run: draftWithOpenAI },
 ];
 
@@ -165,25 +250,18 @@ const DRAFT_PROVIDERS = [
  * (see oracle.js's fulfillOracleCall); `purpose` only labels the logs.
  */
 export async function draftAnswer(question, questionId, { purpose = 'instant-tier' } = {}) {
-  if (!llmProvider.isConfigured()) {
-    logger.warn({ questionId, purpose }, `${purpose} draft requested but LLM provider "${llmProvider.name}" not configured`);
+  if (!DRAFT_PROVIDERS.some((p) => p.configured())) {
+    logger.warn({ questionId, purpose }, `${purpose} draft requested but no LLM provider configured`);
     return null;
   }
 
-  try {
-    const draft = await llmProvider.reportDraft(question);
-    if (!draft) return null;
-
-    return {
-      consensus: draft.answer,
-      confidence: draft.confidence,
-      matchingWorkerIds: [],
-      method: 'llm-draft',
-      llm: draft.llm,
-    };
-  } catch (err) {
-    logger.error({ err, questionId, purpose }, `${purpose} draft answer failed`);
-    return null;
+  for (const provider of DRAFT_PROVIDERS) {
+    if (!provider.configured()) continue;
+    try {
+      return await provider.run(question);
+    } catch (err) {
+      logger.error({ err, questionId, purpose }, `${purpose} draft answer failed, trying next provider`);
+    }
   }
   return null;
 }

@@ -236,6 +236,9 @@ export function rankByXp(profiles, limit = 50) {
 
 /** XP leaderboard across every known worker. Unlike /leaderboard (accuracy,
  * established workers only), this includes newcomers — XP is dominated by
- * matched answers, so a fresh sybil identity 
-
-/* … truncated 269 chars — edit only what you need near the top … */
+ * matched answers, so a fresh sybil identity can't outrank real history. */
+export async function getXpLeaderboard(limit = 50, now = Date.now()) {
+  const ids = await getKnownWorkerIds();
+  const profiles = await Promise.all(ids.map((id) => getGamificationProfile(id, now)));
+  return rankByXp(profiles, limit);
+}
