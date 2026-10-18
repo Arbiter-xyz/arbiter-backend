@@ -1,3 +1,4 @@
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { config } from './config.js';
 import { logger } from './logger.js';
 
@@ -13,7 +14,7 @@ import { logger } from './logger.js';
  * NOT covered by this abstraction: the live worker SSE registry and the
  * per-question quorum collector in dispatch.js. Those hold open socket
  * objects and in-process timers, which are inherently tied to whichever
- * process accepted the connection. See pubsub.js for how dispatch.js fans
+ * process accepted the connection. dispatch.js fans
  * those out across instances using getClient()/setNX()/hsetnx()/hgetall()
  * below as the coordination primitives.
  */
@@ -60,10 +61,10 @@ class MemoryStore {
     return next;
   }
 
-  // No Redis client to duplicate a pub/sub connection from — see pubsub.js's
-  // createPubSub(), which falls back to an in-process broker when this
-  // returns null, same "no Redis, no distributed anything" trade-off as
-  // every other feature in this file.
+  // No Redis client to hand out — callers that need one (dispatch.js's
+  // cross-instance presence) treat null as single-instance mode, same
+  // "no Redis, no distributed anything" trade-off as every other feature in
+  // this file.
   getClient() {
     return null;
   }
@@ -252,6 +253,25 @@ export class RedisStore {
     return result;
   }
 }
+
+async function createStore() {
+  if (!config.redisUrl) {
+    logger.info('REDIS_URL not set — using in-memory store (single-instance only)');
+    return new MemoryStore();
+  }
+  try {
+    const { default: Redis } = await import('ioredis');
+    const client = new Redis(config.redisUrl, { lazyConnect: false, maxRetriesPerRequest: 3 });
+    await client.ping();
+    logger.info('Connected to Redis — using RedisStore');
+    return new RedisStore(client);
+  } catch (err) {
+    logger.warn({ err }, 'Redis unavailable — falling back to in-memory store (single-instance only)');
+    return new MemoryStore();
+  }
+}
+
+export const store = await createStore();
 
 /**
  * Federation reputation credentials (#86).

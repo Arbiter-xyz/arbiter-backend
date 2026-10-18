@@ -177,6 +177,135 @@ export async function getTreasury() {
 }
 
 /** Sums the platform's PLATFORM_FEE_BPS cut across every settled+resolved
- * job this backend has recorded. A derived, historical figure (off
+ * job this backend has recorded. A derived, historical figure (off-chain
+ * bookkeeping over this backend's own job records) — the live treasury
+ * balance above is the on-chain-verifiable ground truth; this is "how much
+ * of that did settlement fees, specifically, account for."
+ *
+ * Deliberately a full-index aggregate: it must sum across every job to
+ * report a total, so it can't be paginated. Its cost is bounded to
+ * O(known jobs) *store* reads only — getJob() reads local job metadata and
+ * makes no chain/RPC calls — so this stays cheap even at the 5,000-entry
+ * index cap and needs no concurrency cap or memoization. */
+export async function getFeeRevenue() {
+  const ids = await getKnownJobIds();
+  const jobs = await Promise.all(ids.map((id) => getJob(id)));
 
-/* … truncated 5271 chars — edit only what you need near the top … */
+  let totalFeeStroops = 0n;
+  let resolvedCount = 0;
+  for (const job of jobs) {
+    if (job?.status !== 'settled' || job.outcome !== 'resolved') continue;
+    totalFeeStroops += (BigInt(job.amountStroops || 0) * PLATFORM_FEE_BPS) / BPS_DENOM;
+    resolvedCount += 1;
+  }
+
+  return {
+    resolvedCount,
+    totalFeeRevenue: stroopsToUsdc(totalFeeStroops),
+  };
+}
+
+/** Bank Payouts — self-reported SEP-24 withdrawal history (see
+ * anchorRecords.js for why this is a self-reported cache, not a live
+ * per-address anchor query: SEP-10 means only the account holder can pull
+ * their own transaction history from the anchor). Paginated like
+ * listTransactions(): slice before per-item work. */
+export async function listAnchorPayouts({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
+  const addresses = await getKnownAnchorAddresses();
+  const page = addresses.slice(offset, offset + limit);
+  const rows = await mapWithConcurrency(page, MAX_CONCURRENCY, async (address) => {
+    const txs = await getAnchorTransactions(address);
+    return txs.filter((t) => t.kind === 'withdrawal').map((t) => ({ address, ...t }));
+  });
+  return {
+    total: addresses.length,
+    payouts: rows.flat().sort((a, b) => b.reportedAt - a.reportedAt),
+  };
+}
+
+/** KYC & Tiers — self-reported SEP-12 customer status per address, same
+ * caveat as listAnchorPayouts(). Paginated like listTransactions(): slice
+ * before per-item work. */
+export async function listAnchorKyc({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
+  const addresses = await getKnownAnchorAddresses();
+  const page = addresses.slice(offset, offset + limit);
+  const rows = await mapWithConcurrency(page, MAX_CONCURRENCY, async (address) => {
+    const kyc = await getAnchorKyc(address);
+    return kyc ? { address, ...kyc } : null;
+  });
+  return { total: addresses.length, kyc: rows.filter(Boolean) };
+}
+
+/** Operator override for the anomaly auto-suspend (issue #153): clears the
+ * suspension flag on an account so a wrongly-suspended key resumes
+ * resolving. Gated behind requireAdmin at the route layer, same as every
+ * other /admin/* handler. */
+export async function unsuspendKey(accountId) {
+  return unsuspendAccount(accountId);
+}
+
+/** Filters a slice of structured JSON log lines down to the ones correlated
+ * with an incident: an optional [from, to] time range and/or a job id. Log
+ * lines are the pino JSON objects logger.js already emits (request-id /
+ * job-id correlation fields), so this is a pure, unit-testable filter over
+ * a canned sample — no log-aggregator integration required. */
+export function selectIncidentLogs(logs, { from, to, jobId } = {}) {
+  return (logs || []).filter((line) => {
+    if (jobId && line.jobId !== jobId && line['job-id'] !== jobId) return false;
+    const at = line.time ?? line.timestamp;
+    if (from && at != null && at < from) return false;
+    if (to && at != null && at > to) return false;
+    return true;
+  });
+}
+
+/** Turns a set of correlated log lines into a structured postmortem draft
+ * via a tool-forced Claude call, modeled on reconcile.js's
+ * reconcileWithClaude(). Never throws: on any Claude failure (missing key,
+ * timeout, malformed tool output) it resolves to a clearly-marked fallback
+ * so an operator always gets a response and the process never sees an
+ * unhandled rejection. */
+export async function generatePostmortem(logs, { from, to, jobId } = {}) {
+  const selected = selectIncidentLogs(logs, { from, to, jobId });
+  const fallback = {
+    generated: false,
+    error: 'draft generation failed, see raw logs',
+    logCount: selected.length,
+    logs: selected,
+  };
+
+  let client;
+  try {
+    client = getClient();
+  } catch {
+    return fallback;
+  }
+  if (!client) return fallback;
+
+  try {
+    const message = await client.messages.create({
+      model: config.anthropic.model,
+      max_tokens: 2048,
+      tools: [REPORT_POSTMORTEM_TOOL],
+      tool_choice: { type: 'tool', name: REPORT_POSTMORTEM_TOOL.name },
+      messages: [
+        {
+          role: 'user',
+          content:
+            'Draft an incident postmortem from these correlated log lines. ' +
+            'Use only what the logs support; mark anything uncertain as unknown.\n\n' +
+            JSON.stringify(selected),
+        },
+      ],
+    });
+
+    const toolUse = (message.content || []).find(
+      (block) => block.type === 'tool_use' && block.name === REPORT_POSTMORTEM_TOOL.name,
+    );
+    if (!toolUse?.input) return fallback;
+
+    return { generated: true, logCount: selected.length, ...toolUse.input };
+  } catch {
+    return fallback;
+  }
+}
