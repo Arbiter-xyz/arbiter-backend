@@ -5,7 +5,9 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "check:env": "node scripts/check-env-example.js",
+    "canary:preflight": "node scripts/canary-preflight.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.0",

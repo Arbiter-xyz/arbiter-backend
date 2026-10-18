@@ -104,8 +104,8 @@ async function indexJob(jobId) {
   await store.set(JOB_INDEX_KEY, [jobId, ...known].slice(0, MAX_TRACKED_JOBS));
 }
 
-export async function getKnownJobIds() {
-  return (await store.get(JOB_INDEX_KEY)) || [];
+export async function getKnownJobIds(readStore = store) {
+  return (await readStore.get(JOB_INDEX_KEY)) || [];
 }
 
 async function indexReview(jobId) {
