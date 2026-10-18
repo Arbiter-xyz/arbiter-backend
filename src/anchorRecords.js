@@ -78,11 +78,19 @@ export async function getAnchorKyc(address) {
  * per-address store fan-out used for GDPR requests) — CCPA deletion reuses
  * it rather than re-deriving store logic. Removes the per-address tx and KYC
  * records and drops the address from the known-address index so no residual
- * personal information remains keyed by that address.
+ * personal information remains keyed by that address IN THIS MODULE.
+ *
+ * Scope (reviewed in #285): this is one slice of the fan-out, not the whole
+ * erasure. The review/escalation indexes in jobs.js hold job ids, not
+ * addresses, so they have nothing to scrub here. But collusion.js keeps its
+ * own address-keyed records (collusion:worker-ips:, :partners:, :pair:,
+ * :link:, :flag:, and the flagged-pairs index) that this function does not
+ * and should not touch. Those need their own erasure slice in collusion.js,
+ * composed by the fan-out alongside this one.
  */
 export async function eraseAnchorRecords(address) {
-  await store.del(TX_PREFIX + address);
-  await store.del(KYC_PREFIX + address);
+  await store.delete(TX_PREFIX + address);
+  await store.delete(KYC_PREFIX + address);
   const known = (await store.get(ADDRESS_INDEX_KEY)) || [];
   if (known.includes(address)) {
     await store.set(
