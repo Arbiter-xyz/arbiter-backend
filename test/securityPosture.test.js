@@ -12,6 +12,7 @@ const SECURE_PROD = {
   SESSION_SECRET: 'a'.repeat(64),
   ALLOWED_ORIGINS: 'https://app.example.com',
   REDIS_URL: 'rediss://default:pw@redis.example.com:6380',
+  METRICS_TOKEN: 'b'.repeat(64),
 };
 
 function settingsOf(result) {
@@ -65,13 +66,13 @@ describe('evaluateSecurityPosture', () => {
     assert.deepEqual(result.findings, []);
   });
 
-  test('production with all three insecure defaults flags all three by name', () => {
+  test('production with every insecure default flags each one by name', () => {
     const result = evaluateSecurityPosture({ NODE_ENV: 'production', REDIS_URL: 'redis://redis.example.com:6379' });
-    assert.deepEqual(settingsOf(result), ['ALLOWED_ORIGINS', 'REDIS_URL', 'SESSION_SECRET']);
+    assert.deepEqual(settingsOf(result), ['ALLOWED_ORIGINS', 'METRICS_TOKEN', 'REDIS_URL', 'SESSION_SECRET']);
   });
 
   test('SESSION_SECRET unset in production is fatal, and the message says why and how to fix it', () => {
-    const { SESSION_SECRET, ...env } = SECURE_PROD;
+    const { SESSION_SECRET: _unset, ...env } = SECURE_PROD;
     const [finding] = evaluateSecurityPosture(env).findings;
     assert.equal(finding.setting, 'SESSION_SECRET');
     assert.equal(finding.severity, 'fatal');
@@ -97,8 +98,24 @@ describe('evaluateSecurityPosture', () => {
   });
 
   test('a platform marker alone (no NODE_ENV) still catches a missing SESSION_SECRET', () => {
-    const result = evaluateSecurityPosture({ RENDER: 'true', ALLOWED_ORIGINS: 'https://app.example.com' });
+    const result = evaluateSecurityPosture({ RENDER: 'true', ALLOWED_ORIGINS: 'https://app.example.com', METRICS_TOKEN: 'x' });
     assert.deepEqual(settingsOf(result), ['SESSION_SECRET']);
+  });
+
+  test('METRICS_TOKEN unset in production is an error (warn and keep running), naming the exposure', () => {
+    const { METRICS_TOKEN: _unset, ...env } = SECURE_PROD;
+    const findings = evaluateSecurityPosture(env).findings;
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0].setting, 'METRICS_TOKEN');
+    assert.equal(findings[0].severity, 'error');
+    assert.match(findings[0].message, /GET \/metrics answers anyone/);
+    assert.match(findings[0].message, /private network/);
+    // An empty value is the same as unset: metricsHandler() skips the check on ''.
+    assert.equal(evaluateSecurityPosture({ ...SECURE_PROD, METRICS_TOKEN: '' }).findings[0].setting, 'METRICS_TOKEN');
+  });
+
+  test('METRICS_TOKEN unset in local dev produces no finding', () => {
+    assert.deepEqual(evaluateSecurityPosture({ SESSION_SECRET: 'x' }).findings, []);
   });
 });
 
@@ -122,9 +139,17 @@ describe('enforceSecurityPosture', () => {
     assert.ok(lines[0].obj.productionSignals.includes('NODE_ENV=production'));
   });
 
+  test('an unset METRICS_TOKEN is logged but never stops the process', () => {
+    const { lines, log } = captureLog();
+    const { METRICS_TOKEN: _unset, ...env } = SECURE_PROD;
+    assert.equal(enforceSecurityPosture(env, log), true);
+    assert.equal(lines.length, 1);
+    assert.match(lines[0].msg, /INSECURE CONFIG: METRICS_TOKEN/);
+  });
+
   test('returns false when any finding is fatal', () => {
     const { lines, log } = captureLog();
-    const { SESSION_SECRET, ...env } = SECURE_PROD;
+    const { SESSION_SECRET: _unset, ...env } = SECURE_PROD;
     assert.equal(enforceSecurityPosture(env, log), false);
     assert.match(lines[0].msg, /REFUSING TO START: SESSION_SECRET/);
   });

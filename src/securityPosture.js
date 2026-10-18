@@ -1,7 +1,8 @@
 /**
- * Startup security-posture check. Three pieces of config default to
+ * Startup security-posture check. Several pieces of config default to
  * "insecure but convenient" for local dev — wide-open CORS, plaintext
- * Redis, a random per-process SESSION_SECRET — and each is documented as
+ * Redis, a random per-process SESSION_SECRET, an unauthenticated /metrics
+ * — and each is documented as
  * "lock this down for a real deployment," but nothing ever enforced it.
  * This runs once at boot and makes a real deployment that left any of them
  * at the insecure default say so loudly (or refuse to start at all).
@@ -86,6 +87,12 @@ export function productionSignals(env) {
  *   a private network (e.g. Railway's internal redis://), where TLS is
  *   optional, so refusing to start would break a legitimate setup. The
  *   warning still makes that trade-off a deliberate choice.
+ * - METRICS_TOKEN unset → error. metricsHandler() only checks a bearer token
+ *   when one is configured, so unset means GET /metrics is open — the
+ *   opposite fail-safe direction from ADMIN_TOKEN, which fails closed. Open
+ *   is the usual setup for a scrape target on a private network, so this
+ *   stays non-fatal (and the open default is unchanged), but it has to be a
+ *   choice someone made, not a default nobody checked.
  */
 export function evaluateSecurityPosture(env) {
   const signals = productionSignals(env);
@@ -137,6 +144,18 @@ export function evaluateSecurityPosture(env) {
           'Use a rediss:// URL, unless this Redis is reachable only over a private network you trust.',
       });
     }
+  }
+
+  if (!env.METRICS_TOKEN) {
+    findings.push({
+      setting: 'METRICS_TOKEN',
+      severity: 'error',
+      message:
+        'METRICS_TOKEN is not set, so GET /metrics answers anyone who can reach this process, with no authentication: ' +
+        'it exposes per-route traffic, job and settlement throughput, online-worker and admin-invocation counts, and the build version. ' +
+        'That is only safe if /metrics is reachable solely from a private network (e.g. your Prometheus scraper\'s). ' +
+        'Otherwise set METRICS_TOKEN to a random value (`openssl rand -hex 32`) and give the scraper it as a bearer token.',
+    });
   }
 
   return { production, signals, findings };
