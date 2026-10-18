@@ -345,3 +345,40 @@ export function taxSummariesToCsv(summaries) {
   });
   return csvRows([header, ...rows]);
 }
+
+/**
+ * Operator-facing, all-workers counterpart of the per-worker tax summary
+ * route, gated by `adminGate`.
+ *
+ * GET /admin/tax/summaries?year=2025&usOnly=true&reportableOnly=true&format=csv
+ *
+ * `year` defaults to last year (parseTaxYear). `format=csv` returns
+ * taxSummariesToCsv()'s one-row-per-worker bulk-import shape as a download;
+ * anything else returns JSON.
+ */
+export function mountTaxAdminRoutes(app, adminGate) {
+  app.get('/admin/tax/summaries', adminGate, async (req, res) => {
+    let year;
+    try {
+      year = parseTaxYear(req.query.year);
+    } catch (err) {
+      if (err instanceof TaxReportError) return res.status(err.status).json({ error: err.message });
+      throw err;
+    }
+    try {
+      const summaries = await buildAllTaxSummaries(year, {
+        usOnly: req.query.usOnly === 'true',
+        reportableOnly: req.query.reportableOnly === 'true',
+      });
+      if (req.query.format === 'csv') {
+        res.set('Content-Type', 'text/csv; charset=utf-8');
+        res.set('Content-Disposition', `attachment; filename="arbiter-tax-summaries-${year}.csv"`);
+        return res.send(taxSummariesToCsv(summaries));
+      }
+      res.json({ taxYear: year, count: summaries.length, summaries });
+    } catch (err) {
+      req.log?.error({ err }, 'failed to build tax summaries');
+      res.status(500).json({ error: 'failed to build tax summaries' });
+    }
+  });
+}

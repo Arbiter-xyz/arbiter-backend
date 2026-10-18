@@ -3,7 +3,7 @@ import { config } from './config.js';
 import { checkRateLimit } from './rateLimit.js';
 import { screenAnswer } from './answerFilter.js';
 import { getPushEligibleWorkerIds, notifyWorker } from './push.js';
-import { getStakeOnChain, touchWorker } from './stellarClient.js';
+import { getStakeOnChain } from './stellarClient.js';
 import { jobLogger, logger } from './logger.js';
 import { isCollusionSuspended } from './collusion.js';
 import { trace, context, propagation, SpanKind, SpanStatusCode } from '@opentelemetry/api';
@@ -503,37 +503,6 @@ export async function broadcast(questionId, questionText, { category, quorumSize
       }
       span.setStatus({ code: SpanStatusCode.OK });
       return targets.length;
-    } catch (err) {
-      span.recordException(err);
-      span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
-      throw err;
-    } finally {
-      span.end();
-    }
-  });
-}
-
-/**
- * Record the on-chain settlement transaction hash against the question's
- * trace. Soroban has no native tracing concept, so the traceparent is carried
- * in the transaction memo (see stellarClient.js) and the resulting hash is
- * attached here as a span attribute — this is what lets an operator walk from
- * a trace ID to the exact on-chain transaction.
- */
-export async function recordSettlement(questionId, txHash, { traceparent } = {}) {
-  const parentCtx = contextFromTraceparent(traceparent);
-  return context.with(parentCtx, async () => {
-    const span = tracer().startSpan('settlement.onchain', {
-      kind: SpanKind.CLIENT,
-      attributes: {
-        'question.id': questionId.toString(),
-        'settlement.tx_hash': txHash,
-      },
-    });
-    try {
-      await touchWorker('settlement', { questionId: questionId.toString(), txHash });
-      span.setStatus({ code: SpanStatusCode.OK });
-      return txHash;
     } catch (err) {
       span.recordException(err);
       span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });

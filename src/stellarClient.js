@@ -225,8 +225,22 @@ export function createSerialQueue() {
 
 const serializeAdminCall = createSerialQueue();
 
+// Blue-green single-writer gate (deployment.js). Unset — the default — means
+// no check at all. When set, it runs inside the serial queue, immediately
+// before each admin call is built and signed, so a deployment that doesn't
+// hold the writer lease waits for it instead of racing the other
+// environment on the platform key's sequence number.
+let adminWriteGuard = null;
+
+export function setAdminWriteGuard(guard) {
+  adminWriteGuard = guard;
+}
+
 function invokeAsAdmin(method, scValArgs) {
-  return serializeAdminCall(() => runInvokeAsAdmin(method, scValArgs)).then(
+  return serializeAdminCall(async () => {
+    if (adminWriteGuard) await adminWriteGuard(method);
+    return runInvokeAsAdmin(method, scValArgs);
+  }).then(
     (result) => {
       recordAdminInvocation(method, true);
       return result;
@@ -236,13 +250,6 @@ function invokeAsAdmin(method, scValArgs) {
       throw err;
     },
   );
-}
-
-/** Rotates the contract id only after every admin call already queued
- * against the old id has drained. Enqueues the swap on the same serial
- * chain, so it takes effect strictly between calls — never mid-flight. */
-export function rotateContractIdAfterDrain(newContractId) {
-  return serializeAdminCall(() => rotateContractId(newContractId));
 }
 
 export async function resolveQuestion(questionId, matchingWorkerAddresses, losingWorkerAddresses = []) {
@@ -273,17 +280,6 @@ export async function resolveQuestionsBatch(entries) {
     nativeToScVal(questionIds, { type: 'Vec' }),
     nativeToScVal(matching, { type: 'Vec' }),
     nativeToScVal(losing, { type: 'Vec' }),
-  ]);
-}
-
-/** Batch-aware variant of refund(): force-refunds several questions in one
- * platform-signed transaction. Mirrors resolveQuestionsBatch()'s
- * per-question independence — a member already resolved or already
- * refunded is reported in the returned outcome vector rather than
- * aborting the whole batch. */
-export async function refundQuestionsBatch(questionIds) {
-  return invokeAsAdmin('refund_batch', [
-    nativeToScVal(questionIds.map((id) => u64Arg(id)), { type: 'Vec' }),
   ]);
 }
 
@@ -349,10 +345,6 @@ export async function getQuestionOnChain(questionId) {
     status: decodeStatus(native.status),
     createdAt: Number(native.created_at),
   };
-}
-
-export async function getTimeoutLedgersOnChain() {
-  return simulateReadOnly('get_timeout_ledgers');
 }
 
 export async function getOwedOnChain(workerAddress) {

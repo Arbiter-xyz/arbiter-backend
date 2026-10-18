@@ -120,10 +120,3 @@ export async function claudeBudgetSpent() {
   return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
-/**
- * Remaining fleet-wide budget for the active rolling window (in cents).
- */
-export async function claudeBudgetRemaining() {
-  const remaining = budgetCents() - (await claudeBudgetSpent());
-  return remaining > 0 ? remaining : 0;
-}

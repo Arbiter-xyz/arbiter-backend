@@ -154,3 +154,37 @@ export function describePause(pause) {
   const until = new Date(pause.resumesAt).toISOString();
   return `dispatch is paused for scheduled maintenance${pause.reason ? ` (${pause.reason})` : ''} until ${until}`;
 }
+
+/** API shape of a stored window: epoch-ms bounds as ISO-8601 strings. */
+export function serializeWindow(w) {
+  return { ...w, startsAt: new Date(w.startsAt).toISOString(), endsAt: new Date(w.endsAt).toISOString() };
+}
+
+/**
+ * The write side of GET /maintenance, gated by `adminGate`. These two routes
+ * shipped with the original feature and were dropped by a later merge,
+ * which left scheduling a window impossible.
+ *
+ * - POST   /admin/maintenance-windows      { startsAt, endsAt, reason? } — ISO-8601 strings or epoch ms
+ * - DELETE /admin/maintenance-windows/:id  deleting an active window ends the pause immediately
+ */
+export function mountMaintenanceRoutes(app, adminGate) {
+  app.post('/admin/maintenance-windows', adminGate, async (req, res) => {
+    try {
+      const window = await addWindow(req.body || {});
+      req.log?.info({ window }, 'maintenance window scheduled');
+      res.status(201).json({ window: serializeWindow(window) });
+    } catch (err) {
+      if (err instanceof MaintenanceWindowError) return res.status(400).json({ error: err.message });
+      req.log?.error({ err }, 'failed to schedule maintenance window');
+      res.status(500).json({ error: 'failed to schedule maintenance window' });
+    }
+  });
+
+  app.delete('/admin/maintenance-windows/:id', adminGate, async (req, res) => {
+    const removed = await removeWindow(req.params.id);
+    if (!removed) return res.status(404).json({ error: 'no such maintenance window' });
+    req.log?.info({ windowId: req.params.id }, 'maintenance window removed');
+    res.json({ ok: true, id: req.params.id });
+  });
+}

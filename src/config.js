@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { randomBytes } from 'node:crypto';
+import { hostname } from 'node:os';
 
 /**
  * Central runtime configuration.
@@ -232,7 +233,38 @@ export const config = Object.freeze({
 
   // Prometheus scrape endpoint (metrics.js) and the probes behind its gauges
   // (healthProbes.js). METRICS_TOKEN unset = /metrics is open, which is the
-  // usual setup for a scrape target on a private network.
+  // usual setup for a scrape target on a private network. A production-looking
+  // deployment with it unset gets a loud startup warning (securityPosture.js).
+  // Annual earnings summary for tax reporting (see taxReport.js). The
+  // payer block is the platform's own details, as they'd appear in the
+  // PAYER box of a 1099. Unset fields are left blank in exports.
+  tax: Object.freeze({
+    // US reporting threshold in USD. At or above it, a summary is flagged
+    // as reportable. $600 matches 1099-NEC; change it if your counsel says
+    // a different form or threshold applies.
+    reportingThresholdUsd: num(process.env.TAX_REPORTING_THRESHOLD_USD, 600),
+    payerName: process.env.TAX_PAYER_NAME || '',
+    payerTin: process.env.TAX_PAYER_TIN || '',
+    payerAddress: process.env.TAX_PAYER_ADDRESS || '',
+  }),
+
+  // Blue-green deploys (deployment.js; docs/runbooks/blue-green-deploy.md).
+  // DEPLOY_WRITER_LEASE=true makes this instance hold a lease in the shared
+  // store before signing any admin call, so blue and green can never both
+  // sign resolve()/refund() at once. Off by default: a single-service deploy
+  // has no second writer to fence. instanceId must differ between the two
+  // environments; Railway's per-deployment id does that automatically.
+  deploy: Object.freeze({
+    instanceId: process.env.DEPLOY_INSTANCE_ID || `${process.env.RAILWAY_DEPLOYMENT_ID || hostname()}:${process.pid}`,
+    writerLease: process.env.DEPLOY_WRITER_LEASE === 'true',
+    leaseTtlMs: num(process.env.DEPLOY_LEASE_TTL_MS, 30_000),
+    // How long a settlement on the incoming environment waits for the
+    // outgoing one to finish draining and release the lease.
+    leaseWaitMs: num(process.env.DEPLOY_LEASE_WAIT_MS, 90_000),
+    // A standard-tier job can be mid-quorum for up to ~45s, plus settlement.
+    drainTimeoutMs: num(process.env.DEPLOY_DRAIN_TIMEOUT_MS, 60_000),
+  }),
+
   metrics: Object.freeze({
     token: process.env.METRICS_TOKEN || '',
     probeIntervalMs: num(process.env.METRICS_PROBE_INTERVAL_MS, 15_000),
@@ -316,6 +348,11 @@ export const config = Object.freeze({
     push: Object.freeze({
       max: num(process.env.PUSH_RATE_LIMIT_MAX, 10),
       windowMs: num(process.env.PUSH_RATE_LIMIT_WINDOW_MS, 60_000),
+    }),
+    // POST /support/tickets writes a durable record per call (support.js).
+    support: Object.freeze({
+      max: num(process.env.SUPPORT_RATE_LIMIT_MAX, 5),
+      windowMs: num(process.env.SUPPORT_RATE_LIMIT_WINDOW_MS, 60_000),
     }),
     billing: Object.freeze({
       max: num(process.env.BILLING_RATE_LIMIT_MAX, 10),

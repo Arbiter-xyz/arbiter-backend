@@ -172,35 +172,6 @@ export function isAllowedRedirectUrl(url) {
   }
 }
 
-/**
- * Apple Pay / Google Pay quick-checkout (issue #105).
- *
- * Stripe Checkout auto-detects and offers Apple Pay / Google Pay on
- * supporting devices/browsers whenever the account has those payment
- * methods enabled — no `payment_method_types` array is needed here, and
- * passing one would actually *narrow* the methods offered. The only
- * code-side requirement is that the Checkout Session's redirect URLs
- * (success_url/cancel_url) live on a domain that has been registered with
- * Stripe for Apple Pay domain verification; that domain is exactly the
- * origin isAllowedRedirectUrl() already restricts to config.allowedOrigins,
- * so the existing allowlist is the single source of truth for both the
- * redirect-safety check and Apple Pay's domain-association requirement.
- *
- * This helper exists so the domain-verification requirement is explicit
- * and testable rather than an implicit assumption: it returns the origin
- * Stripe will associate with the session, or null when the URL is not on
- * an allowed origin (in which case createCheckoutSession() would already
- * have rejected it).
- */
-export function getApplePayVerificationOrigin(url) {
-  if (!isAllowedRedirectUrl(url)) return null;
-  try {
-    return new URL(url).origin;
-  } catch {
-    return null;
-  }
-}
-
 export async function createCheckoutSession(amountUsd, successUrl, cancelUrl) {
   if (!Number.isFinite(amountUsd) || amountUsd < config.billing.minTopupUsd) {
     throw new Error(`amountUsd must be a number >= ${config.billing.minTopupUsd}`);
@@ -602,27 +573,3 @@ export async function recordUsage(accountId, endpoint, tier, ts = Date.now()) {
   await store.incrBy(`usage:${accountId}:${endpoint}:${tier}:${usageDay(ts)}`, 1);
 }
 
-/**
- * Reads the pooled fiat balance for the /metrics endpoint (issue #162).
- * Returns null when billing isn't configured so the metrics route can skip
- * the gauge entirely rather than reporting a misleading zero. The balance
- * itself is read from the same store key the on-chain pool accounting
- * already maintains; this is a read-only accessor, not a new source of
- * truth.
- */
-export async function getFiatPoolBalanceStroops() {
-  if (!isBillingConfigured()) return null;
-  const balance = await store.get(`pool:${config.billing.fiatPoolAddress}`);
-  return balance || 0;
-}
-
-/**
- * Refreshes the fiat-pool-balance gauge. Called by the /metrics handler
- * before scraping so the gauge reflects the current pool rather than a
- * stale value from process start. No-op when billing is unconfigured.
- */
-export async function refreshFiatPoolBalanceMetric() {
-  const balance = await getFiatPoolBalanceStroops();
-  if (balance === null) return;
-  fiatPoolBalanceStroops.set(balance);
-}

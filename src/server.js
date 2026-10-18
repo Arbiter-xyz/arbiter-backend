@@ -12,6 +12,7 @@ import {
   unregisterWorker,
   submitAnswer,
   getReputation,
+  refreshPresence,
 } from './dispatch.js';
 import { getStats } from './stats.js';
 import { getVapidPublicKey, isPushConfigured, saveSubscription, removeSubscription } from './push.js';
@@ -26,7 +27,7 @@ import {
   feeBumpWithdrawTo,
 } from './sponsor.js';
 import { getStashedQuestion, nextQuestionId } from './pendingQuestions.js';
-import { getOwedOnChain, getStakeOnChain } from './stellarClient.js';
+import { getOwedOnChain, getStakeOnChain, setAdminWriteGuard } from './stellarClient.js';
 import { askMetered, getMeteredBalance, depositInstructions } from './metered.js';
 import { getLeaderboard } from './leaderboard.js';
 import { getWorkerDashboard } from './workerAnalytics.js';
@@ -57,6 +58,44 @@ import {
   ReferralError,
 } from './referrals.js';
 import { recordWorkerIp, noteAnswerTiming, listFlaggedPairs, getWorkerCollusionReport, clearPairFlag } from './collusion.js';
+import { store } from './store.js';
+import { getKnownJobIds, getJob } from './jobs.js';
+import {
+  getDispatchPause,
+  listUpcomingWindows,
+  describePause,
+  serializeWindow,
+  mountMaintenanceRoutes,
+} from './maintenanceWindows.js';
+import {
+  getTaxProfile,
+  saveTaxProfile,
+  listTaxYears,
+  parseTaxYear,
+  buildTaxSummary,
+  taxSummaryToCsv,
+  TaxReportError,
+  mountTaxAdminRoutes,
+} from './taxReport.js';
+import {
+  AutoWithdrawError,
+  getAutoWithdrawSettings,
+  setAutoWithdrawSettings,
+  checkAutoWithdraw,
+  deleteAutoWithdrawSettings,
+  submitAutoWithdraw,
+  startAutoWithdrawSweep,
+  stopAutoWithdrawSweep,
+} from './autoWithdraw.js';
+import { mountSupportRoutes } from './support.js';
+import { mountErasureRoutes } from './erasure.js';
+import {
+  createWriterLease,
+  createAdminWriteGuard,
+  createDrainController,
+  createInFlightCounter,
+  mountDeployRoutes,
+} from './deployment.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -117,6 +156,37 @@ app.post('/billing/webhook', express.raw({ type: 'application/json' }), async (r
 
 app.use(express.json());
 
+// Blue-green deploys (deployment.js; docs/runbooks/blue-green-deploy.md).
+// With DEPLOY_WRITER_LEASE=true, only the lease holder signs admin calls,
+// so the outgoing and incoming environments can never both sign
+// resolve()/refund(). The drain controller runs on SIGTERM or
+// POST /admin/deploy/drain: new questions are refused, background sweeps
+// stop, in-flight jobs finish, then the lease is released.
+const writerLease = config.deploy.writerLease
+  ? createWriterLease({ store, instanceId: config.deploy.instanceId, ttlMs: config.deploy.leaseTtlMs })
+  : null;
+if (writerLease) {
+  setAdminWriteGuard(createAdminWriteGuard(writerLease, { waitMs: config.deploy.leaseWaitMs }));
+  writerLease.startRenewing();
+}
+const drain = createDrainController({
+  countInFlight: createInFlightCounter({ getKnownJobIds, getJob, instanceId: config.deploy.instanceId }),
+  onDrainStart: [stopAutoWithdrawSweep],
+  onDrained: writerLease ? [() => writerLease.stopRenewing(), () => writerLease.release()] : [],
+  onResume: [startAutoWithdrawSweep, ...(writerLease ? [() => writerLease.startRenewing()] : [])],
+  timeoutMs: config.deploy.drainTimeoutMs,
+  log: logger,
+});
+// Only the routes that create a new question: answers, cancels and status
+// polls must keep working so in-flight jobs can finish.
+app.use((req, res, next) => {
+  if (req.method === 'POST' && (req.path === '/oracle' || req.path === '/oracle/sandbox')) {
+    return drain.rejectWhileDraining(req, res, next);
+  }
+  return next();
+});
+app.get('/health/ready', (req, res) => drain.readinessHandler(req, res));
+
 /** Every /sponsor/* call spends a real network fee on the platform's behalf,
  * and POST /oracle writes unbounded state per call — both get a per-IP rate
  * limit, not just the SSE connection endpoint. */
@@ -150,10 +220,6 @@ app.get('/maintenance', async (req, res) => {
     windows: upcoming.map(serializeWindow),
   });
 });
-
-function serializeWindow(w) {
-  return { ...w, startsAt: new Date(w.startsAt).toISOString(), endsAt: new Date(w.endsAt).toISOString() };
-}
 
 /** 503 + Retry-After for a request that would create a question while
  * dispatch is paused. Returns true if it responded. */
@@ -1175,7 +1241,12 @@ app.get('/app/events', async (req, res) => {
   recordWorkerIp(workerId, req.ip);
   res.write(`event: connected\ndata: ${JSON.stringify({ workerId, categories })}\n\n`);
 
-  const keepAlive = setInterval(() => res.write(': keep-alive\n\n'), 15_000);
+  // Each heartbeat also refreshes this worker's cross-instance presence
+  // record, which otherwise expires PRESENCE_TTL_SECONDS after connect.
+  const keepAlive = setInterval(() => {
+    res.write(': keep-alive\n\n');
+    refreshPresence(workerId).catch((err) => req.log.warn({ err }, 'presence refresh failed'));
+  }, 15_000);
 
   req.on('close', () => {
     clearInterval(keepAlive);
@@ -1313,6 +1384,14 @@ app.post('/anchor/report', rateLimited('push', byIp), async (req, res) => {
 
 if (faultInjector) mountFaultRoutes(app, faultInjector, requireAdmin);
 
+// requireAdmin is a factory (adminAuth.js): these mounts pass the built
+// middleware, requireAdmin(), not the factory itself.
+mountMaintenanceRoutes(app, requireAdmin());
+mountTaxAdminRoutes(app, requireAdmin());
+mountErasureRoutes(app, requireAdmin());
+mountSupportRoutes(app, requireAdmin(), { limiter: rateLimited('support', byIp) });
+mountDeployRoutes(app, requireAdmin(), { drain, lease: writerLease });
+
 // Runs the chain-driven recovery sweep on demand (disasterRecovery.js;
 // docs/runbooks/disaster-recovery.md). `?dryRun=true` classifies every
 // on-chain Pending question without refunding anything.
@@ -1335,7 +1414,7 @@ app.post('/admin/recovery/sweep', requireAdmin, async (req, res) => {
 // Serve the built worker UI from the same Express app.
 app.use(express.static(path.join(__dirname, '../../app/dist')));
 
-app.listen(config.port, () => {
+const httpServer = app.listen(config.port, () => {
   startAutoWithdrawSweep();
   startTreasuryMonitor();
   logger.info(
@@ -1362,3 +1441,22 @@ app.listen(config.port, () => {
     logger.warn('recovery sweep disabled (RECOVERY_SWEEP_ENABLED=false, or ORACLE_CONTRACT_ID/PLATFORM_SECRET unset)');
   }
 });
+
+// Platforms (Railway included) send SIGTERM when replacing a deployment.
+// Drain first so the outgoing environment finishes its in-flight jobs and
+// hands the writer lease over, instead of dying mid-settlement and leaving
+// payers to the refund_timeout() backstop.
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info({ signal }, 'shutdown requested; draining');
+  const report = await drain.drain();
+  if (!report.drained) {
+    logger.warn(report, 'drain timed out with jobs still in flight; the recovery sweep refunds any that stay pending on-chain');
+  }
+  httpServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5_000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

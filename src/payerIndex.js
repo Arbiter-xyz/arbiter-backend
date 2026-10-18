@@ -63,19 +63,6 @@ export async function getPayerQuestionIds(payerAddress) {
 }
 
 /**
- * Ownership check for the dispute endpoint (#124): a payer may only contest
- * a question that appears in their own payerIndex record. This is the
- * off-chain analogue of the on-chain payer field — the session token proves
- * address control, and this proves the address actually paid for the
- * question, so a valid session for payer A can't dispute payer B's job.
- */
-export async function payerOwnsQuestion(payerAddress, questionId) {
-  if (!payerAddress || !questionId) return false;
-  const ids = await getPayerQuestionIds(payerAddress);
-  return ids.includes(questionId);
-}
-
-/**
  * GDPR erasure (#126): delete this payer's off-chain records — the
  * `payer-questions:` list and, if present, the address's entry in the
  * known-payer index. On-chain state (resolved questions, stake, owed
@@ -162,57 +149,6 @@ export function evaluateLoyaltyTier(summary) {
     bonusStroops: matched.bonusStroops.toString(),
     bonus: stroopsToUsdc(matched.bonusStroops),
   };
-}
-
-/**
- * Idempotent threshold tracking: a payer's highest already-credited tier is
- * persisted under `loyalty-tier:{payerAddress}`, so re-evaluating the same
- * summary never re-credits a crossing. Returns the tier to credit (with
- * `bonusStroops` as a BigInt) only when the payer has newly reached a
- * higher tier, otherwise null.
- *
- * The caller is responsible for actually applying the credit via the
- * billing.js incrBy ledger — this function only decides whether a credit
- * is owed, keeping the store read/write local and the decision pure-ish.
- */
-export async function claimLoyaltyTier(payerAddress, summary) {
-  const evaluated = evaluateLoyaltyTier(summary);
-  if (!evaluated) return null;
-
-  const key = 'loyalty-tier:' + payerAddress;
-  const credited = await store.get(key);
-  const creditedIndex = LOYALTY_TIERS.findIndex((t) => t.name === credited);
-  const evaluatedIndex = LOYALTY_TIERS.findIndex((t) => t.name === evaluated.tier);
-  if (evaluatedIndex <= creditedIndex) return null; // already credited at this tier or higher
-
-  await store.set(key, evaluated.tier);
-  return { ...evaluated, bonusStroops: BigInt(evaluated.bonusStroops) };
-}
-
-/**
- * Admin view: which payers are in which loyalty tier, following the same
- * composition pattern as admin.js's listPayers() — enumerate the durable
- * payer index, summarize each payer's tracked questions, and attach the
- * pure tier evaluation. Payers below every threshold report tier: null.
- */
-export async function listPayerLoyaltyTiers() {
-  const addresses = await getKnownPayerAddresses();
-  const rows = await Promise.all(
-    addresses.map(async (payerAddress) => {
-      const ids = await getPayerQuestionIds(payerAddress);
-      const jobs = await Promise.all(ids.map((id) => store.get('job:' + id)));
-      const summary = summarizePayerQuestions(ids, jobs);
-      const tier = evaluateLoyaltyTier(summary);
-      return {
-        payerAddress,
-        totalSpendStroops: summary.totalSpendStroops.toString(),
-        totalSpend: stroopsToUsdc(summary.totalSpendStroops),
-        tier: tier ? tier.tier : null,
-        bonusStroops: tier ? tier.bonusStroops : null,
-      };
-    })
-  );
-  return rows;
 }
 
 /**

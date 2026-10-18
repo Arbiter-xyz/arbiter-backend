@@ -51,6 +51,3 @@ export async function getAnchorConfig(config) {
   return value;
 }
 
-export function clearAnchorConfigCache() {
-  cache = { value: null, expiresAt: 0 };
-}
