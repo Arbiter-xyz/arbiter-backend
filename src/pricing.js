@@ -157,3 +157,68 @@ export function priceForTierWithVolumeDiscount(tierKey, onlineWorkers, volume) {
   const priceStroops = BigInt(Math.round(Number(priced.priceStroops) * discountMultiplier));
   return { ...priced, priceStroops, discountMultiplier };
 }
+
+/**
+ * A/B pricing experiments per category (issue #119).
+ *
+ * `PRICING_TIERS` above is frozen and snapshotted once at quote time so a
+ * payer's price can't move between quote and payment. Experiments must
+ * preserve that invariant: the assigned variant is chosen deterministically
+ * from (payerAddress, category) at quote time, and the resulting price is
+ * persisted alongside `priceStroops` so verification checks the exact quoted
+ * variant price rather than recomputing it.
+ *
+ * Unlike `PRICING_TIERS`, the experiment config is intentionally mutable —
+ * operators can add/retire experiments without a code change. Each experiment
+ * maps a category to a list of variants, each carrying a `priceMultiplier`
+ * applied to the tier's base price. The multiplier is clamped so the resulting
+ * price can never exceed `MAX_SURGE_MULTIPLIER`'s ceiling that billing.js's
+ * `reserveCredit()` reserves worst-case against — an experiment price above
+ * that ceiling would silently break the prepaid-balance reservation math.
+ */
+export const PRICING_EXPERIMENTS = Object.create(null);
+
+/**
+ * Pure, deterministic variant assignment. Hashes `payerAddress` + `category`
+ * into a stable bucket and looks it up against the experiment config. Returns
+ * `null` when no experiment is configured for the category (callers then fall
+ * back to the unmodified tier price). No store or chain access, mirroring
+ * `surgeMultiplier()`/`computeSmoothedCount()`'s testability pattern.
+ */
+export function assignPricingVariant(payerAddress, category) {
+  const experiment = PRICING_EXPERIMENTS[category];
+  if (!experiment || !Array.isArray(experiment.variants) || experiment.variants.length === 0) {
+    return null;
+  }
+  const seed = `${payerAddress || ''}:${category}`;
+  // FNV-1a 32-bit hash — stable across runs, no crypto dependency.
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < seed.length; i += 1) {
+    hash ^= seed.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  const variant = experiment.variants[hash % experiment.variants.length];
+  return { experiment: experiment.key || category, category, variant: variant.key, priceMultiplier: variant.priceMultiplier };
+}
+
+/**
+ * Snapshots a tier's price with an A/B experiment variant applied (issue
+ * #119). The variant multiplier is clamped so the final price never exceeds
+ * `MAX_SURGE_MULTIPLIER` times the tier's base price — the same ceiling
+ * `reserveCredit()` reserves against. When no experiment is configured for
+ * the category, the price is identical to `priceForTier()`.
+ */
+export function priceForTierWithExperiment(tierKey, onlineWorkers, payerAddress, category) {
+  const priced = priceForTier(tierKey, onlineWorkers);
+  const assignment = assignPricingVariant(payerAddress, category);
+  if (!assignment) {
+    return { ...priced, pricingVariant: null };
+  }
+  const tier = resolveTier(tierKey);
+  const ceiling = Number(tier.priceStroops) * MAX_SURGE_MULTIPLIER;
+  const rawMultiplier = Number(assignment.priceMultiplier);
+  const variantMultiplier = Number.isFinite(rawMultiplier) && rawMultiplier > 0 ? rawMultiplier : 1;
+  const candidate = Number(priced.priceStroops) * variantMultiplier;
+  const priceStroops = BigInt(Math.round(Math.min(candidate, ceiling)));
+  return { ...priced, priceStroops, pricingVariant: assignment.variant, pricingExperiment: assignment.experiment };
+}
