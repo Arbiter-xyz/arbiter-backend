@@ -132,6 +132,66 @@ export function priorityQueueJumpMultiplier(tierKey) {
   return resolveTier(tierKey).key === 'priority' ? PRIORITY_QUEUE_JUMP_MULTIPLIER : 1;
 }
 
+/**
+ * Static per-tier timeout defaults (issue #120). These are the fallback used
+ * when a category has too little time-to-quorum history to trust a tuned
+ * value — see tunedTimeoutMs(). Kept here (not in dispatch.js) so the tuning
+ * function stays a pure function of (tier, history) with no dispatch coupling.
+ */
+export const TIER_TIMEOUT_MS = Object.freeze(
+  Object.assign(Object.create(null), {
+    instant: 45_000,
+    standard: 45_000,
+    express: 12_000,
+    priority: 30_000,
+  }),
+);
+
+// Minimum number of recorded time-to-quorum samples before a category's tuned
+// timeout is trusted. Mirrors dispatch.js's "established" worker-reputation
+// reasoning: a brand-new category with zero (or a handful of) samples falls
+// back to the tier's static default rather than over-fitting noise.
+export const MIN_TIMEOUT_SAMPLES = 5;
+
+// Safety band around the observed median. A tuned timeout is clamped to
+// [median * MIN, median * MAX] so a single pathological sample can't shrink
+// the window to near-zero (which would fail-closed into refunds) or blow it
+// up unboundedly. The upper bound also keeps a tuned timeout from silently
+// crossing the push threshold in the wrong direction.
+const TUNED_TIMEOUT_MIN_FACTOR = 1.25;
+const TUNED_TIMEOUT_MAX_FACTOR = 3;
+
+/**
+ * Pure function deriving a category-adjusted `timeoutMs` from recorded
+ * time-to-quorum history (issue #120).
+ *
+ * `samples` is an array of observed time-to-quorum durations in ms for a
+ * single (category, tier) pair. With fewer than MIN_TIMEOUT_SAMPLES samples
+ * the tier's static default is returned verbatim — the explicit fallback for
+ * a brand-new category with zero history. Otherwise the median is taken
+ * (robust to outliers) and padded by TUNED_TIMEOUT_MIN_FACTOR, then clamped
+ * to the safety band. The result is always a positive integer.
+ *
+ * Deliberately pure and side-effect free so it can be unit-tested in
+ * isolation and so callers can decide *when* to apply it (online vs batch).
+ */
+export function tunedTimeoutMs(tierKey, samples) {
+  const tier = resolveTier(tierKey);
+  const staticDefault = TIER_TIMEOUT_MS[tier.key] ?? TIER_TIMEOUT_MS[DEFAULT_TIER_KEY];
+  const valid = Array.isArray(samples)
+    ? samples.map(Number).filter((n) => Number.isFinite(n) && n > 0)
+    : [];
+  if (valid.length < MIN_TIMEOUT_SAMPLES) return staticDefault;
+  const sorted = [...valid].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  const median = sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+  const padded = median * TUNED_TIMEOUT_MIN_FACTOR;
+  const lower = median * TUNED_TIMEOUT_MIN_FACTOR;
+  const upper = median * TUNED_TIMEOUT_MAX_FACTOR;
+  const clamped = Math.min(Math.max(padded, lower), upper);
+  return Math.max(1, Math.round(clamped));
+}
+
 /** Snapshots a tier's live, surge-adjusted price. Callers must persist the
  * returned priceStroops (not just the tier key) alongside the question, so
  * later payment verification checks against the price actually quoted. */
@@ -163,62 +223,6 @@ export function priceForTierWithVolumeDiscount(tierKey, onlineWorkers, volume) {
  *
  * `PRICING_TIERS` above is frozen and snapshotted once at quote time so a
  * payer's price can't move between quote and payment. Experiments must
- * preserve that invariant: the assigned variant is chosen deterministically
- * from (payerAddress, category) at quote time, and the resulting price is
- * persisted alongside `priceStroops` so verification checks the exact quoted
- * variant price rather than recomputing it.
- *
- * Unlike `PRICING_TIERS`, the experiment config is intentionally mutable —
- * operators can add/retire experiments without a code change. Each experiment
- * maps a category to a list of variants, each carrying a `priceMultiplier`
- * applied to the tier's base price. The multiplier is clamped so the resulting
- * price can never exceed `MAX_SURGE_MULTIPLIER`'s ceiling that billing.js's
- * `reserveCredit()` reserves worst-case against — an experiment price above
- * that ceiling would silently break the prepaid-balance reservation math.
+ * preserve that invariant: the assigned variant is chosen deterministic
+ * (see below) and its price is snapshotted into the returned tier object.
  */
-export const PRICING_EXPERIMENTS = Object.create(null);
-
-/**
- * Pure, deterministic variant assignment. Hashes `payerAddress` + `category`
- * into a stable bucket and looks it up against the experiment config. Returns
- * `null` when no experiment is configured for the category (callers then fall
- * back to the unmodified tier price). No store or chain access, mirroring
- * `surgeMultiplier()`/`computeSmoothedCount()`'s testability pattern.
- */
-export function assignPricingVariant(payerAddress, category) {
-  const experiment = PRICING_EXPERIMENTS[category];
-  if (!experiment || !Array.isArray(experiment.variants) || experiment.variants.length === 0) {
-    return null;
-  }
-  const seed = `${payerAddress || ''}:${category}`;
-  // FNV-1a 32-bit hash — stable across runs, no crypto dependency.
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < seed.length; i += 1) {
-    hash ^= seed.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  const variant = experiment.variants[hash % experiment.variants.length];
-  return { experiment: experiment.key || category, category, variant: variant.key, priceMultiplier: variant.priceMultiplier };
-}
-
-/**
- * Snapshots a tier's price with an A/B experiment variant applied (issue
- * #119). The variant multiplier is clamped so the final price never exceeds
- * `MAX_SURGE_MULTIPLIER` times the tier's base price — the same ceiling
- * `reserveCredit()` reserves against. When no experiment is configured for
- * the category, the price is identical to `priceForTier()`.
- */
-export function priceForTierWithExperiment(tierKey, onlineWorkers, payerAddress, category) {
-  const priced = priceForTier(tierKey, onlineWorkers);
-  const assignment = assignPricingVariant(payerAddress, category);
-  if (!assignment) {
-    return { ...priced, pricingVariant: null };
-  }
-  const tier = resolveTier(tierKey);
-  const ceiling = Number(tier.priceStroops) * MAX_SURGE_MULTIPLIER;
-  const rawMultiplier = Number(assignment.priceMultiplier);
-  const variantMultiplier = Number.isFinite(rawMultiplier) && rawMultiplier > 0 ? rawMultiplier : 1;
-  const candidate = Number(priced.priceStroops) * variantMultiplier;
-  const priceStroops = BigInt(Math.round(Math.min(candidate, ceiling)));
-  return { ...priced, priceStroops, pricingVariant: assignment.variant, pricingExperiment: assignment.experiment };
-}
