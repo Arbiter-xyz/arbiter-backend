@@ -3,7 +3,7 @@ import { resolveTier } from './pricing.js';
 import { exactMatchVote, draftAnswer } from './reconcile.js';
 import { config } from './config.js';
 import { jobLogger } from './logger.js';
-import { tryConsumeClaudeBudget } from './claudeBudget.js';
+import { reserveClaudeBudget } from './rateLimit.js';
 
 /**
  * Sandbox mode: ask a question with zero real payment and get a realistic,
@@ -32,7 +32,7 @@ import { tryConsumeClaudeBudget } from './claudeBudget.js';
  * answer." Cost exposure from a free, unauthenticated endpoint calling a
  * paid API is bounded by the existing per-IP sandbox rate limit
  * (SANDBOX_RATE_LIMIT_MAX) AND by the fleet-wide rolling Claude budget
- * (claudeBudget.js) — when that budget is exhausted, this path cleanly
+ * (rateLimit.js) — when that budget is exhausted, this path cleanly
  * falls back to the canned response instead of calling Claude, so a
  * distributed attacker can't multiply real spend across many IPs.
  * Every response is unambiguously tagged `sandbox: true` and fake tx
@@ -143,7 +143,7 @@ async function runSandboxFulfillment(questionId, questionText, mode) {
     // If the rolling budget is exhausted (e.g. distributed abuse across
     // many IPs), skip Claude entirely and fall through to the canned path
     // below — a clean, deterministic response, never a hung request.
-    const allowed = await tryConsumeClaudeBudget('sandbox');
+    const allowed = await reserveClaudeBudget('sandbox');
     if (allowed) {
       const draft = await draftAnswer(questionText, questionId);
       if (draft) {
@@ -183,106 +183,22 @@ async function runSandboxFulfillment(questionId, questionText, mode) {
           const vote = exactMatchVote(submissions);
           return {
             consensus: vote.consensus,
-            confidence: vote.allAgree ? 1 : vote.confidence,
+            confidence: vote.confidence,
             matchingWorkerIds: vote.matchingWorkerIds,
-            method: vote.allAgree ? 'exact-match-fastpath' : 'exact-match-fallback',
+            method: 'exact-match',
           };
         })();
 
-  // Same settlement threshold real oracle.js uses, so sandbox behavior
-  // stays honest about what would actually happen with these submissions.
-  const shouldResolve =
-    submissions.length > 0 && result.matchingWorkerIds.length > 0 && result.confidence >= config.minConfidence;
-
-  if (shouldResolve) {
-    await updateJob(questionId, {
-      status: 'settled',
-      outcome: 'resolved',
-      answer: result.consensus,
-      confidence: result.confidence,
-      reconciliationMethod: result.method,
-      totalAnswers: submissions.length,
-      matchingWorkers: result.matchingWorkerIds,
-      payoutTx: fakeTxHash('payout'),
-      payoutModel: 'sandbox — no real funds moved',
-    });
-  } else {
-    await updateJob(questionId, {
-      status: 'settled',
-      outcome: 'refunded',
-      reason: submissions.length === 0 ? 'no answers submitted' : 'no consensus reached',
-      totalAnswers: submissions.length,
-      refundTx: fakeTxHash('refund'),
-    });
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Worker practice mode (issue #83)
-// ---------------------------------------------------------------------------
-
-const PRACTICE_QUESTIONS = [
-  'What is the capital of France?',
-  'How many sides does a hexagon have?',
-  'What is 7 multiplied by 6?',
-];
-
-const PRACTICE_CONSENSUS = {
-  'What is the capital of France?': 'Paris',
-  'How many sides does a hexagon have?': '6',
-  'What is 7 multiplied by 6?': '42',
-};
-
-function pickPracticeQuestion(seed) {
-  const idx = Math.abs(Number(seed) || 0) % PRACTICE_QUESTIONS.length;
-  return PRACTICE_QUESTIONS[idx];
-}
-
-/**
- * Builds the synthetic `question` event a practice-mode worker receives.
- * Shape mirrors what dispatch.js broadcasts over SSE (type: 'question',
- * questionId, question, tier, timeoutMs) so a worker's real event handler
- * can be exercised unchanged — only `practice: true` distinguishes it.
- */
-export function buildPracticeQuestionEvent(workerId, { questionId, seed } = {}) {
-  const question = pickPracticeQuestion(seed ?? questionId ?? workerId);
-  const id = questionId || `practice-${Math.random().toString(36).slice(2, 10)}`;
-  return {
-    practice: true,
-    type: 'question',
-    questionId: id,
-    question,
-    workerId,
-    tier: 'practice',
-    timeoutMs: 0,
-    note: 'Practice mode: this is a synthetic question. No real dispatch, no chain calls, ' +
-      'no payout. Submit an answer to POST /app/answer with practice: true to get feedback.',
-  };
-}
-
-/**
- * Grades a practice-mode answer submission against the canned consensus for
- * the practice question. Never touches dispatch.js's `collectors` Map,
- * never calls reconcile(), and never calls any stellarClient.js function —
- * this is pure in-memory feedback, tagged `practice: true` so it can't be
- * mistaken for a real dispatch response.
- */
-export function gradePracticeAnswer({ workerId, questionId, answer } = {}) {
-  const question = pickPracticeQuestion(questionId ?? workerId);
-  const expected = PRACTICE_CONSENSUS[question];
-  const normalized = typeof answer === 'string' ? answer.trim().toLowerCase() : '';
-  const matched = normalized.length > 0 && normalized === expected.toLowerCase();
-
-  return {
-    practice: true,
-    questionId: questionId || null,
-    workerId: workerId || null,
-    question,
-    answer: typeof answer === 'string' ? answer : null,
-    matchedConsensus: matched,
-    feedback: matched
-      ? 'Correct — your answer matches the practice consensus. In a real dispatch this would count toward quorum.'
-      : `Not quite — the practice consensus answer is "${expected}". In a real dispatch, non-matching answers don't count toward quorum.`,
-    note: 'Practice mode: no real dispatch state was touched, no chain calls were made, and no payout occurred.',
-  };
+  await updateJob(questionId, {
+    status: 'settled',
+    outcome: result.consensus ? 'resolved' : 'refunded',
+    answer: result.consensus,
+    confidence: result.confidence,
+    reconciliationMethod: result.method,
+    totalAnswers: submissions.length,
+    matchingWorkers: result.matchingWorkerIds,
+    payoutTx: result.consensus ? fakeTxHash('payout') : null,
+    refundTx: result.consensus ? null : fakeTxHash('refund'),
+    payoutModel: 'sandbox — no real funds moved',
+  });
 }
