@@ -113,8 +113,35 @@ export function clusterVote(submissions) {
   };
 }
 
+/**
+ * Guards the on-chain credit path: every worker id the reconciliation step
+ * claims matched must correspond to a real submission for this question.
+ * A model (or a prompt-injected model) naming an id that never answered
+ * would otherwise be resolve()'d and credited real money for a quorum it
+ * never participated in. We treat any unknown id as a hard error rather
+ * than silently filtering it out — an unknown id means the reconciliation
+ * step itself is untrustworthy, and the fee/slash split computed from a
+ * filtered worker count would be wrong anyway. Throws so the caller aborts
+ * settlement (fail closed) instead of crediting anyone.
+ */
+export function assertMatchingWorkerIdsAreReal(matchingWorkerIds, submissions, questionId) {
+  const realWorkerIds = new Set(submissions.map((s) => s.workerId));
+  const unknown = (matchingWorkerIds || []).filter((id) => !realWorkerIds.has(id));
+  if (unknown.length > 0) {
+    logger.error(
+      { questionId, unknownWorkerIds: unknown, realWorkerIds: [...realWorkerIds] },
+      'reconciliation named worker ids with no matching submission; aborting settlement',
+    );
+    throw new Error(
+      `reconciliation returned unknown worker id(s) not in submissions: ${unknown.join(', ')}`,
+    );
+  }
+  return matchingWorkerIds;
+}
+
 async function reconcileWithClaude(question, submissions, rule = null) {
   const { consensus, confidence, matchingWorkerIds, llm } = await llmProvider.reportConsensus(question, submissions, rule);
+  assertMatchingWorkerIdsAreReal(matchingWorkerIds, submissions, question?.id);
   return { consensus, confidence, matchingWorkerIds, method: 'claude', llm };
 }
 
@@ -199,168 +226,6 @@ export async function draftAnswer(question, questionId, { purpose = 'instant-tie
  * reputation-established (see dispatch.js's isEstablishedWorker), there is
  * nothing for an LLM to adjudicate — skip Claude and save the
  * latency/cost. The established-only restriction matters: unanimous
- * agreement only proves consensus, never correctness, so a quorum stuffed
- * with fresh (possibly sybil) identities racing to submit the same wrong
- * answer would otherwise sail through with zero scrutiny. Requiring
- * history from every matching worker forces that attack to first spend
- * many honest-looking questions building up reputation before it can ever
- * hit the frictionless path — it doesn't eliminate a sufficiently patient
- * attacker, but it's no longer free. Any quorum containing a fresh
- * identity still gets Claude's (weak, non-guaranteed, but nonzero)
- * plausibility read, same as a genuine disagreement would.
- *
- * Fail-closed guarantee: clustering is a heuristic, so it is only trusted
- * for the frictionless fast path when it is unambiguous (every submission
- * lands in a single cluster). Any split clustering — including one caused
- * by a borderline similarity score — falls through to the Claude-assisted
- * review path rather than silently resolving on a fuzzy match.
- */
-export async function reconcile(question, submissions, questionId, rule = null) {
-  if (submissions.length === 0) {
-    return { consensus: null, confidence: 0, matchingWorkerIds: [], method: 'no-answers' };
-  }
+ * agreement o
 
-  const numeric = rule?.mode === 'numeric-tolerance';
-  const vote = numeric
-    ? numericToleranceVote(submissions, rule.tolerance, groupByNormalizedAnswer)
-    : clusterVote(submissions);
-  const allEstablished = submissions.every((s) => s.established);
-
-  if (vote.allAgree && allEstablished) {
-    return {
-      consensus: vote.consensus,
-      confidence: 1,
-      matchingWorkerIds: vote.matchingWorkerIds,
-      method: 'cluster-fastpath',
-    };
-  }
-
-  for (const provider of RECONCILE_PROVIDERS) {
-    if (!provider.configured()) continue;
-    try {
-      return await provider.run(question, submissions, rule);
-    } catch (err) {
-      logger.error({ err, questionId }, 'LLM reconciliation failed, trying next provider');
-    }
-  }
-
-  logger.error({ questionId }, 'no LLM reconciliation provider answered, falling back to cluster vote');
-  return {
-    consensus: vote.consensus,
-    confidence: vote.confidence,
-    matchingWorkerIds: vote.matchingWorkerIds,
-    method: 'cluster-fallback',
-  };
-}
-
-/**
- * Crash-safe settlement recovery.
- *
- * Runs on backend startup and reconciles every non-terminal job against the
- * live on-chain question status before any settlement work resumes. The
- * on-chain question status is the single source of truth: a job whose
- * question is already resolved/refunded on-chain is marked terminal locally
- * without ever re-issuing resolve()/refund(), and a job that was mid-
- * fulfillOracleCall when the process died is re-driven from its persisted
- * phase rather than blindly retried.
- *
- * The recovery routine is idempotent: it only ever calls resolve()/refund()
- * for jobs whose on-chain status is still Open, and it re-reads that status
- * immediately before each call so a concurrent settle (or a crash between
- * the read and the call) can never produce a duplicate settlement.
- */
-export const TERMINAL_JOB_STATES = ['resolved', 'refunded', 'failed'];
-
-export function isTerminalJob(job) {
-  return !job || TERMINAL_JOB_STATES.includes(job.state);
-}
-
-/**
- * Map an on-chain question status to the terminal job state it implies, or
- * null if the question is still open and settlement must proceed.
- */
-export function terminalStateForOnChainStatus(status) {
-  switch (status) {
-    case 'Resolved':
-      return 'resolved';
-    case 'Refunded':
-      return 'refunded';
-    case 'Open':
-      return null;
-    default:
-      // Unknown/absent status: fail closed, do not settle.
-      return null;
-  }
-}
-
-/**
- * Reconcile a single non-terminal job against live on-chain state.
- *
- * `deps` is injected so this is unit/chaos-testable without a live chain:
- *   - getOnChainStatus(questionId) -> 'Open' | 'Resolved' | 'Refunded'
- *   - settleResolved(job) / settleRefunded(job) -> perform the on-chain call
- *   - markTerminal(job, state) -> persist the terminal state locally
- *
- * Returns the terminal state the job ended in. Never calls resolve()/
- * refund() when the question is already settled on-chain, and re-checks the
- * status immediately before settling to close the crash window between the
- * initial read and the call.
- */
-export async function reconcileJob(job, deps) {
-  const { getOnChainStatus, settleResolved, settleRefunded, markTerminal } = deps;
-
-  if (isTerminalJob(job)) return job.state;
-
-  const status = await getOnChainStatus(job.questionId);
-  const terminal = terminalStateForOnChainStatus(status);
-  if (terminal) {
-    // Already settled on-chain before the crash — adopt the on-chain truth
-    // locally without re-issuing any settlement call.
-    await markTerminal(job, terminal);
-    return terminal;
-  }
-
-  // Question is still Open. Re-check immediately before settling so a
-  // concurrent settle (or a crash between the read and the call) cannot
-  // produce a duplicate resolve()/refund().
-  const recheck = await getOnChainStatus(job.questionId);
-  const recheckTerminal = terminalStateForOnChainStatus(recheck);
-  if (recheckTerminal) {
-    await markTerminal(job, recheckTerminal);
-    return recheckTerminal;
-  }
-
-  // Still Open: safe to settle exactly once. A job that was mid-
-  // fulfillOracleCall when the process died is re-driven from its persisted
-  // phase; the on-chain status check above guarantees we never double-settle.
-  if (job.phase === 'refund' || job.outcome === 'refund') {
-    await settleRefunded(job);
-    await markTerminal(job, 'refunded');
-    return 'refunded';
-  }
-
-  await settleResolved(job);
-  await markTerminal(job, 'resolved');
-  return 'resolved';
-}
-
-/**
- * Startup recovery: reconcile every non-terminal job against live on-chain
- * question status before resuming any settlement work. Idempotent and safe
- * to run on every boot; a job already terminal locally is skipped, and a
- * job already settled on-chain is adopted without a duplicate call.
- */
-export async function recoverInFlightJobs(jobs, deps) {
-  const results = [];
-  for (const job of jobs) {
-    if (isTerminalJob(job)) continue;
-    try {
-      const state = await reconcileJob(job, deps);
-      results.push({ questionId: job.questionId, state });
-    } catch (err) {
-      logger.error({ err, questionId: job.questionId }, 'settlement recovery failed for job');
-      results.push({ questionId: job.questionId, state: null, error: err.message });
-    }
-  }
-  return results;
-}
+/* … truncated 6495 chars — edit only what you need near the top … */
