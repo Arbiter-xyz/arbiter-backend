@@ -12,6 +12,12 @@
 // number of worker answers required to settle; the instant tier has none —
 // it's a single LLM draft, no human quorum at all.
 //
+// `instant` marks the tier as resolved via the LLM-draft path (no human
+// quorum) — read by fulfillOracleCall(). `timeoutMs` is the quorum deadline
+// read by dispatchAndCollect() (a positive value so quorums actually time
+// out). `preferEstablished` biases worker selection toward established
+// workers for that tier.
+//
 // Built on a null-prototype object (not just Object.freeze on a plain
 // literal), so a "__proto__" tier key can never resolve to Object.prototype
 // itself via a plain bracket lookup — PRICING_TIERS['__proto__'] is
@@ -19,10 +25,38 @@
 // caller is safe, not just resolveTier()'s explicit hasOwnProperty check.
 export const PRICING_TIERS = Object.freeze(
   Object.assign(Object.create(null), {
-    instant: Object.freeze({ key: 'instant', quorumSize: 0, priceStroops: 500_000n }),
-    standard: Object.freeze({ key: 'standard', quorumSize: 3, priceStroops: 2_500_000n }),
-    express: Object.freeze({ key: 'express', quorumSize: 2, priceStroops: 4_000_000n }),
-    priority: Object.freeze({ key: 'priority', quorumSize: 5, priceStroops: 6_000_000n }),
+    instant: Object.freeze({
+      key: 'instant',
+      quorumSize: 0,
+      priceStroops: 500_000n,
+      instant: true,
+      timeoutMs: 30_000,
+      preferEstablished: false,
+    }),
+    standard: Object.freeze({
+      key: 'standard',
+      quorumSize: 3,
+      priceStroops: 2_500_000n,
+      instant: false,
+      timeoutMs: 120_000,
+      preferEstablished: false,
+    }),
+    express: Object.freeze({
+      key: 'express',
+      quorumSize: 2,
+      priceStroops: 4_000_000n,
+      instant: false,
+      timeoutMs: 60_000,
+      preferEstablished: true,
+    }),
+    priority: Object.freeze({
+      key: 'priority',
+      quorumSize: 5,
+      priceStroops: 6_000_000n,
+      instant: false,
+      timeoutMs: 180_000,
+      preferEstablished: true,
+    }),
   }),
 );
 
