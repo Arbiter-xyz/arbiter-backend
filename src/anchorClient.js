@@ -51,6 +51,19 @@ export async function getAnchorConfig(config) {
   return value;
 }
 
+/**
+ * Derive whether the anchor is configured from the resolved config value,
+ * matching the same shape `getAnchorConfig()` returns. Kept in sync with the
+ * cache so callers get a cheap synchronous check without re-fetching.
+ */
+export function isAnchorConfigured(config) {
+  const value = cache.value;
+  if (!value) {
+    return Boolean(config?.anchor?.homeDomain);
+  }
+  return Boolean(value.homeDomain && value.signingKey);
+}
+
 export function clearAnchorConfigCache() {
   cache = { value: null, expiresAt: 0 };
 }
