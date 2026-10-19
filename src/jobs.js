@@ -192,11 +192,32 @@ export async function getEscalatedItems() {
 }
 
 /**
- * Returns the set of escalated ids for a given kind, for cheap membership
- * checks when marking a list of review-queue items or disputes. Returns a
- * Set so callers can do `set.has(id)` without scanning the raw entries.
+ * Tags a job as synthetic monitoring (issue #111). Idempotent. Synthetic jobs
+ * are excluded from /stats the same way sandbox settlements are, so a
+ * monitoring run never inflates real customer metrics.
  */
-export async function getEscalatedIds(kind) {
-  const escalated = await getEscalatedItems();
-  return new Set(escalated.filter((e) => e.kind === kind).map((e) => e.id));
+export async function markSynthetic(jobId) {
+  const synthetic = (await store.get(SYNTHETIC_INDEX_KEY)) || [];
+  if (synthetic.includes(jobId)) return;
+  await store.set(
+    SYNTHETIC_INDEX_KEY,
+    [jobId, ...synthetic].slice(0, MAX_TRACKED_SYNTHETIC_JOBS),
+  );
+}
+
+/**
+ * Returns the jobIds tagged as synthetic monitoring, most-recent-first.
+ * Backs /stats' exclusion of synthetic runs.
+ */
+export async function getSyntheticJobIds() {
+  return (await store.get(SYNTHETIC_INDEX_KEY)) || [];
+}
+
+/**
+ * True if the given jobId was tagged as synthetic monitoring. Used by /stats
+ * to exclude synthetic runs from real customer metrics.
+ */
+export async function isSyntheticJob(jobId) {
+  const synthetic = (await store.get(SYNTHETIC_INDEX_KEY)) || [];
+  return synthetic.includes(jobId);
 }
