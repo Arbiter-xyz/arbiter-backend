@@ -168,3 +168,8 @@ Instead of polling `GE
 
 <!-- handsoff-issue-84 -->
 - #84: Multi-tenant white-label backend
+
+## Handsoff notes
+
+<!-- handsoff-issue-232 -->
+- #232: resolveQuestion() doesn't pass answer_hash — will hard-fail the moment arbiter-contract's compile-fix is deployed, and kills on-chain notarization end-to-end
