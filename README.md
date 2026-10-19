@@ -176,3 +176,6 @@ Instead of polling `GE
 
 <!-- handsoff-issue-298 -->
 - #298: Review: autoWithdraw.js has no test file at all
+
+<!-- handsoff-issue-300 -->
+- #300: Review: earnings.js has no test file at all
