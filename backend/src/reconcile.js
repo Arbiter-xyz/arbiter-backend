@@ -5,6 +5,13 @@ const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const MODEL = process.env.CLAUDE_MODEL || 'claude-3-5-sonnet-latest';
 
 /**
+ * Public accessor for the shared Anthropic client instance.
+ */
+function getClient() {
+  return client;
+}
+
+/**
  * Deterministic fallback: credit every worker whose normalized answer matches
  * the majority normalized answer. Used when Claude is unavailable or when its
  * output fails validation.
@@ -168,4 +175,4 @@ async function draftAnswer(question) {
   }
 }
 
-module.exports = { reconcileWithClaude, draftAnswer, exactMatchVote };
+module.exports = { reconcileWithClaude, draftAnswer, exactMatchVote, getClient };
