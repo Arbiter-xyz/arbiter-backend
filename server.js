@@ -62,6 +62,24 @@ function rateLimitedSponsorOnboard(req, res, next) {
 
 app.use('/api/sponsor/onboard', rateLimitedSponsorOnboard);
 
+// Cancel a pending question within its undo window. This is the canonical
+// route advertised by oracle.js/metered.js as `cancelUrl: /oracle/${jobId}/cancel`
+// and it delegates to the existing cancelJob() implementation rather than
+// reimplementing cancellation logic here.
+app.post('/oracle/:jobId/cancel', async (req, res) => {
+  try {
+    const { cancelJob } = require('./oracle');
+    const result = await cancelJob(req.params.jobId);
+    if (result && result.error) {
+      return res.status(400).json(result);
+    }
+    return res.json(result);
+  } catch (err) {
+    console.error('Failed to cancel job:', err);
+    return res.status(500).json({ error: 'Failed to cancel job' });
+  }
+});
+
 async function start() {
   await rebuildSubscribedWorkers();
   const port = process.env.PORT || 3000;
