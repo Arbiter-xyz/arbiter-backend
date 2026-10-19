@@ -5,6 +5,25 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const app = express();
 
+// Soroban contract error code for `ContractError::InsufficientBalance`.
+//
+// LOUD WARNING: this number is part of arbiter-contract's external interface.
+// `#[repr(u32)]` values are matched numerically by clients, so a renumbering
+// event breaks this mapping SILENTLY — no build error on either side. This has
+// already happened once: arbiter-contract's docs/versioning.md "Class D"
+// records `QuorumTooLarge` being renumbered to 200 after two branches' error
+// codes collided on merge (clients built against the earlier version would
+// misread 15–18). See also arbiter-contract PR #180, which removed 6
+// `ContractError` variants to fit Soroban's 50-variant XDR cap.
+//
+// Source of truth: repo-root `src/lib.rs` in arbiter-contract (NOT
+// `contracts/oracle-escrow/src/lib.rs`, which is docs-only). If that enum
+// changes, update this constant deliberately — see issue #236.
+const INSUFFICIENT_BALANCE_CODE = 13;
+const INSUFFICIENT_BALANCE_RE = new RegExp(
+  `Error\\(Contract, #${INSUFFICIENT_BALANCE_CODE}\\)`
+);
+
 // Security headers: CSP, X-Frame-Options (frame-ancestors), nosniff, etc.
 app.use(
   helmet({
@@ -108,3 +127,5 @@ if (require.main === module) {
 module.exports = app;
 module.exports.start = start;
 module.exports.attachWebSocketServer = attachWebSocketServer;
+module.exports.INSUFFICIENT_BALANCE_CODE = INSUFFICIENT_BALANCE_CODE;
+module.exports.INSUFFICIENT_BALANCE_RE = INSUFFICIENT_BALANCE_RE;
