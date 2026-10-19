@@ -192,129 +192,19 @@ export async function getEscalatedItems() {
 }
 
 /**
- * Returns the set of escalated ids for a given kind, for cheap membership
- * checks when annotating admin listings.
+ * Moves a job into the manual review queue. `extra` carries any additional
+ * fields to persist alongside the status change (e.g. `outcome`, `reason`).
+ * The `outcome` is read from `extra.outcome` so callers can record why the
+ * job was flagged for review without this function referencing an undefined
+ * variable.
  */
-export async function getEscalatedIds(kind) {
-  const escalated = await getEscalatedItems();
-  return new Set(escalated.filter((e) => e.kind === kind).map((e) => e.id));
-}
-
-/**
- * Marks a job as synthetic (a scheduled monitor run, not a real customer
- * question) and records it in a separate index so /stats can exclude it.
- * Called by the synthetic runner right after createJob(), before dispatch,
- * so the tag is present for the entire lifetime of the job and every log
- * line emitted for it can carry `synthetic: true`.
- */
-export async function markSynthetic(jobId) {
-  await updateJob(jobId, { synthetic: true });
-  const known = (await store.get(SYNTHETIC_INDEX_KEY)) || [];
-  if (!known.includes(jobId)) {
-    await store.set(
-      SYNTHETIC_INDEX_KEY,
-      [jobId, ...known].slice(0, MAX_TRACKED_SYNTHETIC_JOBS),
-    );
-  }
-}
-
-export async function getSyntheticJobIds() {
-  return (await store.get(SYNTHETIC_INDEX_KEY)) || [];
-}
-
-/**
- * True when a job record is a synthetic monitor run. Used by /stats to keep
- * synthetic settlements out of the public counters, consistent with how
- * sandbox traffic is already excluded (see stats.js).
- */
-export function isSyntheticJob(job) {
-  return Boolean(job && job.synthetic);
-}
-
-async function indexScheduled(jobId) {
-  const scheduled = (await store.get(SCHEDULED_INDEX_KEY)) || [];
-  if (scheduled.includes(jobId)) return;
-  await store.set(
-    SCHEDULED_INDEX_KEY,
-    [jobId, ...scheduled].slice(0, MAX_TRACKED_SCHEDULED),
-  );
-}
-
-async function unindexScheduled(jobId) {
-  const scheduled = (await store.get(SCHEDULED_INDEX_KEY)) || [];
-  if (!scheduled.includes(jobId)) return;
-  await store.set(SCHEDULED_INDEX_KEY, scheduled.filter((id) => id !== jobId));
-}
-
-/**
- * Returns the jobIds currently in the `scheduled` state, most-recent-first.
- * Backs the scheduling sweep (scheduled.js), which dispatches any job whose
- * `scheduledFor` has arrived and prunes entries that have left the state.
- */
-export async function getScheduledJobIds() {
-  return (await store.get(SCHEDULED_INDEX_KEY)) || [];
-}
-
-/**
- * Returns the full job records currently in `scheduled`, sorted by execute
- * time ascending (soonest first). Jobs whose record has expired (TTL) or
- * already left the scheduled state are pruned from the index so the queue
- * self-heals, mirroring getPendingReviews().
- */
-export async function getScheduledJobs() {
-  const jobIds = await getScheduledJobIds();
-  const jobs = [];
-  for (const jobId of jobIds) {
-    const job = await getJob(jobId);
-    if (job && job.status === 'scheduled') {
-      jobs.push(job);
-    } else {
-      await unindexScheduled(jobId);
-    }
-  }
-  return jobs.sort((a, b) => (a.scheduledFor || 0) - (b.scheduledFor || 0));
-}
-
-/**
- * Cancels a scheduled question before its dispatch time. Only valid while the
- * job is still in `scheduled` — once the sweep has moved it to
- * `awaiting_workers` the normal undo window / refund path applies instead.
- * Returns the updated job, or null if the job is missing or no longer
- * cancellable. Releasing reserved funds is the caller's responsibility (the
- * route layer refunds the prepaid charge); this only flips the state and
- * removes the job from the schedule index so it is never dispatched.
- */
-export async function cancelScheduledJob(jobId) {
-  const job = await getJob(jobId);
-  if (!job || job.status !== 'scheduled') return null;
-  const updated = await updateJob(jobId, {
-    status: 'cancelled',
-    cancelledAt: Date.now(),
+export async function markPendingReview(jobId, extra = {}) {
+  const { outcome, ...rest } = extra;
+  const job = await updateJob(jobId, {
+    status: 'pending_review',
+    outcome: outcome ?? 'pending_review',
+    ...rest,
   });
-  await unindexScheduled(jobId);
-  return updated;
+  await indexReview(jobId);
+  return job;
 }
-
-/**
- * Async job record for a paid question. Replaces v1's design of holding the
- * client's HTTP request open for up to QUORUM_TIMEOUT_MS while workers
- * answer — that's fragile against proxies, mobile networks, and
- * serverless/edge request timeouts. Instead POST /oracle's second step
- * returns 202 immediately once payment is confirmed, and the caller polls
- * GET /oracle/:jobId (or listens on its SSE stream) for the result.
- *
- * States: [holding ->] awaiting_workers -> reconciling -> settled
- * `holding` is the undo window (see undoWindow.js) — paid, not yet
- * dispatched, cancellable until `cancellableUntil`; a cancelled job goes
- * 
-
-/* … truncated 4798 chars — edit only what you need near the top … */
- * States: [holding ->] [scheduled ->] awaiting_workers -> reconciling -> settled
- * `holding` is the undo window (see undoWindow.js) — paid, not yet
- * dispatched, cancellable until `cancellableUntil`; a cancelled job goes
- * to `cancelled`. `scheduled` (#80) is a paid question whose dispatch is
- * deferred to `scheduledFor`; the scheduling sweep moves it to
- * `awaiting_workers` at that time, after which the normal pipeline applies.
- * A scheduled job cancelled before `scheduledFor` goes straight to
- * `cancelled` without ever dispatching.
- */
