@@ -173,3 +173,6 @@ Instead of polling `GE
 
 <!-- handsoff-issue-297 -->
 - #297: Review: anchorRecords.js has no test file at all
+
+<!-- handsoff-issue-298 -->
+- #298: Review: autoWithdraw.js has no test file at all
