@@ -168,3 +168,8 @@ Instead of polling `GE
 
 <!-- handsoff-issue-84 -->
 - #84: Multi-tenant white-label backend
+
+## Handsoff notes
+
+<!-- handsoff-issue-241 -->
+- #241: All three billing processors call an undefined resolveCurrency()/SUPPORTED_CURRENCIES
