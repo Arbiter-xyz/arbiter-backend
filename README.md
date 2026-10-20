@@ -171,5 +171,11 @@ Instead of polling `GE
 
 ## Handsoff notes
 
-<!-- handsoff-issue-232 -->
-- #232: resolveQuestion() doesn't pass answer_hash — will hard-fail the moment arbiter-contract's compile-fix is deployed, and kills on-chain notarization end-to-end
+<!-- handsoff-issue-297 -->
+- #297: Review: anchorRecords.js has no test file at all
+
+<!-- handsoff-issue-298 -->
+- #298: Review: autoWithdraw.js has no test file at all
+
+<!-- handsoff-issue-300 -->
+- #300: Review: earnings.js has no test file at all
