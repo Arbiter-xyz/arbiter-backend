@@ -168,3 +168,14 @@ Instead of polling `GE
 
 <!-- handsoff-issue-84 -->
 - #84: Multi-tenant white-label backend
+
+## Handsoff notes
+
+<!-- handsoff-issue-297 -->
+- #297: Review: anchorRecords.js has no test file at all
+
+<!-- handsoff-issue-298 -->
+- #298: Review: autoWithdraw.js has no test file at all
+
+<!-- handsoff-issue-300 -->
+- #300: Review: earnings.js has no test file at all
