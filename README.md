@@ -171,5 +171,5 @@ Instead of polling `GE
 
 ## Handsoff notes
 
-<!-- handsoff-issue-311 -->
-- #311: Review: workerAnalytics.js has no test file at all
+<!-- handsoff-issue-232 -->
+- #232: resolveQuestion() doesn't pass answer_hash — will hard-fail the moment arbiter-contract's compile-fix is deployed, and kills on-chain notarization end-to-end
