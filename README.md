@@ -171,5 +171,8 @@ Instead of polling `GE
 
 ## Handsoff notes
 
-<!-- handsoff-issue-308 -->
-- #308: Review: taxReport.js has no test file at all
+<!-- handsoff-issue-267 -->
+- #267: dispatch.js's committed file ends mid-function, missing 6 functions imported elsewhere
+
+<!-- handsoff-issue-301 -->
+- #301: Review: faultInjection.js has no test file at all
