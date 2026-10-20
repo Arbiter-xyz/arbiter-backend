@@ -238,6 +238,50 @@ export async function addMembers(teamId, actor, addresses, role = 'member') {
  * member's role to 'owner' transfers ownership: they become owner and the
  * previous owner becomes an admin, so there's always exactly one owner.
  */
-export async function setMemberRole(teamId, a
+export async function setMemberRole(teamId, actor, target, role) {
+  if (!ROLES.includes(role)) throw new TeamError(`role must be one of ${ROLES.join(', ')}`);
+  const team = await requireTeamRole(teamId, actor, 'owner');
+  const member = team.members.find((m) => m.address === target);
+  if (!member) throw new TeamError('that address is not a member of this team', 404);
+  if (target === actor) {
+    throw new TeamError('the owner cannot change their own role — transfer ownership to another member instead', 409);
+  }
 
-/* … truncated 1980 chars — edit only what you need near the top … */
+  if (role === 'owner') {
+    team.members.find((m) => m.address === actor).role = 'admin';
+  }
+  member.role = role;
+  return saveTeam(team);
+}
+
+/**
+ * Removes a member. Anyone may remove themselves (leave); admins may remove
+ * plain members; the owner may remove anyone but themselves. The owner can
+ * never leave while they're the owner — transfer first.
+ */
+export async function removeMember(teamId, actor, target) {
+  const team = await requireTeamRole(teamId, actor, 'member');
+  const targetRole = roleOf(team, target);
+  if (targetRole === null) throw new TeamError('that address is not a member of this team', 404);
+  if (targetRole === 'owner') {
+    throw new TeamError('the owner cannot be removed — transfer ownership first, or delete the team', 409);
+  }
+  if (target !== actor) {
+    const required = targetRole === 'admin' ? 'owner' : 'admin';
+    if (!hasRole(team, actor, required)) throw new TeamError(`requires the ${required} role on this team`, 403);
+  }
+
+  team.members = team.members.filter((m) => m.address !== target);
+  await saveTeam(team);
+  await removeMembership(target, teamId);
+  return team;
+}
+
+export async function deleteTeam(teamId, actor) {
+  const team = await requireTeamRole(teamId, actor, 'owner');
+  await store.delete(TEAM_PREFIX + teamId);
+  await Promise.all(team.members.map((m) => removeMembership(m.address, teamId)));
+  const known = await listKnownTeamIds();
+  await store.set(TEAM_INDEX_KEY, known.filter((id) => id !== teamId));
+  return true;
+}

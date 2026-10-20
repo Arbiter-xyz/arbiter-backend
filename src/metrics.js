@@ -108,25 +108,23 @@ export const probeErrorsTotal = new client.Counter({
   registers: [registry],
 });
 
-// --- Billing (billing.js) --------------------------------------------------
+export const fiatPoolBalanceStroops = new client.Gauge({
+  name: 'arbiter_fiat_pool_balance_stroops',
+  help: 'Current balance of the pooled fiat-onramp custody address, in stroops.',
+  registers: [registry],
+});
 
 export const billingReservationCount = new client.Counter({
-  name: 'arbiter_billing_reservations_total',
-  help: 'Credit reservations made by reserveCredit(), by result (ok, insufficient, error).',
-  labelNames: ['result'],
+  name: 'arbiter_billing_reservation_total',
+  help: 'Fiat-credit reservations against a customer balance, by outcome (reserved, insufficient).',
+  labelNames: ['outcome'],
   registers: [registry],
 });
 
 export const billingSettlementCount = new client.Counter({
-  name: 'arbiter_billing_settlements_total',
-  help: 'Credit settlements made by settleCredit(), by result (ok, error).',
-  labelNames: ['result'],
-  registers: [registry],
-});
-
-export const fiatPoolBalanceStroops = new client.Gauge({
-  name: 'arbiter_fiat_pool_balance_stroops',
-  help: 'Current fiat pool balance in stroops, as last observed by the billing path.',
+  name: 'arbiter_billing_settlement_total',
+  help: 'Fiat-credit reservations settled against an actual charge, by outcome (charged, refunded).',
+  labelNames: ['outcome'],
   registers: [registry],
 });
 

@@ -268,25 +268,171 @@ export async function rescorePair(key, { getReputation } = {}) {
 
     if (disposition === 'ok') return { key, score, disposition };
 
-    await store.set(FLAG_PREFIX + key, { score, disposition, at: Date.now() });
-    await pushBounded(FLAGGED_INDEX_KEY, key, MAX_FLAGGED_TRACKED);
-    if (disposition === 'suspend') {
-      await store.set(SUSPENDED_PREFIX + key, { score, at: Date.now() });
+function matchRatio(rep) {
+  return rep && rep.total > 0 ? rep.matched / rep.total : null;
+}
+
+/**
+ * Pure scoring over already-loaded inputs. Returns { score, signals } where
+ * each signal is 0..1 before weighting.
+ */
+export function scorePair({ counters, ratioA, ratioB, referral, sharedIp }, minShared = config.collusion.minSharedQuestions) {
+  const { shared, sameAnswer, sameWrong, synced } = counters;
+  const signals = { sameWrong: 0, lift: 0, sync: 0, referral: referral ? 1 : 0, sharedIp: sharedIp ? 1 : 0 };
+
+  // Once is a coincidence; twice in identical words is a pattern. Scales
+  // with how much of their shared history is agreeing-on-wrong.
+  if (sameWrong >= 2 && shared > 0) signals.sameWrong = Math.min(1, (2 * sameWrong) / shared + 0.25);
+
+  if (shared >= minShared) {
+    // Under independence, P(same answer) ~= P(both right) = pA * pB (the
+    // chance of two independent wrong answers matching word for word is
+    // small enough to ignore). Lift is how far above that they sit,
+    // normalized so "always agree" scores 1 regardless of the baseline.
+    if (ratioA !== null && ratioB !== null) {
+      const expected = ratioA * ratioB;
+      const observed = sameAnswer / shared;
+      if (expected < 1) signals.lift = Math.max(0, Math.min(1, (observed - expected) / (1 - expected)));
     }
-    logger.warn({ key, score, disposition }, 'collusion pair flagged');
-    return { key, score, disposition };
-  } catch (err) {
-    logger.warn({ err, key }, 'failed to rescore collusion pair');
-    return null;
+    signals.sync = Math.min(1, synced / shared);
   }
+
+  let clean = 1;
+  for (const [name, value] of Object.entries(signals)) clean *= 1 - SIGNAL_WEIGHTS[name] * value;
+  return { score: Math.round((1 - clean) * 1000) / 1000, signals };
 }
 
-/** True if the pair is currently suspended (dropped from routing). */
-export async function isPairSuspended(a, b) {
-  return Boolean(await store.get(SUSPENDED_PREFIX + pairKey(a, b)));
+export async function evaluatePair(a, b, getReputation) {
+  const key = pairKey(a, b);
+  const [counters, repA, repB, link, sharedIp] = await Promise.all([
+    getPairCounters(key),
+    getReputation(a),
+    getReputation(b),
+    store.get(LINK_PREFIX + key),
+    sharesIp(a, b),
+  ]);
+  const result = scorePair({
+    counters,
+    ratioA: matchRatio(repA),
+    ratioB: matchRatio(repB),
+    referral: link?.kind === 'referral',
+    sharedIp,
+  });
+  return { pair: key, workers: splitPair(key), counters, referral: link || null, ...result };
 }
 
-/** True if the pair is currently flagged (denied the reconcile fast path). */
-export async function isPairFlagged(a, b) {
-  return Boolean(await store.get(FLAG_PREFIX + pairKey(a, b)));
+async function rescorePair(a, b, getReputation) {
+  const evaluation = await evaluatePair(a, b, getReputation);
+  const { score } = evaluation;
+  const flagKey = FLAG_PREFIX + evaluation.pair;
+  const previous = await store.get(flagKey);
+  // An already-flagged pair is always re-written, even below threshold, so
+  // assessQuorum() sees the score fall rather than a stale high one.
+  if (score < config.collusion.flagScore && !previous) return evaluation;
+
+  const now = Date.now();
+  const flag = {
+    ...(previous || { flaggedAt: now }),
+    pair: evaluation.pair,
+    workers: evaluation.workers,
+    score,
+    signals: evaluation.signals,
+    counters: evaluation.counters,
+    updatedAt: now,
+  };
+  await store.set(flagKey, flag);
+  await pushBounded(FLAGGED_INDEX_KEY, evaluation.pair, MAX_FLAGGED_TRACKED);
+  if (!previous && score >= config.collusion.flagScore) logger.warn({ pair: evaluation.pair, score, signals: evaluation.signals }, 'collusion heuristic flagged a worker pair');
+
+  // An operator clearing a pair records the score they accepted; only a
+  // strictly worse score after that re-suspends, so review isn't undone by
+  // the very next quorum they share.
+  const reviewedScore = typeof flag.reviewedScore === 'number' ? flag.reviewedScore : -1;
+  if (score >= config.collusion.suspendScore && score > reviewedScore) {
+    for (const [worker, partner] of [evaluation.workers, [...evaluation.workers].reverse()]) {
+      await store.set(SUSPENDED_PREFIX + worker, { partner, pair: evaluation.pair, score, since: now });
+    }
+  }
+  return evaluation;
+}
+
+/**
+ * Pre-reconcile check over one quorum: are any two workers in it a
+ * flagged pair who gave the same answer? Same-answer is the part that
+ * matters — a flagged pair that disagreed this time can't have stuffed
+ * this particular consensus. Returns { suspicious, pairs, workerIds }.
+ * Fails open (not suspicious) on a store error, since the caller is on the
+ * settlement path.
+ */
+export async function assessQuorum(submissions) {
+  const pairs = [];
+  try {
+    for (let i = 0; i < submissions.length; i += 1) {
+      for (let j = i + 1; j < submissions.length; j += 1) {
+        const a = submissions[i];
+        const b = submissions[j];
+        if (a.workerId === b.workerId || normalize(a.answer) !== normalize(b.answer)) continue;
+        const flag = await store.get(FLAG_PREFIX + pairKey(a.workerId, b.workerId));
+        if (flag && flag.score >= config.collusion.flagScore) pairs.push({ pair: flag.pair, score: flag.score, signals: flag.signals });
+      }
+    }
+  } catch (err) {
+    logger.error({ err }, 'collusion quorum assessment failed — proceeding without it');
+    return { suspicious: false, pairs: [], workerIds: [] };
+  }
+  const workerIds = [...new Set(pairs.flatMap((p) => splitPair(p.pair)))];
+  return { suspicious: pairs.length > 0, pairs, workerIds };
+}
+
+/** Routing gate used by dispatch.js's isEligible(). */
+export async function isCollusionSuspended(workerId) {
+  return Boolean(await store.get(SUSPENDED_PREFIX + workerId));
+}
+
+export async function isFlaggedPair(a, b) {
+  const flag = await store.get(FLAG_PREFIX + pairKey(a, b));
+  return Boolean(flag && flag.score >= config.collusion.flagScore);
+}
+
+// ---------------------------------------------------------------------
+// Operator surface (see /admin/collusion in server.js).
+// ---------------------------------------------------------------------
+
+export async function listFlaggedPairs({ limit = 100 } = {}) {
+  const keys = (await store.get(FLAGGED_INDEX_KEY)) || [];
+  const flags = await Promise.all(keys.map((k) => store.get(FLAG_PREFIX + k)));
+  return flags
+    .filter(Boolean)
+    .map((f) => ({ ...f, active: f.score >= config.collusion.flagScore }))
+    .sort((x, y) => y.score - x.score)
+    .slice(0, limit);
+}
+
+/** Every tracked partner of one worker, scored live, highest first. */
+export async function getWorkerCollusionReport(workerId, getReputation) {
+  const partners = (await store.get(PARTNERS_PREFIX + workerId)) || [];
+  const pairs = await Promise.all(partners.map((p) => evaluatePair(workerId, p, getReputation)));
+  return {
+    workerId,
+    suspended: await store.get(SUSPENDED_PREFIX + workerId),
+    pairs: pairs.sort((x, y) => y.score - x.score),
+  };
+}
+
+/**
+ * Operator review: lifts the routing suspension for both workers in the
+ * pair and records the score that was accepted, so only a worse score
+ * re-suspends. The flag itself stays in the index for the audit trail.
+ */
+export async function clearPairFlag(a, b, { note } = {}) {
+  const key = pairKey(a, b);
+  const flag = await store.get(FLAG_PREFIX + key);
+  if (!flag) return null;
+  const reviewed = { ...flag, reviewedAt: Date.now(), reviewedScore: flag.score, ...(note ? { reviewNote: String(note).slice(0, 500) } : {}) };
+  await store.set(FLAG_PREFIX + key, reviewed);
+  for (const worker of splitPair(key)) {
+    const suspension = await store.get(SUSPENDED_PREFIX + worker);
+    if (suspension?.pair === key) await store.delete(SUSPENDED_PREFIX + worker);
+  }
+  return reviewed;
 }

@@ -5,6 +5,12 @@ import { config } from './config.js';
 import { jobLogger } from './logger.js';
 import { reserveClaudeBudget } from './rateLimit.js';
 
+// Conservative per-call estimate for one short draft exchange (roughly
+// 500-1000 input and 200-500 output tokens at current Sonnet pricing). The
+// fleet cap bounds worst-case abuse, not exact spend, so this reservation is
+// treated as final rather than reconciled with settleClaudeBudget.
+const SANDBOX_CLAUDE_COST_CENTS = 2;
+
 /**
  * Sandbox mode: ask a question with zero real payment and get a realistic,
  * fully-typed job response back — no wallet, no testnet USDC, no chain
@@ -143,7 +149,7 @@ async function runSandboxFulfillment(questionId, questionText, mode) {
     // If the rolling budget is exhausted (e.g. distributed abuse across
     // many IPs), skip Claude entirely and fall through to the canned path
     // below — a clean, deterministic response, never a hung request.
-    const allowed = await reserveClaudeBudget('sandbox');
+    const allowed = await reserveClaudeBudget(SANDBOX_CLAUDE_COST_CENTS);
     if (allowed) {
       const draft = await draftAnswer(questionText, questionId);
       if (draft) {

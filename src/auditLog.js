@@ -1,57 +1,34 @@
+import { randomUUID } from 'node:crypto';
 import { store } from './store.js';
 
 /**
- * Durable, bounded append/read log used by support.js (#133) to record
- * ticket lifecycle events (opened, replied, closed) so an admin can audit
- * what happened to a support ticket without a store-wide scan.
- *
- * Mirrors payerIndex.js's durable-list pattern: a per-key list with no TTL
- * (durable, same choice as reputation) plus a bounded known-key index so
- * the set of logged subjects can be enumerated.
+ * Admin action audit trail (#129). A durable, bounded, newest-first list,
+ * using the same pattern as payerIndex.js's known-address index. Callers
+ * treat this as best-effort (each call site wraps it in .catch(() => {})):
+ * losing an audit entry is bad, but it must never make the admin action
+ * itself fail.
  */
-const PREFIX = 'audit-log:';
-const MAX_ENTRIES_PER_KEY = 500; // bound growth; keep the most recent
 
-// Mirrors payerIndex.js's PAYER_INDEX_KEY: a durable, bounded list of every
-// subject key ever logged, so an admin "Audit" view can enumerate them
-// without a store-wide scan.
-const AUDIT_INDEX_KEY = 'known-audit-keys';
-const MAX_TRACKED_KEYS = 5_000;
+const AUDIT_LOG_KEY = 'audit-log';
+const MAX_TRACKED_ENTRIES = 5_000;
 
-export async function getKnownAuditKeys() {
-  return (await store.get(AUDIT_INDEX_KEY)) || [];
+export async function appendAuditLog({ action, actor, target = null, metadata = null }) {
+  const entry = {
+    id: randomUUID(),
+    action,
+    actor,
+    target,
+    metadata,
+    at: new Date().toISOString(),
+  };
+  const existing = (await store.get(AUDIT_LOG_KEY)) || [];
+  await store.set(AUDIT_LOG_KEY, [entry, ...existing].slice(0, MAX_TRACKED_ENTRIES));
+  return entry;
 }
 
-/**
- * Append an entry to the log for `key`. Entries are stored newest-first and
- * bounded to MAX_ENTRIES_PER_KEY. The first write for a key also registers
- * it in the known-keys index.
- */
-export async function appendAuditEntry(key, entry) {
-  if (!key) return null;
-
-  const storeKey = PREFIX + key;
-  const existing = (await store.get(storeKey)) || [];
-  const isNew = existing.length === 0;
-  const record = { ...entry, at: entry?.at || new Date().toISOString() };
-  const next = [record, ...existing].slice(0, MAX_ENTRIES_PER_KEY);
-  await store.set(storeKey, next); // no TTL — durable, same choice as reputation
-
-  if (isNew) {
-    const known = await getKnownAuditKeys();
-    if (!known.includes(key)) {
-      await store.set(AUDIT_INDEX_KEY, [key, ...known].slice(0, MAX_TRACKED_KEYS));
-    }
-  }
-
-  return record;
-}
-
-/**
- * Read the log for `key`, newest-first. Returns an empty array when nothing
- * has been logged yet.
- */
-export async function readAuditLog(key) {
-  if (!key) return [];
-  return (await store.get(PREFIX + key)) || [];
+/** Most recent entries first, optionally filtered by actor. */
+export async function listAuditLog({ actor, limit = 200 } = {}) {
+  const entries = (await store.get(AUDIT_LOG_KEY)) || [];
+  const filtered = actor ? entries.filter((e) => e.actor === actor) : entries;
+  return filtered.slice(0, limit);
 }

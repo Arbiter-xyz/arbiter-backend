@@ -8,30 +8,22 @@ import { getHorizon } from './sponsor.js';
 import { config } from './config.js';
 import { stroopsToUsdc } from './pricing.js';
 import { getClient } from './reconcile.js';
-import { adminReadStore } from './store.js';
-import { lookupReferralCode } from './referrals.js';
-import { createPayerReferralLedger } from './payerReferrals.js';
+import { store } from './store.js';
+import { createAccount, unsuspendAccount } from './billing.js';
 
 const PLATFORM_FEE_BPS = 2000n; // mirrors contracts/oracle-escrow/src/lib.rs's PLATFORM_FEE_BPS
 const BPS_DENOM = 10_000n;
 
+// Page size for every paginated admin listing (listTransactions,
+// listAnchorPayouts, etc.) when the caller doesn't specify one.
 const DEFAULT_LIMIT = 50;
-// Caps parallel per-item reads in the anchor views, so a page can't fan out
-// into hundreds of simultaneous store reads.
-const MAX_CONCURRENCY = 10;
 
-/** Every list/summary read in this module goes through adminReadStore
- * (#92): the Redis read replica when REDIS_REPLICA_URL is set, the primary
- * otherwise, and the primary again whenever the replica fails. Nothing here
- * writes, so replica lag is the only cost — acceptable for an operator
- * dashboard, never for the settlement path, which keeps reading `store`.
- * `job:` mirrors jobs.js's PREFIX, read directly the same way
- * payerIndex.js's listPayerLoyaltyTiers() does. */
-const readStore = adminReadStore;
-const getJob = (id) => readStore.get('job:' + id);
+// Bound on concurrent per-item lookups in mapWithConcurrency — keeps a
+// paginated listing from firing e.g. 200 simultaneous anchor API calls.
+const MAX_CONCURRENCY = 5;
 
-const payerReferralLedger = createPayerReferralLedger({ store: readStore, lookupReferralCode });
-
+/** Maps `items` through `fn`, running at most `limit` calls concurrently.
+ * Preserves input order in the returned array. */
 async function mapWithConcurrency(items, limit, fn) {
   const results = new Array(items.length);
   let next = 0;
@@ -101,49 +93,47 @@ export async function listTransactions({ limit = DEFAULT_LIMIT, offset = 0 } = {
  * listTransactions(): the id list is sliced *before* any per-item work, so
  * a page of N workers only issues on-chain reads for those N. */
 export async function listWorkers({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
-  const ids = await getKnownWorkerIds(readStore);
-  return Promise.all(
-    ids.map(async (workerId) => {
-      const rep = await getReputation(workerId, readStore);
-      const isAddress = StrKey.isValidEd25519PublicKey(workerId);
-      const [stakeStroops, owedStroops] = isAddress
-        ? await Promise.all([getStakeOnChain(workerId).catch(() => 0n), getOwedOnChain(workerId).catch(() => 0n)])
-        : [0n, 0n];
-      return {
-        workerId,
-        totalAnswers: rep.total,
-        matched: rep.matched,
-        matchRatio: rep.total > 0 ? rep.matched / rep.total : null,
-        established: rep.total >= config.worker.minAnswersBeforeReputationGate,
-        stake: stroopsToUsdc(stakeStroops),
-        owed: stroopsToUsdc(owedStroops),
-      };
-    }),
-  );
+  const ids = await getKnownWorkerIds();
+  const page = ids.slice(offset, offset + limit);
+  return mapWithConcurrency(page, MAX_CONCURRENCY, async (workerId) => {
+    const rep = await getReputation(workerId);
+    const isAddress = StrKey.isValidEd25519PublicKey(workerId);
+    const [stakeStroops, owedStroops] = isAddress
+      ? await Promise.all([getStakeOnChain(workerId).catch(() => 0n), getOwedOnChain(workerId).catch(() => 0n)])
+      : [0n, 0n];
+    return {
+      workerId,
+      totalAnswers: rep.total,
+      matched: rep.matched,
+      matchRatio: rep.total > 0 ? rep.matched / rep.total : null,
+      established: rep.total >= config.worker.minAnswersBeforeReputationGate,
+      stake: stroopsToUsdc(stakeStroops),
+      owed: stroopsToUsdc(owedStroops),
+    };
+  });
 }
 
 /** Every payer address this backend has seen a verified on-chain payment
  * from, with the same spend/success aggregation the buyer dashboard shows
  * that payer about themselves (payerIndex.js's summarizePayerQuestions),
  * plus the loyalty tier that spend summary now qualifies them for. */
-export async function listPayers() {
-  const addresses = await getKnownPayerAddresses(readStore);
-  return Promise.all(
-    addresses.map(async (payerAddress) => {
-      const ids = await getPayerQuestionIds(payerAddress, readStore);
-      const jobs = await Promise.all(ids.map((id) => getJob(id)));
-      const summary = summarizePayerQuestions(ids, jobs);
-      const tier = evaluateLoyaltyTier(summary);
-      return {
-        payerAddress,
-        totalTracked: summary.totalTracked,
-        totalSpend: stroopsToUsdc(summary.totalSpendStroops),
-        settled: summary.settled,
-        successRate: summary.successRate,
-        loyaltyTier: tier?.tier ?? null,
-      };
-    }),
-  );
+export async function listPayers({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
+  const addresses = await getKnownPayerAddresses();
+  const page = addresses.slice(offset, offset + limit);
+  return mapWithConcurrency(page, MAX_CONCURRENCY, async (payerAddress) => {
+    const ids = await getPayerQuestionIds(payerAddress);
+    const jobs = await Promise.all(ids.map((id) => getJob(id)));
+    const summary = summarizePayerQuestions(ids, jobs);
+    const tier = evaluateLoyaltyTier(summary);
+    return {
+      payerAddress,
+      totalTracked: summary.totalTracked,
+      totalSpend: stroopsToUsdc(summary.totalSpendStroops),
+      settled: summary.settled,
+      successRate: summary.successRate,
+      loyaltyTier: tier?.name ?? null,
+    };
+  });
 }
 
 /** Admin-only provisioning for enterprise customers who can't use a credit
@@ -217,10 +207,11 @@ export async function getTreasury() {
  *
  * Deliberately a full-index aggregate: it must sum across every job to
  * report a total, so it can't be paginated. Its cost is bounded to
- * O(known jobs) *store* reads only — no chain/RPC calls — which is exactly
- * the kind of load the read replica exists to absorb. */
+ * O(known jobs) *store* reads only — getJob() reads local job metadata and
+ * makes no chain/RPC calls — so this stays cheap even at the 5,000-entry
+ * index cap and needs no concurrency cap or memoization. */
 export async function getFeeRevenue() {
-  const ids = await getKnownJobIds(readStore);
+  const ids = await getKnownJobIds();
   const jobs = await Promise.all(ids.map((id) => getJob(id)));
 
   let totalFeeStroops = 0n;
@@ -243,59 +234,34 @@ export async function getFeeRevenue() {
  * their own transaction history from the anchor). Paginated like
  * listTransactions(): slice before per-item work. */
 export async function listAnchorPayouts({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
-  const addresses = await getKnownAnchorAddresses(readStore);
+  const addresses = await getKnownAnchorAddresses();
   const page = addresses.slice(offset, offset + limit);
   const rows = await mapWithConcurrency(page, MAX_CONCURRENCY, async (address) => {
-    const txs = await getAnchorTransactions(address, readStore);
+    const txs = await getAnchorTransactions(address);
     return txs.filter((t) => t.kind === 'withdrawal').map((t) => ({ address, ...t }));
   });
-  return {
-    total: addresses.length,
-    payouts: rows.flat().sort((a, b) => b.reportedAt - a.reportedAt),
-  };
+  return rows.flat().sort((a, b) => b.reportedAt - a.reportedAt);
 }
 
 /** KYC & Tiers — self-reported SEP-12 customer status per address, same
  * caveat as listAnchorPayouts(). Paginated like listTransactions(): slice
  * before per-item work. */
 export async function listAnchorKyc({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
-  const addresses = await getKnownAnchorAddresses(readStore);
+  const addresses = await getKnownAnchorAddresses();
   const page = addresses.slice(offset, offset + limit);
   const rows = await mapWithConcurrency(page, MAX_CONCURRENCY, async (address) => {
-    const kyc = await getAnchorKyc(address, readStore);
+    const kyc = await getAnchorKyc(address);
     return kyc ? { address, ...kyc } : null;
   });
-  return { total: addresses.length, kyc: rows.filter(Boolean) };
+  return rows.filter(Boolean);
 }
 
-/** Payer-referral earnings per worker (#99): every worker who brought in at
- * least one paying payer, with their informational referral credit and the
- * payers attributed to them. Same composition as listPayers(): enumerate a
- * durable index, then one summary per entry. Bookkeeping only — nothing
- * here has been paid out. */
-export async function listReferralEarnings() {
-  const rows = await payerReferralLedger.listReferralEarnings();
-  return rows.map(({ worker, earnedStroops, referredPayers, referrals }) => ({
-    worker,
-    referredPayers,
-    earnedStroops: earnedStroops.toString(),
-    earned: stroopsToUsdc(earnedStroops),
-    referrals: referrals.map((r) => ({
-      payer: r.payer,
-      code: r.code,
-      questionId: r.questionId,
-      firstPayment: stroopsToUsdc(BigInt(r.firstPaymentStroops || 0)),
-      reward: stroopsToUsdc(BigInt(r.rewardStroops || 0)),
-      attributedAt: r.attributedAt,
-    })),
-  }));
-}
-
-/** Where admin reads are going right now (replica or primary) and the
- * replica's lag when it can report one, so the console can say "data as of
- * N seconds ago" instead of presenting a stale number as live. */
-export async function getReadReplicaStatus() {
-  return readStore.status();
+/** Operator override for the anomaly auto-suspend (issue #153): clears the
+ * suspension flag on an account so a wrongly-suspended key resumes
+ * resolving. Gated behind requireAdmin at the route layer, same as every
+ * other /admin/* handler. */
+export async function unsuspendKey(accountId) {
+  return unsuspendAccount(accountId);
 }
 
 /** Filters a slice of structured JSON log lines down to the ones correlated
@@ -338,7 +304,7 @@ export async function generatePostmortem(logs, { from, to, jobId } = {}) {
 
   try {
     const message = await client.messages.create({
-      model: config.anthropicModel,
+      model: config.anthropic.model,
       max_tokens: 2048,
       tools: [REPORT_POSTMORTEM_TOOL],
       tool_choice: { type: 'tool', name: REPORT_POSTMORTEM_TOOL.name },

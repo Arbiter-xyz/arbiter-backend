@@ -141,8 +141,8 @@ export function startHealthProbes({
   const timers = [
     every(intervalMs, () => probeStore(store)),
     every(intervalMs, () => probeChain(getLatestLedgerSequence)),
-    every(intervalMs, async () => onlineWorkers.set(getOnlineWorkerCount())),
-    everyNoOverlap(jobScanIntervalMs, () => probeJobs({ getKnownJobIds, getJob })),
+    every(intervalMs, async () => onlineWorkers.set(await getOnlineWorkerCount())),
+    every(jobScanIntervalMs, () => probeJobs({ getKnownJobIds, getJob })),
   ];
   return () => timers.forEach(clearInterval);
 }

@@ -5,6 +5,7 @@ import { config } from './config.js';
 import { hashApiKey } from './apiKeyAuth.js';
 import { logger } from './logger.js';
 import { recordPaymentReversal } from './paymentReversals.js';
+import { billingReservationCount, billingSettlementCount, fiatPoolBalanceStroops } from './metrics.js';
 
 /**
  * The non-crypto onramp: a fiat customer pays via Stripe and is issued an
@@ -77,7 +78,7 @@ function generateApiKey() {
   return `ak_live_${randomBytes(32).toString('hex')}`;
 }
 
-async function createAccount() {
+export async function createAccount() {
   const accountId = generateAccountId();
   const rawKey = generateApiKey();
   // Durable, no TTL — same as every other identity record in this codebase
@@ -86,6 +87,15 @@ async function createAccount() {
   await store.set(`apikey:${hashApiKey(rawKey)}`, { accountId });
   await store.set(`account-key:${accountId}`, hashApiKey(rawKey));
   return { accountId, rawKey };
+}
+
+/** Clears an account's suspended flag so its key resolves again via
+ * apiKeyAuth.js. Admin-only, gated at the route layer. */
+export async function unsuspendAccount(accountId) {
+  const account = await store.get(`account:${accountId}`);
+  if (!account) throw new Error(`no such account: ${accountId}`);
+  await store.set(`account:${accountId}`, { ...account, suspended: false });
+  return { accountId, suspended: false };
 }
 
 /**
@@ -201,15 +211,40 @@ export function getApplePayVerificationOrigin(url) {
   }
 }
 
-export async function createCheckoutSession(amountUsd, successUrl, cancelUrl) {
-  if (!Number.isFinite(amountUsd) || amountUsd < config.billing.minTopupUsd) {
-    throw new Error(`amountUsd must be a number >= ${config.billing.minTopupUsd}`);
-  }
-  const code = currency.trim().toLowerCase();
+/**
+ * Supported checkout currencies. Deliberately USD-only: usdPerUnit is a
+ * real, non-fabricated rate only for USD (1:1 by definition). Adding
+ * another currency here means wiring a real live FX source first — a
+ * hardcoded approximate rate is exactly the kind of silently-stale number
+ * that shouldn't exist in a path that charges real money. minorUnits is
+ * the processors' smallest-unit multiplier (100 = cents, matching Stripe's
+ * unit_amount convention).
+ */
+export const SUPPORTED_CURRENCIES = Object.freeze({
+  usd: Object.freeze({ minorUnits: 100, usdPerUnit: 1 }),
+});
+
+/** Validates and normalizes a currency code, throwing for anything not in
+ * SUPPORTED_CURRENCIES rather than silently defaulting — a bad currency is
+ * always a 400, never a silent USD substitution the caller didn't ask for. */
+export function resolveCurrency(currency) {
+  const code = String(currency).trim().toLowerCase();
   if (!/^[a-z]{3}$/.test(code) || !SUPPORTED_CURRENCIES[code]) {
     throw new Error(`unsupported currency: ${currency}`);
   }
   return { code, ...SUPPORTED_CURRENCIES[code] };
+}
+
+/**
+ * Top-level entry point: picks the first configured processor (stripe,
+ * then paypal, then coinbase — PROCESSORS' own declaration order) and
+ * delegates to it. Callers that need a specific processor use
+ * getProcessor(name) directly instead.
+ */
+export async function createCheckoutSession(amountUsd, successUrl, cancelUrl, currency = 'usd') {
+  const [processorName] = configuredProcessors();
+  if (!processorName) throw new Error('no payment processor is configured');
+  return getProcessor(processorName).createCheckoutSession(amountUsd, successUrl, cancelUrl, currency);
 }
 
 /**

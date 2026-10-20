@@ -262,9 +262,9 @@ async function createStore() {
   }
   try {
     const { default: Redis } = await import('ioredis');
-    const client = new Redis(config.redisUrl, { lazyConnect: false, maxRetriesPerRequest: 3 });
+    const client = new Redis(config.redisUrl, { lazyConnect: false });
     await client.ping();
-    logger.info('Connected to Redis — using RedisStore');
+    logger.info('Connected to Redis store');
     return new RedisStore(client);
   } catch (err) {
     logger.warn({ err }, 'Redis unavailable — falling back to in-memory store (single-instance only)');
@@ -273,42 +273,6 @@ async function createStore() {
 }
 
 export const store = await createStore();
-
-/**
- * Optional read replica for admin.js (#92). Unlike createStore(), an
- * unreachable replica at boot is not fatal and doesn't fall back to memory:
- * the client is kept (ioredis reconnects on its own) and every failed read
- * is served by the primary via replicaStore.js. enableOfflineQueue: false
- * makes a down replica fail fast rather than queue admin reads behind a
- * reconnect.
- */
-async function createReplica() {
-  if (!config.readReplica.url) return null;
-  // A replica of an in-memory primary would be a different, empty dataset.
-  if (!(store instanceof RedisStore)) {
-    logger.warn('REDIS_REPLICA_URL is set but the primary store is not Redis — admin reads will use the primary');
-    return null;
-  }
-  try {
-    const { default: Redis } = await import('ioredis');
-    const client = new Redis(config.readReplica.url, { maxRetriesPerRequest: 1, enableOfflineQueue: false });
-    client.on('error', () => {}); // surfaced per read by replicaStore.js; don't crash on reconnect noise
-    logger.info('Admin console reads will use the Redis read replica');
-    return new RedisStore(client);
-  } catch (err) {
-    logger.warn({ err }, 'failed to create Redis read replica client — admin reads will use the primary');
-    return null;
-  }
-}
-
-// Read-only view admin.js reads through. With no replica configured this
-// reads the primary, exactly like importing `store` directly.
-export const adminReadStore = createReplicaReadStore({
-  primary: store,
-  replica: await createReplica(),
-  logger,
-  retryAfterMs: config.readReplica.retryAfterMs,
-});
 
 /**
  * Federation reputation credentials (#86).
