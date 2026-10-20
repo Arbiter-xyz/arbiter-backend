@@ -90,7 +90,10 @@ export async function askMeteredBatch(payerAddress, items, { ownerAccountId } = 
       continue;
     }
     try {
-      const result = await askMetered(payerAddress, item.question, item.tier, item.category, { ownerAccountId });
+      const result = await askMetered(payerAddress, item.question, item.tier, item.category, {
+        ownerAccountId,
+        consensusRule: item.consensusRule,
+      });
       results.push({ index, ok: true, ...result });
     } catch (err) {
       results.push({ index, ok: false, error: err.message || 'charge failed' });

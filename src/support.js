@@ -22,16 +22,46 @@ const OPEN_TICKETS_KEY = 'support:open';
 
 const TICKET_STATUSES = ['open', 'answered', 'closed'];
 
+// Per-address ticket-creation rate limit (#280). A valid session token alone
+// must not allow unbounded ticket creation, which would let any authenticated
+// address spam/DoS the support queue. Sliding window: at most
+// TICKET_RATE_LIMIT_MAX tickets per TICKET_RATE_LIMIT_WINDOW_MS per address.
+const TICKET_RATE_LIMIT_MAX = 5;
+const TICKET_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
+
 // In-memory fallback store, mirroring the pattern used by the other index
 // modules when no durable backend is wired up. Kept module-local so tests
 // and single-process deployments work without extra configuration.
 const memory = {
   tickets: new Map(),
   open: new Set(),
+  // address -> array of creation timestamps (ms) within the rate window.
+  createTimestamps: new Map(),
 };
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+/**
+ * Enforces the per-address ticket-creation rate limit. Throws a 429 error
+ * when `address` has already created TICKET_RATE_LIMIT_MAX tickets within
+ * the sliding window; otherwise records the current attempt.
+ */
+function enforceCreateRateLimit(address) {
+  const now = Date.now();
+  const cutoff = now - TICKET_RATE_LIMIT_WINDOW_MS;
+  const recent = (memory.createTimestamps.get(address) || []).filter((t) => t > cutoff);
+
+  if (recent.length >= TICKET_RATE_LIMIT_MAX) {
+    memory.createTimestamps.set(address, recent);
+    const err = new Error('too many support tickets created; please try again later');
+    err.status = 429;
+    throw err;
+  }
+
+  recent.push(now);
+  memory.createTimestamps.set(address, recent);
 }
 
 async function persistTicket(ticket) {
@@ -68,6 +98,9 @@ export async function isQuestionLinkedToAddress(address, questionId) {
  *
  * `questionId` is optional; when provided it must be a real question this
  * address is associated with (payer history or worker answer history).
+ *
+ * Creation is rate limited per address (see enforceCreateRateLimit) so a
+ * valid session cannot be used to flood the support queue.
  */
 export async function createTicket(address, questionId, message, { sessionToken } = {}) {
   if (!address || typeof address !== 'string') {
@@ -87,6 +120,8 @@ export async function createTicket(address, questionId, message, { sessionToken 
     err.status = 401;
     throw err;
   }
+
+  enforceCreateRateLimit(address);
 
   if (questionId) {
     const linked = await isQuestionLinkedToAddress(address, questionId);

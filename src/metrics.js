@@ -206,10 +206,13 @@ export function recordJobScan(jobs, now = Date.now()) {
   for (const job of jobs) {
     if (!job || job.status === 'settled') continue;
     byStatus.set(job.status, (byStatus.get(job.status) || 0) + 1);
-    const createdAt = job.createdAt ?? job.updatedAt;
-    if (createdAt && (oldestCreatedAt === null || createdAt < oldestCreatedAt)) oldestCreatedAt = createdAt;
+    if (typeof job.createdAt === 'number' && (oldestCreatedAt === null || job.createdAt < oldestCreatedAt)) {
+      oldestCreatedAt = job.createdAt;
+    }
   }
+  // Reset every known status to 0 before rebuilding, so a status that drained
+  // since the last scan doesn't leave a stale non-zero series behind.
   jobsInflight.reset();
   for (const [status, count] of byStatus) jobsInflight.set({ status }, count);
-  oldestInflightJobAge.set(oldestCreatedAt === null ? 0 : Math.max(0, ms(now - oldestCreatedAt)));
+  oldestInflightJobAge.set(oldestCreatedAt === null ? 0 : ms(now - oldestCreatedAt));
 }

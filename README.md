@@ -185,3 +185,8 @@ Instead of polling `GE
 
 <!-- handsoff-issue-84 -->
 - #84: Multi-tenant white-label backend
+
+## Handsoff notes
+
+<!-- handsoff-issue-226 -->
+- #226: ALLOWED_ORIGINS=* silently disables checkout redirect validation — open redirect leaks a fresh raw API key

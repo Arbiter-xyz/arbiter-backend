@@ -40,6 +40,11 @@ const LOCK_PREFIX = 'auto-withdraw-lock:';
 const INDEX_KEY = 'auto-withdraw-workers';
 const LOCK_TTL_MS = 60_000;
 const MAX_TRACKED_WORKERS = 5_000;
+// The sweep used to check workers one at a time, so wall-clock time grew
+// linearly with INDEX_KEY (each worker costs one or two RPC simulations).
+// Run a bounded number of checks concurrently so a large index doesn't
+// stretch the sweep past its interval, while still capping in-flight RPCs.
+const SWEEP_CONCURRENCY = 8;
 
 export class AutoWithdrawError extends Error {
   constructor(message, status = 400) {
@@ -202,115 +207,62 @@ export async function checkAutoWithdraw(workerAddress) {
       return { status: 'below_threshold', owedStroops: owed.toString(), thresholdStroops: threshold.toString() };
     }
 
-    const ttlMs = config.autoWithdraw.pendingTtlMs;
-    const xdr = await buildWorkerWithdrawTx(workerAddress, owed, settings.beneficiaryAddress, Math.floor(ttlMs / 1000));
-    const now = Date.now();
+    const { xdr, expiresAt } = await buildWorkerWithdrawTx(workerAddress, owed, settings.beneficiaryAddress);
     const record = {
       xdr,
       amountStroops: owed.toString(),
-      beneficiaryAddress: settings.beneficiaryAddress,
-      createdAt: now,
-      expiresAt: now + ttlMs,
+      beneficiaryAddress: settings.beneficiaryAddress || null,
+      createdAt: Date.now(),
+      expiresAt,
     };
-    await store.set(PENDING_PREFIX + workerAddress, record, ttlMs);
+    await store.set(PENDING_PREFIX + workerAddress, record);
 
-    notifyWorker(workerAddress, {
-      title: 'Your Arbiter balance is ready to withdraw',
-      body: `Your earnings reached ${stroopsToUsdc(threshold)} USDC. Sign to withdraw ${stroopsToUsdc(owed)} USDC.`,
-      type: 'auto_withdraw_ready',
-      amountStroops: owed.toString(),
-    }).catch(() => {});
+    try {
+      await notifyWorker(workerAddress, {
+        type: 'auto_withdraw_ready',
+        amountStroops: owed.toString(),
+        amount: stroopsToUsdc(owed),
+        beneficiaryAddress: settings.beneficiaryAddress || null,
+        expiresAt,
+      });
+    } catch (err) {
+      logger.warn({ err, workerAddress }, 'auto-withdraw: failed to push ready notification');
+    }
 
-    logger.info({ workerAddress, amountStroops: owed.toString() }, 'auto-withdraw transaction prepared');
     return { status: 'prepared', pending: presentPending(record) };
   } finally {
     await store.delete(LOCK_PREFIX + workerAddress);
   }
 }
 
-/** Relays the worker-signed pending transaction through the fee-bump
- * relay. On a failed relay the pending transaction is dropped either way:
- * the usual causes (stale sequence number, expired time bound, Owed
- * changed) all mean it can never succeed as-is, and the next check
- * prepares a fresh one. */
-export async function submitAutoWithdraw(workerAddress, signedXdr) {
-  const pending = await store.get(PENDING_PREFIX + workerAddress);
-  if (!pending) {
-    throw new AutoWithdrawError('no pending auto-withdraw for this worker; it may have expired or already been submitted', 404);
-  }
-
-  let result;
-  try {
-    result = pending.beneficiaryAddress
-      ? await feeBumpWithdrawTo(signedXdr, workerAddress, pending.beneficiaryAddress, pending.amountStroops)
-      : await feeBumpWithdraw(signedXdr, workerAddress, pending.amountStroops);
-  } catch (err) {
-    await store.delete(PENDING_PREFIX + workerAddress);
-    throw new AutoWithdrawError(`auto-withdraw relay failed: ${err.message}. A fresh transaction will be prepared on the next check.`);
-  }
-
-  await store.delete(PENDING_PREFIX + workerAddress);
-  await recordWorkerWithdrawal(workerAddress, {
-    amountStroops: pending.amountStroops,
-    txHash: result.hash,
-    beneficiaryAddress: pending.beneficiaryAddress,
-    auto: true,
-  }).catch((err) => logger.error({ err, workerAddress }, 'failed to record auto-withdraw in earnings ledger'));
-
-  return { hash: result.hash, amountStroops: pending.amountStroops, amount: stroopsToUsdc(pending.amountStroops) };
-}
-
-/** Settlement hook: checks every credited worker who has auto-withdraw on.
- * Fire-and-forget from the caller's side; never throws. */
-export async function checkAutoWithdrawForWorkers(workerIds) {
-  for (const workerId of workerIds) {
-    if (!StrKey.isValidEd25519PublicKey(workerId)) continue;
-    try {
-      await checkAutoWithdraw(workerId);
-    } catch (err) {
-      logger.error({ err, workerId }, 'auto-withdraw check failed after settlement');
-    }
-  }
-}
-
-/** Backstop sweep over every opted-in worker. Sequential rather than a
- * Promise.all() fan-out: each check is one or two RPC simulations, and
- * there's no latency target here worth hammering the RPC for. */
+/**
+ * Periodic backstop: checks every opted-in worker. Runs with bounded
+ * concurrency (SWEEP_CONCURRENCY) so wall-clock time stays roughly flat as
+ * INDEX_KEY grows toward MAX_TRACKED_WORKERS instead of scaling linearly
+ * with the number of workers. Per-worker failures are logged and skipped so
+ * one bad worker can't abort the sweep.
+ */
 export async function sweepAutoWithdraw() {
   const workers = (await store.get(INDEX_KEY)) || [];
-  const summary = { checked: 0, prepared: 0, failed: 0 };
-  for (const workerAddress of workers) {
-    try {
-      const { status } = await checkAutoWithdraw(workerAddress);
-      summary.checked += 1;
-      if (status === 'prepared') summary.prepared += 1;
-    } catch (err) {
-      summary.failed += 1;
-      logger.error({ err, workerAddress }, 'auto-withdraw sweep check failed');
+  if (workers.length === 0) return { checked: 0, prepared: 0 };
+
+  let prepared = 0;
+  let next = 0;
+
+  async function runWorker() {
+    while (next < workers.length) {
+      const workerAddress = workers[next++];
+      try {
+        const result = await checkAutoWithdraw(workerAddress);
+        if (result.status === 'prepared') prepared += 1;
+      } catch (err) {
+        logger.warn({ err, workerAddress }, 'auto-withdraw: sweep check failed');
+      }
     }
   }
-  return summary;
-}
 
-let sweepHandle = null;
+  const lanes = Math.min(SWEEP_CONCURRENCY, workers.length);
+  await Promise.all(Array.from({ length: lanes }, () => runWorker()));
 
-export function startAutoWithdrawSweep() {
-  const intervalMs = config.autoWithdraw.sweepIntervalMs;
-  if (!intervalMs || sweepHandle || !config.contractId) return null;
-  sweepHandle = setInterval(() => {
-    sweepAutoWithdraw()
-      .then((summary) => {
-        if (summary.checked > 0) logger.info(summary, 'auto-withdraw sweep complete');
-      })
-      .catch((err) => logger.error({ err }, 'auto-withdraw sweep failed'));
-  }, intervalMs);
-  // Unlike a pending webhook retry, nothing is lost if the process exits
-  // between sweeps; the next boot just sweeps again.
-  sweepHandle.unref();
-  return sweepHandle;
-}
-
-export function stopAutoWithdrawSweep() {
-  if (sweepHandle) clearInterval(sweepHandle);
-  sweepHandle = null;
+  return { checked: workers.length, prepared };
 }
