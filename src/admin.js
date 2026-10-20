@@ -178,5 +178,3 @@ export async function getTreasury() {
 
 /** Sums the platform's PLATFORM_FEE_BPS cut across every settled+resolved
  * job this backend has recorded. A derived, historical figure (off
-
-/* … truncated 5271 chars — edit only what you need near the top … */

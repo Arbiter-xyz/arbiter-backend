@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test": "node --test test/*.js"
+    "lint": "eslint .",
+    "test": "node --test test/*.js",
+    "check": "node --check src/*.js"
   },
   "keywords": [],
   "author": "",
