@@ -168,3 +168,8 @@ Instead of polling `GE
 
 <!-- handsoff-issue-84 -->
 - #84: Multi-tenant white-label backend
+
+## Handsoff notes
+
+<!-- handsoff-issue-267 -->
+- #267: dispatch.js's committed file ends mid-function, missing 6 functions imported elsewhere
