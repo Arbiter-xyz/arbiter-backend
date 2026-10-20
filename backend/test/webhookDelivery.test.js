@@ -61,3 +61,38 @@ describe('backoffDelayMs jitter bounds', () => {
     }
   });
 });
+
+// Issue #338: isBlockedAddress unwraps IPv4-mapped IPv6 addresses
+// (::ffff:a.b.c.d) and must enforce the same blocked IPv4 subnets on the
+// unwrapped address, not only the plain IPv6 ranges. These tests pin that
+// behavior so the mapped-address path is covered for future audits.
+describe('isBlockedAddress IPv4-mapped IPv6 coverage', () => {
+  const { isBlockedAddress } = require('../src/webhooks');
+
+  it('blocks IPv4-mapped IPv6 forms of blocked IPv4 subnets', () => {
+    const blocked = [
+      '::ffff:127.0.0.1',
+      '::ffff:10.0.0.1',
+      '::ffff:192.168.1.1',
+      '::ffff:169.254.169.254',
+    ];
+    for (const addr of blocked) {
+      assert.strictEqual(
+        isBlockedAddress(addr),
+        true,
+        `expected ${addr} to be blocked via mapped-address unwrap`
+      );
+    }
+  });
+
+  it('allows IPv4-mapped IPv6 forms of public IPv4 addresses', () => {
+    const allowed = ['::ffff:8.8.8.8', '::ffff:1.1.1.1'];
+    for (const addr of allowed) {
+      assert.strictEqual(
+        isBlockedAddress(addr),
+        false,
+        `expected ${addr} to be allowed`
+      );
+    }
+  });
+});
