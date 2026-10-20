@@ -171,5 +171,5 @@ Instead of polling `GE
 
 ## Handsoff notes
 
-<!-- handsoff-issue-307 -->
-- #307: Review: support.js has no test file at all
+<!-- handsoff-issue-311 -->
+- #311: Review: workerAnalytics.js has no test file at all
