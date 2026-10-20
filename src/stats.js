@@ -21,6 +21,13 @@
  * don't hammer the Redis connection. The cache lives in store.js (shared
  * across instances, same shape as anchorClient.js's stellar.toml cache) and
  * degrades to the uncached read if the cache backend is briefly unreachable.
+ *
+ * Issue #87 adds experiment-scoped outcome counters keyed by
+ * `experiment:{experimentId}:{variant}:{outcome}` so A/B pricing variants can
+ * be compared (resolved vs. refunded, settlement price, time-to-reconcile)
+ * without re-deriving them from raw job records. These are only written when
+ * an experiment is active; with the experiment disabled no variant tagging
+ * happens at all.
  */
 import { store } from './store.js';
 
@@ -187,4 +194,88 @@ export async function getUsage(store, accountId, { days = 30, now = new Date() }
     total += count;
   }
   return { accountId, days, total, endpoints };
+}
+
+/**
+ * Experiment-scoped outcome counters (issue #87). Keyed by
+ * `experiment:{experimentId}:{variant}:{outcome}` so a per-variant breakdown
+ * can be read back with a single prefix scan. Outcomes are the settlement
+ * result (`resolved` / `refunded`) plus the aggregate settlement price and
+ * time-to-reconcile, which are summed so callers can derive averages.
+ */
+export function experimentKey(experimentId, variant, outcome) {
+  return `experiment:${experimentId}:${variant}:${outcome}`;
+}
+
+/**
+ * Records one settlement outcome against the variant that produced it. Only
+ * called when an experiment is active, so a disabled experiment adds no
+ * variant-tagging overhead. `settlementPrice` and `timeToReconcileMs` are
+ * summed under dedicated keys so the admin endpoint can report averages
+ * without re-deriving them from raw job records.
+ */
+export async function recordExperimentOutcome(
+  experimentId,
+  variant,
+  { outcome, settlementPrice, timeToReconcileMs } = {},
+) {
+  if (!experimentId || !variant || !outcome) return null;
+  await store.incr(experimentKey(experimentId, variant, outcome));
+  if (Number.isFinite(settlementPrice)) {
+    await store.incrBy(experimentKey(experimentId, variant, 'settlementPrice'), settlementPrice);
+  }
+  if (Number.isFinite(timeToReconcileMs)) {
+    await store.incrBy(experimentKey(experimentId, variant, 'timeToReconcileMs'), timeToReconcileMs);
+  }
+  return experimentKey(experimentId, variant, outcome);
+}
+
+/**
+ * Reads back the per-variant breakdown for one experiment. Returns
+ * `{ experimentId, variants: { [variant]: { resolved, refunded, settled,
+ * settlementPrice, avgSettlementPrice, timeToReconcileMs,
+ * avgTimeToReconcileMs } } }`. Averages are null until at least one outcome
+ * has been recorded, so we never publish a misleading 0 before any data
+ * exists.
+ */
+export async function getExperimentResults(experimentId) {
+  const variants = {};
+  if (!experimentId) return { experimentId, variants };
+  const prefix = `experiment:${experimentId}:`;
+  const keys = await store.listKeys(`${prefix}*`);
+  for (const key of keys) {
+    const rest = key.slice(prefix.length);
+    const sep = rest.lastIndexOf(':');
+    if (sep < 0) continue;
+    const variant = rest.slice(0, sep);
+    const outcome = rest.slice(sep + 1);
+    const value = Number(await store.get(key)) || 0;
+    if (!variants[variant]) {
+      variants[variant] = {
+        resolved: 0,
+        refunded: 0,
+        settled: 0,
+        settlementPrice: 0,
+        avgSettlementPrice: null,
+        timeToReconcileMs: 0,
+        avgTimeToReconcileMs: null,
+      };
+    }
+    const v = variants[variant];
+    if (outcome === 'resolved' || outcome === 'refunded') {
+      v[outcome] += value;
+      v.settled += value;
+    } else if (outcome === 'settlementPrice') {
+      v.settlementPrice += value;
+    } else if (outcome === 'timeToReconcileMs') {
+      v.timeToReconcileMs += value;
+    }
+  }
+  for (const v of Object.values(variants)) {
+    if (v.settled > 0) {
+      v.avgSettlementPrice = v.settlementPrice / v.settled;
+      v.avgTimeToReconcileMs = v.timeToReconcileMs / v.settled;
+    }
+  }
+  return { experimentId, variants };
 }
