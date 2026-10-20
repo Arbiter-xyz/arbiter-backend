@@ -37,8 +37,8 @@ async function indexAddress(address) {
   await store.set(ADDRESS_INDEX_KEY, [address, ...known].slice(0, MAX_TRACKED_ADDRESSES));
 }
 
-export async function getKnownAnchorAddresses() {
-  return (await store.get(ADDRESS_INDEX_KEY)) || [];
+export async function getKnownAnchorAddresses(readStore = store) {
+  return (await readStore.get(ADDRESS_INDEX_KEY)) || [];
 }
 
 export async function recordAnchorTransaction(address, { kind, status, amount, assetCode, anchorTransactionId }) {
@@ -59,8 +59,8 @@ export async function recordAnchorTransaction(address, { kind, status, amount, a
   await indexAddress(address);
 }
 
-export async function getAnchorTransactions(address) {
-  return (await store.get(TX_PREFIX + address)) || [];
+export async function getAnchorTransactions(address, readStore = store) {
+  return (await readStore.get(TX_PREFIX + address)) || [];
 }
 
 export async function recordAnchorKyc(address, { status, tier }) {
@@ -68,8 +68,8 @@ export async function recordAnchorKyc(address, { status, tier }) {
   await indexAddress(address);
 }
 
-export async function getAnchorKyc(address) {
-  return store.get(KYC_PREFIX + address);
+export async function getAnchorKyc(address, readStore = store) {
+  return readStore.get(KYC_PREFIX + address);
 }
 
 /**

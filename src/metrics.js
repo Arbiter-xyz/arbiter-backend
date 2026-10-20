@@ -230,6 +230,8 @@ export function recordJobScan(jobs, now = Date.now()) {
     byStatus.set(job.status, (byStatus.get(job.status) || 0) + 1);
     if (oldestCreatedAt === null || job.createdAt < oldestCreatedAt) oldestCreatedAt = job.createdAt;
   }
+  // Reset every known status to 0 before rebuilding, so a status that drained
+  // since the last scan doesn't leave a stale non-zero series behind.
   jobsInflight.reset();
   for (const [status, count] of byStatus) jobsInflight.set({ status }, count);
   oldestInflightJobAge.set(oldestCreatedAt === null ? 0 : ms(now - oldestCreatedAt));

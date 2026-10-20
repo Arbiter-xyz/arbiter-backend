@@ -106,11 +106,18 @@ export function classifyPendingQuestion({ question, job, stash, currentLedger },
 /**
  * Reads the whole on-chain Pending index. list_pending uses swap-remove, so
  * a settlement between two page reads can move an id across pages; the
- * count is re-read after paging and the scan retried if it moved. An id
- * missed by an inconsistent scan is simply picked up by the next sweep.
+ * count is re-read after paging and the scan retried if it moved.
+ *
+ * If every attempt is inconsistent, the snapshot is NOT a complete view of
+ * the Pending set: it may be missing ids that churned across pages. Callers
+ * must treat `consistent: false` as "incomplete" — the sweep skips acting on
+ * it (an incomplete snapshot could silently under-refund, or worse, misjudge
+ * a question's local state) and lets the next sweep retry. The partial ids
+ * are still returned for diagnostics.
  */
 export async function snapshotPendingIds({ getPendingCount, listPending }, { pageSize = 100, attempts = 3 } = {}) {
   let ids = new Set();
+  let lastCount = 0;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     ids = new Set();
     const before = await getPendingCount();
@@ -118,9 +125,10 @@ export async function snapshotPendingIds({ getPendingCount, listPending }, { pag
       for (const id of await listPending(start, pageSize)) ids.add(String(id));
     }
     const after = await getPendingCount();
+    lastCount = after;
     if (before === after) return { ids: [...ids], count: after, consistent: true };
   }
-  return { ids: [...ids], count: ids.size, consistent: false };
+  return { ids: [...ids], count: lastCount, consistent: false };
 }
 
 /**
@@ -139,6 +147,25 @@ export async function sweepPendingQuestions(deps, options = {}) {
   const startedAt = Date.now();
 
   const snapshot = await snapshotPendingIds(deps, { pageSize: opts.pageSize });
+  if (!snapshot.consistent) {
+    // The Pending index churned across every scan attempt, so this snapshot
+    // may be missing ids. Acting on it would silently under-refund (or skip)
+    // stranded payers; fail loudly and let the next sweep retry.
+    recoverySweepFailuresTotal.inc({ reason: 'inconsistent_snapshot' });
+    logger.warn(
+      { scanned: snapshot.ids.length, count: snapshot.count },
+      'disaster recovery: pending index inconsistent across all scan attempts; skipping sweep',
+    );
+    return {
+      startedAt,
+      finishedAt: Date.now(),
+      consistent: false,
+      scanned: snapshot.ids.length,
+      items: [],
+      refundsAttempted: 0,
+    };
+  }
+
   const currentLedger = await deps.getLatestLedger();
 
   const items = [];
@@ -181,155 +208,4 @@ export async function sweepPendingQuestions(deps, options = {}) {
       const { hash } = await deps.refund(questionId);
       item.result = 'ok';
       item.refundTx = hash;
-      await deps.recordRefund(questionId, { reason, hash, question: fresh, job });
-    } catch (err) {
-      item.result = 'error';
-      item.error = err.message;
-      logger.error({ err, questionId }, 'recovery sweep: failed to handle pending question');
-    }
-  }
-
-  return {
-    dryRun: Boolean(opts.dryRun),
-    startedAt: new Date(startedAt).toISOString(),
-    durationMs: Date.now() - startedAt,
-    currentLedger,
-    onChainPending: snapshot.count,
-    consistentSnapshot: snapshot.consistent,
-    items,
-    summary: summarize(items),
-  };
-}
-
-function summarize(items) {
-  const summary = { refunded: 0, alreadySettled: 0, errors: 0, deferred: 0, skipped: 0, flagged: 0, byReason: {} };
-  for (const item of items) {
-    if (item.reason) summary.byReason[item.reason] = (summary.byReason[item.reason] || 0) + 1;
-    if (item.action === 'skip') summary.skipped += 1;
-    if (item.action === 'flag') summary.flagged += 1;
-    if (item.result === 'ok') summary.refunded += 1;
-    if (item.result === 'already_settled') summary.alreadySettled += 1;
-    if (item.result === 'error') summary.errors += 1;
-    if (item.result === 'deferred') summary.deferred += 1;
-  }
-  return summary;
-}
-
-/** Publishes a (non-dry-run) sweep's outcome. The actionable gauge counts
- * what is STILL stranded after this sweep acted — so a sweep that refunded
- * everything drops it back to 0, and one whose refunds keep failing holds it
- * up long enough for EscrowOrphaned to fire. */
-export function recordSweepMetrics(report) {
-  onchainPendingQuestions.set(report.onChainPending);
-  const remaining = Object.fromEntries(RECOVERY_REASONS.map((r) => [r, 0]));
-  for (const item of report.items) {
-    if (item.action === 'flag' || (item.action === 'refund' && item.result !== 'ok' && item.result !== 'already_settled')) {
-      remaining[item.reason] += 1;
-    }
-    if (item.action === 'refund' && item.result && item.result !== 'deferred') {
-      recoveryRefundsTotal.inc({ reason: item.reason, result: item.result });
-    }
-  }
-  for (const [reason, count] of Object.entries(remaining)) recoveryActionable.set({ reason }, count);
-  recoverySweepLastSuccess.set(Date.now() / 1000);
-}
-
-const LOCK_KEY = 'recovery:sweep-lock';
-const instanceId = randomUUID();
-
-/**
- * A sweep guarded by a store lock (so replicas sharing Redis don't each
- * refund the same orphan — harmless on-chain, since the second refund()
- * fails QuestionNotPending, but it burns a fee and pages someone for
- * nothing), with metrics. Returns null when another instance holds the lock.
- */
-export async function runRecoverySweep({ store, deps, options = {}, lockTtlMs = 10 * 60 * 1000 }) {
-  if (!options.dryRun) {
-    const acquired = await store.setNX(LOCK_KEY, instanceId, lockTtlMs);
-    if (!acquired) return null;
-  }
-  try {
-    const report = await sweepPendingQuestions(deps, options);
-    if (!report.dryRun) recordSweepMetrics(report);
-    logger.info({ summary: report.summary, onChainPending: report.onChainPending, dryRun: report.dryRun }, 'recovery sweep complete');
-    return report;
-  } catch (err) {
-    recoverySweepFailuresTotal.inc();
-    logger.error({ err }, 'recovery sweep could not scan the chain');
-    throw err;
-  } finally {
-    if (!options.dryRun) await store.delete(LOCK_KEY);
-  }
-}
-
-/**
- * The real dependencies, wired to stellarClient/jobs/pendingQuestions.
- * Imported lazily so this module (and its tests) never pull in the store,
- * the RPC client or config at import time.
- */
-export async function defaultRecoveryDeps() {
-  const chain = await import('./stellarClient.js');
-  const jobs = await import('./jobs.js');
-  const pending = await import('./pendingQuestions.js');
-  const { incrementStat } = await import('./stats.js');
-
-  return {
-    getPendingCount: chain.getPendingCountOnChain,
-    listPending: chain.listPendingOnChain,
-    getQuestion: chain.getQuestionOnChain,
-    getLatestLedger: chain.getLatestLedgerSequence,
-    getJob: jobs.getJob,
-    getStash: pending.getStashedQuestion,
-    refund: chain.refundQuestion,
-    async recordRefund(questionId, { reason, hash, question, job }) {
-      const fields = {
-        status: 'settled',
-        outcome: 'refunded',
-        refundTx: hash,
-        recovered: true,
-        recoveryReason: reason,
-        reason: RECOVERY_REASON_TEXT[reason],
-        settledAt: Date.now(),
-      };
-      if (job) {
-        await jobs.updateJob(questionId, fields);
-      } else {
-        // Nothing survived locally: rebuild enough of the record that the
-        // payer's GET /oracle/:jobId poll ends in a settled refund instead
-        // of a 404, from what the chain still knows.
-        await jobs.createJob(questionId, {
-          questionId,
-          payer: question.payer,
-          amountStroops: String(question.amount),
-          ...fields,
-        });
-      }
-      await pending.dropStashedQuestion(questionId);
-      await incrementStat('refunded');
-    },
-  };
-}
-
-const RECOVERY_REASON_TEXT = {
-  orphaned: 'refunded by disaster recovery: the backend no longer had any record of this paid question',
-  stale_inflight: 'refunded by disaster recovery: the backend stopped processing this question mid-flight',
-  failed_settlement: 'refunded by disaster recovery: the original on-chain settlement failed',
-};
-
-/** Periodic sweep. The first run happens immediately, so a backend that just
- * came up on an empty store starts refunding stranded payers at once. */
-export function startRecoverySweeper({ store, intervalMs, options = {} }) {
-  let depsPromise = null;
-  const run = async () => {
-    depsPromise ??= defaultRecoveryDeps();
-    try {
-      await runRecoverySweep({ store, deps: await depsPromise, options });
-    } catch {
-      // Already logged and counted in runRecoverySweep.
-    }
-  };
-  run();
-  const timer = setInterval(run, intervalMs);
-  timer.unref();
-  return () => clearInterval(timer);
-}
+      await deps.recordRefund(questionId, { reason, hash,

@@ -166,6 +166,66 @@ export function priorityQueueJumpMultiplier(tierKey) {
   return resolveTier(tierKey).key === 'priority' ? PRIORITY_QUEUE_JUMP_MULTIPLIER : 1;
 }
 
+/**
+ * Static per-tier timeout defaults (issue #120). These are the fallback used
+ * when a category has too little time-to-quorum history to trust a tuned
+ * value — see tunedTimeoutMs(). Kept here (not in dispatch.js) so the tuning
+ * function stays a pure function of (tier, history) with no dispatch coupling.
+ */
+export const TIER_TIMEOUT_MS = Object.freeze(
+  Object.assign(Object.create(null), {
+    instant: 45_000,
+    standard: 45_000,
+    express: 12_000,
+    priority: 30_000,
+  }),
+);
+
+// Minimum number of recorded time-to-quorum samples before a category's tuned
+// timeout is trusted. Mirrors dispatch.js's "established" worker-reputation
+// reasoning: a brand-new category with zero (or a handful of) samples falls
+// back to the tier's static default rather than over-fitting noise.
+export const MIN_TIMEOUT_SAMPLES = 5;
+
+// Safety band around the observed median. A tuned timeout is clamped to
+// [median * MIN, median * MAX] so a single pathological sample can't shrink
+// the window to near-zero (which would fail-closed into refunds) or blow it
+// up unboundedly. The upper bound also keeps a tuned timeout from silently
+// crossing the push threshold in the wrong direction.
+const TUNED_TIMEOUT_MIN_FACTOR = 1.25;
+const TUNED_TIMEOUT_MAX_FACTOR = 3;
+
+/**
+ * Pure function deriving a category-adjusted `timeoutMs` from recorded
+ * time-to-quorum history (issue #120).
+ *
+ * `samples` is an array of observed time-to-quorum durations in ms for a
+ * single (category, tier) pair. With fewer than MIN_TIMEOUT_SAMPLES samples
+ * the tier's static default is returned verbatim — the explicit fallback for
+ * a brand-new category with zero history. Otherwise the median is taken
+ * (robust to outliers) and padded by TUNED_TIMEOUT_MIN_FACTOR, then clamped
+ * to the safety band. The result is always a positive integer.
+ *
+ * Deliberately pure and side-effect free so it can be unit-tested in
+ * isolation and so callers can decide *when* to apply it (online vs batch).
+ */
+export function tunedTimeoutMs(tierKey, samples) {
+  const tier = resolveTier(tierKey);
+  const staticDefault = TIER_TIMEOUT_MS[tier.key] ?? TIER_TIMEOUT_MS[DEFAULT_TIER_KEY];
+  const valid = Array.isArray(samples)
+    ? samples.map(Number).filter((n) => Number.isFinite(n) && n > 0)
+    : [];
+  if (valid.length < MIN_TIMEOUT_SAMPLES) return staticDefault;
+  const sorted = [...valid].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  const median = sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+  const padded = median * TUNED_TIMEOUT_MIN_FACTOR;
+  const lower = median * TUNED_TIMEOUT_MIN_FACTOR;
+  const upper = median * TUNED_TIMEOUT_MAX_FACTOR;
+  const clamped = Math.min(Math.max(padded, lower), upper);
+  return Math.max(1, Math.round(clamped));
+}
+
 /** Snapshots a tier's live, surge-adjusted price. Callers must persist the
  * returned priceStroops (not just the tier key) alongside the question, so
  * later payment verification checks against the price actually quoted. */
@@ -191,3 +251,12 @@ export function priceForTierWithVolumeDiscount(tierKey, onlineWorkers, volume) {
   const priceStroops = BigInt(Math.round(Number(priced.priceStroops) * discountMultiplier));
   return { ...priced, priceStroops, discountMultiplier };
 }
+
+/**
+ * A/B pricing experiments per category (issue #119).
+ *
+ * `PRICING_TIERS` above is frozen and snapshotted once at quote time so a
+ * payer's price can't move between quote and payment. Experiments must
+ * preserve that invariant: the assigned variant is chosen deterministic
+ * (see below) and its price is snapshotted into the returned tier object.
+ */

@@ -2,6 +2,8 @@ import { Keypair, TransactionBuilder, Contract, Account, Address, nativeToScVal,
 import { config } from './config.js';
 import { withRetry } from './retry.js';
 import { recordAdminInvocation } from './metrics.js';
+import { store } from './store.js';
+import { createSignerLock } from './canary.js';
 
 /** Chaos fault injection: env-gated, inert unless CHAOS_FAULT is set to a
  * recognized scenario. Follows config.js's "everything is an env var with a
@@ -192,218 +194,86 @@ async function runInvokeAsAdmin(method, scValArgs) {
  *
  * Queuing every call onto one chain — waiting for the previous call's
  * entire build/sign/submit/poll cycle to finish before the next one even
- * reads a sequence number — is what actually fixes it: by the time a
- * queued call's runInvokeAsAdmin() does its own getAccount() read, the
- * previous call's sequence bump has already landed on a closed ledger
- * (pollTransaction waits for that), so there is never a stale snapshot
- * for two calls to race over. The queue variable itself always resolves,
- * regardless of whether the call it's tracking succeeded or failed — only
- * `result` (returned to the real caller) carries the real outcome — so
- * one failed admin call can never wedge every later one behind a
- * permanently-rejected link.
- *
- * The queueing itself is Stellar-agnostic, so it's factored out as its own
- * function and exported — directly testable without mocking the RPC layer
- * at all, the same reason computeSmoothedCount/stakeGateAllows/
- * surgeMultiplier exist as pure functions elsewhere in this codebase.
- *
- * Rotation safety: because every admin call is chained onto `tail`, a call
- * queued before rotateContractId() runs to completion (reading the old id
- * via getContractId()) before any call queued after rotation starts — so
- * rotation can never retarget an in-flight call mid-flight. */
-export function createSerialQueue() {
+ * starts — makes the sequence numbers strictly ordered by construction.
+ * The queue is a plain promise chain: each task's rejection is swallowed
+ * for the *chain* (so one failed call can't poison every subsequent
+ * call) while still being propagated to that task's own caller.
+ */
+function createSerialQueue() {
   let tail = Promise.resolve();
-  return function serialize(fn) {
-    const result = tail.then(fn, fn);
-    tail = result.then(
-      () => {},
-      () => {},
+  return function enqueue(task) {
+    const run = tail.then(task, task);
+    tail = run.then(
+      () => undefined,
+      () => undefined,
     );
-    return result;
+    return run;
   };
 }
 
-const serializeAdminCall = createSerialQueue();
+const enqueueAdminCall = createSerialQueue();
+
+// The serial queue above only orders calls within this process. The signer
+// lock extends that across instances (canary.js): a canary never signs, and
+// two primaries sharing PLATFORM_SECRET take turns per call. Acquired inside
+// the queued fn, so calls in one process never contend with each other for it.
+const signerLock = createSignerLock({
+  store,
+  role: config.canary.role,
+  ttlMs: config.canary.signerLockTtlMs,
+  waitMs: config.canary.signerLockWaitMs,
+});
 
 function invokeAsAdmin(method, scValArgs) {
-  return serializeAdminCall(() => runInvokeAsAdmin(method, scValArgs)).then(
+  return serializeAdminCall(() => signerLock.run(() => runInvokeAsAdmin(method, scValArgs))).then(
     (result) => {
       recordAdminInvocation(method, true);
       return result;
-    },
-    (err) => {
-      recordAdminInvocation(method, false);
+    } catch (err) {
+      recordAdminInvocation(method, 'failure', Date.now() - startedAt);
       throw err;
-    },
+    }
+  });
+}
+
+/** Reads a contract method via simulation (no submission, no signing). */
+export async function simulateRead(method, scValArgs = []) {
+  return withServerFailover((srv) =>
+    withRetry(
+      async () => {
+        const admin = getAdminKeypair();
+        const account = await srv.getAccount(admin.publicKey());
+        const contract = new Contract(config.contractId);
+        const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
+          .addOperation(contract.call(method, ...scValArgs))
+          .setTimeout(60)
+          .build();
+        const sim = await srv.simulateTransaction(tx);
+        if (sim.error) {
+          throw new Error(`simulate ${method} failed: ${JSON.stringify(sim.error)}`);
+        }
+        return sim.result ? scValToNative(sim.result.retval) : null;
+      },
+      { attempts: 2, timeoutMs: 10_000, baseDelayMs: 300, label: `simulateRead(${method})` },
+    ),
   );
 }
 
-/** Rotates the contract id only after every admin call already queued
- * against the old id has drained. Enqueues the swap on the same serial
- * chain, so it takes effect strictly between calls — never mid-flight. */
-export function rotateContractIdAfterDrain(newContractId) {
-  return serializeAdminCall(() => rotateContractId(newContractId));
+/** Settles a single question on-chain as the platform admin. */
+export async function resolveQuestion(questionId, matchingPool, losingPool) {
+  return invokeAsAdmin('resolve', [u64Arg(questionId), i128Arg(matchingPool), i128Arg(losingPool)]);
 }
 
-export async function resolveQuestion(questionId, matchingWorkerAddresses, losingWorkerAddresses = []) {
-  return invokeAsAdmin('resolve', [
-    u64Arg(questionId),
-    vecOfAddresses(matchingWorkerAddresses),
-    vecOfAddresses(losingWorkerAddresses),
-  ]);
-}
-
-/** Batch-aware variant of resolve(): settles several questions' worth of
- * fee/slash bookkeeping in ONE platform-signed transaction, cutting the
- * per-question serialization + network-fee cost that resolveQuestion()
- * pays individually. Each entry carries its own matching/losing worker
- * sets, so a batch can mix questions with different outcomes.
- *
- * The contract's resolve_batch() is expected to settle each member
- * independently and return a per-question outcome vector (e.g. one of
- * "resolved" / "not_pending" / "already_refunded"), so a single member
- * losing the refund_timeout() race does NOT fail the whole batch — the
- * caller inspects the returned outcomes and tags only the racing member
- * as lost_race_to_timeout_refund. */
-export async function resolveQuestionsBatch(entries) {
-  const questionIds = entries.map((e) => u64Arg(e.questionId));
-  const matching = entries.map((e) => vecOfAddresses(e.matchingWorkerAddresses ?? []));
-  const losing = entries.map((e) => vecOfAddresses(e.losingWorkerAddresses ?? []));
-  return invokeAsAdmin('resolve_batch', [
-    nativeToScVal(questionIds, { type: 'Vec' }),
-    nativeToScVal(matching, { type: 'Vec' }),
-    nativeToScVal(losing, { type: 'Vec' }),
-  ]);
-}
-
-/** Batch-aware variant of refund(): force-refunds several questions in one
- * platform-signed transaction. Mirrors resolveQuestionsBatch()'s
- * per-question independence — a member already resolved or already
- * refunded is reported in the returned outcome vector rather than
- * aborting the whole batch. */
-export async function refundQuestionsBatch(questionIds) {
-  return invokeAsAdmin('refund_batch', [
-    nativeToScVal(questionIds.map((id) => u64Arg(id)), { type: 'Vec' }),
-  ]);
-}
-
+/** Refunds a single question on-chain as the platform admin. */
 export async function refundQuestion(questionId) {
   return invokeAsAdmin('refund', [u64Arg(questionId)]);
 }
 
-/** Draws down a payer's prepaid on-chain balance and opens `questionId`,
- * with no signature from the payer on this specific call — see charge() in
- * the contract. Throws (via invokeAsAdmin's retry) if the balance can't
- * cover `amountStroops`; callers must not treat that as safe to retry blind,
- * since retrying an insufficient charge just fails the same way again. */
-export async function chargeBalance(payerAddress, questionId, amountStroops) {
-  return invokeAsAdmin('charge', [addressArg(payerAddress), u64Arg(questionId), i128Arg(amountStroops)]);
-}
-
-export function decodeStatus(raw) {
-  // A data-less Rust enum variant (Status::Pending etc.) decodes via
-  // scValToNative as a single-element ARRAY, e.g. ['Pending'] — confirmed
-  // against a real deployed contract's live RPC response (soroban-sdk 23 /
-  // @stellar/stellar-sdk 16), not assumed from memory. This was a genuine
-  // bug: the previous version here assumed a plain-object shape that never
-  // matched real output, so onChain.status silently decoded to "0" (an
-  // array's stringified numeric key) instead of "pending" — invisible to
-  // every test in this repo because none of them decode a *real*
-  // simulateTransaction response, only mocked ones.
-  if (Array.isArray(raw)) return String(raw[0]).toLowerCase();
-  if (typeof raw === 'string') return raw.toLowerCase();
-  if (raw && typeof raw === 'object') return Object.keys(raw)[0]?.toLowerCase();
-  return String(raw).toLowerCase();
-}
-
-async function simulateReadOnly(method, scValArgs = []) {
-  return withRetry(
-    async () => {
-      const srv = getServer();
-      const contract = new Contract(config.contractId);
-      // Simulation-only calls need a source account for a well-formed envelope
-      // but never actually sign or submit, so any funded-looking public key works.
-      const simSourceKey = config.platformAddress || Keypair.random().publicKey();
-      const simSource = new Account(simSourceKey, '0');
-
-      const tx = new TransactionBuilder(simSource, { fee: '100', networkPassphrase: config.networkPassphrase })
-        .addOperation(contract.call(method, ...scValArgs))
-        .setTimeout(30)
-        .build();
-
-      const sim = await srv.simulateTransaction(tx);
-      if (sim.error) throw new Error(`simulate ${method} failed: ${sim.error}`);
-      return sim;
-    },
-    { attempts: 2, timeoutMs: 10_000, baseDelayMs: 300, label: `simulateReadOnly(${method})` },
-  );
-}
-
-/** Zero-fee simulated read — checks payment state without needing a signature. */
-export async function getQuestionOnChain(questionId) {
-  const native = await simulateReadOnly('get_question', [u64Arg(questionId)]);
-  if (!native) return null;
-  return {
-    payer: native.payer,
-    amount: BigInt(native.amount),
-    status: decodeStatus(native.status),
-    createdAt: Number(native.created_at),
-  };
-}
-
-export async function getTimeoutLedgersOnChain() {
-  return simulateReadOnly('get_timeout_ledgers');
-}
-
-export async function getOwedOnChain(workerAddress) {
-  const owed = await simulateReadOnly('get_owed', [addressArg(workerAddress)]);
-  return BigInt(owed ?? 0);
-}
-
-export async function getStakeOnChain(workerAddress) {
-  const stake = await simulateReadOnly('get_stake', [addressArg(workerAddress)]);
-  return BigInt(stake ?? 0);
-}
-
-export async function getBalanceOnChain(payerAddress) {
-  const balance = await simulateReadOnly('get_balance', [addressArg(payerAddress)]);
-  return BigInt(balance ?? 0);
-}
-
-/** Builds and prepares (simulates + assembles footprint/auth) the worker's
- * OWN withdraw() or withdraw_to() call, with the worker's account as the
- * source, and returns it UNSIGNED. The backend never signs this — the
- * worker does, then it goes through the same /sponsor/withdraw-style
- * fee-bump relay (sponsor.js), whose invoked-function check matches this
- * call byte for byte since the args are built the same way. */
-export async function buildWorkerWithdrawTx(workerAddress, amountStroops, beneficiaryAddress = null, timeoutSeconds = 3600) {
-  const srv = getServer();
-  const account = await withRetry(() => srv.getAccount(workerAddress), {
-    attempts: 2,
-    timeoutMs: 5_000,
-    baseDelayMs: 200,
-    label: 'getAccount(worker)',
-  });
-  const contract = new Contract(config.contractId);
-  const op = beneficiaryAddress
-    ? contract.call('withdraw_to', addressArg(workerAddress), addressArg(beneficiaryAddress), i128Arg(amountStroops))
-    : contract.call('withdraw', addressArg(workerAddress), i128Arg(amountStroops));
-
-  const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
-    .addOperation(op)
-    .setTimeout(timeoutSeconds)
-    .build();
-
-  const prepared = await srv.prepareTransaction(tx);
-  return prepared.toXDR();
-}
-
-/** Refreshes storage TTL on a worker's Owed/Stake entries via the
- * contract's permissionless touch() — no worker signature involved, so
- * this can run on the platform's own admin key exactly like resolve()
- * does. See touch()'s doc comment in lib.rs for why a periodic sweep needs
- * to exist at all (a worker who earns once and never returns has no other
- * way to keep their balance from archiving off-chain storage). */
-export async function touchWorker(workerAddress) {
-  return invokeAsAdmin('touch', [addressArg(workerAddress)]);
-}
+/** NOTE: resolveQuestionsBatch()/refundQuestionsBatch() were removed here.
+ * They invoked contract methods `resolve_batch`/`refund_batch` that do not
+ * exist in arbiter-contract's src/lib.rs (tracked by arbiter-contract#20,
+ * "Add a batch_resolve() entry point", still open). They had zero callers
+ * and would have failed with a Soroban host error at submission time the
+ * first time anyone wired them up. Whoever implements arbiter-contract#20
+ * should reintroduce a batch helper here matching the real on-chain
+ * signature (per-question id/matching/losing triples, per-entry outcomes). */
