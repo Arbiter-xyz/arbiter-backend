@@ -168,3 +168,8 @@ Instead of polling `GE
 
 <!-- handsoff-issue-84 -->
 - #84: Multi-tenant white-label backend
+
+## Handsoff notes
+
+<!-- handsoff-issue-314 -->
+- #314: Review: healthProbes.js has no test file at all
