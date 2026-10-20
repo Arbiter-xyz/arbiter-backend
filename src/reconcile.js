@@ -131,8 +131,35 @@ export function clusterVote(submissions) {
   };
 }
 
+/**
+ * Guards the on-chain credit path: every worker id the reconciliation step
+ * claims matched must correspond to a real submission for this question.
+ * A model (or a prompt-injected model) naming an id that never answered
+ * would otherwise be resolve()'d and credited real money for a quorum it
+ * never participated in. We treat any unknown id as a hard error rather
+ * than silently filtering it out — an unknown id means the reconciliation
+ * step itself is untrustworthy, and the fee/slash split computed from a
+ * filtered worker count would be wrong anyway. Throws so the caller aborts
+ * settlement (fail closed) instead of crediting anyone.
+ */
+export function assertMatchingWorkerIdsAreReal(matchingWorkerIds, submissions, questionId) {
+  const realWorkerIds = new Set(submissions.map((s) => s.workerId));
+  const unknown = (matchingWorkerIds || []).filter((id) => !realWorkerIds.has(id));
+  if (unknown.length > 0) {
+    logger.error(
+      { questionId, unknownWorkerIds: unknown, realWorkerIds: [...realWorkerIds] },
+      'reconciliation named worker ids with no matching submission; aborting settlement',
+    );
+    throw new Error(
+      `reconciliation returned unknown worker id(s) not in submissions: ${unknown.join(', ')}`,
+    );
+  }
+  return matchingWorkerIds;
+}
+
 async function reconcileWithClaude(question, submissions, rule = null) {
   const { consensus, confidence, matchingWorkerIds, llm } = await llmProvider.reportConsensus(question, submissions, rule);
+  assertMatchingWorkerIdsAreReal(matchingWorkerIds, submissions, question?.id);
   return { consensus, confidence, matchingWorkerIds, method: 'claude', llm };
 }
 
