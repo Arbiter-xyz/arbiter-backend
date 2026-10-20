@@ -188,5 +188,5 @@ Instead of polling `GE
 
 ## Handsoff notes
 
-<!-- handsoff-issue-290 -->
-- #290: Review: stellarClient.js's failover re-runs an already-retried function per URL
+<!-- handsoff-issue-241 -->
+- #241: All three billing processors call an undefined resolveCurrency()/SUPPORTED_CURRENCIES

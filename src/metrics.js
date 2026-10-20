@@ -108,6 +108,28 @@ export const probeErrorsTotal = new client.Counter({
   registers: [registry],
 });
 
+// --- Billing (billing.js) --------------------------------------------------
+
+export const billingReservationCount = new client.Counter({
+  name: 'arbiter_billing_reservations_total',
+  help: 'Credit reservations made by reserveCredit(), by result (ok, insufficient, error).',
+  labelNames: ['result'],
+  registers: [registry],
+});
+
+export const billingSettlementCount = new client.Counter({
+  name: 'arbiter_billing_settlements_total',
+  help: 'Credit settlements made by settleCredit(), by result (ok, error).',
+  labelNames: ['result'],
+  registers: [registry],
+});
+
+export const fiatPoolBalanceStroops = new client.Gauge({
+  name: 'arbiter_fiat_pool_balance_stroops',
+  help: 'Current fiat pool balance in stroops, as last observed by the billing path.',
+  registers: [registry],
+});
+
 // --- Disaster recovery (disasterRecovery.js) -------------------------------
 
 export const onchainPendingQuestions = new client.Gauge({
@@ -206,9 +228,7 @@ export function recordJobScan(jobs, now = Date.now()) {
   for (const job of jobs) {
     if (!job || job.status === 'settled') continue;
     byStatus.set(job.status, (byStatus.get(job.status) || 0) + 1);
-    if (typeof job.createdAt === 'number' && (oldestCreatedAt === null || job.createdAt < oldestCreatedAt)) {
-      oldestCreatedAt = job.createdAt;
-    }
+    if (oldestCreatedAt === null || job.createdAt < oldestCreatedAt) oldestCreatedAt = job.createdAt;
   }
   // Reset every known status to 0 before rebuilding, so a status that drained
   // since the last scan doesn't leave a stale non-zero series behind.
