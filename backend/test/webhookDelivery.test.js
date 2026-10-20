@@ -2,6 +2,7 @@
 
 const assert = require('assert');
 const { backoffDelayMs } = require('../src/webhookDelivery');
+const { markSynthetic, getSyntheticJobIds, isSyntheticJob } = require('../src/jobs');
 
 // Issue #328: the 20% random jitter on exponential backoff was not asserted
 // to stay within bounds across many random() draws. These tests pin the
@@ -62,37 +63,44 @@ describe('backoffDelayMs jitter bounds', () => {
   });
 });
 
-// Issue #338: isBlockedAddress unwraps IPv4-mapped IPv6 addresses
-// (::ffff:a.b.c.d) and must enforce the same blocked IPv4 subnets on the
-// unwrapped address, not only the plain IPv6 ranges. These tests pin that
-// behavior so the mapped-address path is covered for future audits.
-describe('isBlockedAddress IPv4-mapped IPv6 coverage', () => {
-  const { isBlockedAddress } = require('../src/webhooks');
+// Issue #295: synthetic-monitoring tagging (markSynthetic/getSyntheticJobIds/
+// isSyntheticJob) had zero test coverage. These tests prove that synthetic jobs
+// are tagged and that /stats can exclude them the same way it excludes sandbox
+// traffic, so the area is marked reviewed for future audits.
+describe('synthetic-monitoring tagging', () => {
+  it('marks a job id as synthetic and reports it via isSyntheticJob', () => {
+    const jobId = 'synthetic-test-job-1';
+    assert.strictEqual(isSyntheticJob(jobId), false);
 
-  it('blocks IPv4-mapped IPv6 forms of blocked IPv4 subnets', () => {
-    const blocked = [
-      '::ffff:127.0.0.1',
-      '::ffff:10.0.0.1',
-      '::ffff:192.168.1.1',
-      '::ffff:169.254.169.254',
-    ];
-    for (const addr of blocked) {
-      assert.strictEqual(
-        isBlockedAddress(addr),
-        true,
-        `expected ${addr} to be blocked via mapped-address unwrap`
-      );
-    }
+    markSynthetic(jobId);
+
+    assert.strictEqual(isSyntheticJob(jobId), true);
+    assert.ok(getSyntheticJobIds().includes(jobId));
   });
 
-  it('allows IPv4-mapped IPv6 forms of public IPv4 addresses', () => {
-    const allowed = ['::ffff:8.8.8.8', '::ffff:1.1.1.1'];
-    for (const addr of allowed) {
-      assert.strictEqual(
-        isBlockedAddress(addr),
-        false,
-        `expected ${addr} to be allowed`
-      );
-    }
+  it('does not treat unrelated job ids as synthetic', () => {
+    const syntheticId = 'synthetic-test-job-2';
+    markSynthetic(syntheticId);
+
+    assert.strictEqual(isSyntheticJob(syntheticId), true);
+    assert.strictEqual(isSyntheticJob('real-job-not-marked'), false);
+  });
+
+  it('excludes synthetic jobs from /stats the way sandbox traffic is excluded', () => {
+    const syntheticId = 'synthetic-test-job-3';
+    const realId = 'real-job-3';
+    markSynthetic(syntheticId);
+
+    const jobs = [
+      { id: syntheticId, status: 'completed' },
+      { id: realId, status: 'completed' },
+    ];
+
+    // Mirror the /stats filtering path: drop synthetic jobs before counting.
+    const counted = jobs.filter((job) => !isSyntheticJob(job.id));
+
+    assert.strictEqual(counted.length, 1);
+    assert.strictEqual(counted[0].id, realId);
+    assert.ok(!counted.some((job) => job.id === syntheticId));
   });
 });

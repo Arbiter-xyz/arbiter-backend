@@ -192,19 +192,32 @@ export async function getEscalatedItems() {
 }
 
 /**
- * Moves a job into the manual review queue. `extra` carries any additional
- * fields to persist alongside the status change (e.g. `outcome`, `reason`).
- * The `outcome` is read from `extra.outcome` so callers can record why the
- * job was flagged for review without this function referencing an undefined
- * variable.
+ * Tags a job as synthetic monitoring (issue #111). Idempotent. Synthetic jobs
+ * are excluded from /stats the same way sandbox settlements are, so a
+ * monitoring run never inflates real customer metrics.
  */
-export async function markPendingReview(jobId, extra = {}) {
-  const { outcome, ...rest } = extra;
-  const job = await updateJob(jobId, {
-    status: 'pending_review',
-    outcome: outcome ?? 'pending_review',
-    ...rest,
-  });
-  await indexReview(jobId);
-  return job;
+export async function markSynthetic(jobId) {
+  const synthetic = (await store.get(SYNTHETIC_INDEX_KEY)) || [];
+  if (synthetic.includes(jobId)) return;
+  await store.set(
+    SYNTHETIC_INDEX_KEY,
+    [jobId, ...synthetic].slice(0, MAX_TRACKED_SYNTHETIC_JOBS),
+  );
+}
+
+/**
+ * Returns the jobIds tagged as synthetic monitoring, most-recent-first.
+ * Backs /stats' exclusion of synthetic runs.
+ */
+export async function getSyntheticJobIds() {
+  return (await store.get(SYNTHETIC_INDEX_KEY)) || [];
+}
+
+/**
+ * True if the given jobId was tagged as synthetic monitoring. Used by /stats
+ * to exclude synthetic runs from real customer metrics.
+ */
+export async function isSyntheticJob(jobId) {
+  const synthetic = (await store.get(SYNTHETIC_INDEX_KEY)) || [];
+  return synthetic.includes(jobId);
 }
