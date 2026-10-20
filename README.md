@@ -171,8 +171,5 @@ Instead of polling `GE
 
 ## Handsoff notes
 
-<!-- handsoff-issue-314 -->
-- #314: Review: healthProbes.js has no test file at all
-
-<!-- handsoff-issue-315 -->
-- #315: Review: oracle.js's cancelJob authorization branch for API-key jobs is untested
+<!-- handsoff-issue-307 -->
+- #307: Review: support.js has no test file at all
