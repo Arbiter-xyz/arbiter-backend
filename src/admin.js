@@ -1,5 +1,5 @@
 import { StrKey } from '@stellar/stellar-sdk';
-import { getKnownJobIds, getJob } from './jobs.js';
+import { getKnownJobIds } from './jobs.js';
 import { getKnownWorkerIds, getReputation } from './dispatch.js';
 import { getKnownPayerAddresses, getPayerQuestionIds, summarizePayerQuestions, evaluateLoyaltyTier } from './payerIndex.js';
 import { getKnownAnchorAddresses, getAnchorTransactions, getAnchorKyc } from './anchorRecords.js';
@@ -8,9 +8,42 @@ import { getHorizon } from './sponsor.js';
 import { config } from './config.js';
 import { stroopsToUsdc } from './pricing.js';
 import { getClient } from './reconcile.js';
+import { adminReadStore } from './store.js';
+import { lookupReferralCode } from './referrals.js';
+import { createPayerReferralLedger } from './payerReferrals.js';
 
 const PLATFORM_FEE_BPS = 2000n; // mirrors contracts/oracle-escrow/src/lib.rs's PLATFORM_FEE_BPS
 const BPS_DENOM = 10_000n;
+
+const DEFAULT_LIMIT = 50;
+// Caps parallel per-item reads in the anchor views, so a page can't fan out
+// into hundreds of simultaneous store reads.
+const MAX_CONCURRENCY = 10;
+
+/** Every list/summary read in this module goes through adminReadStore
+ * (#92): the Redis read replica when REDIS_REPLICA_URL is set, the primary
+ * otherwise, and the primary again whenever the replica fails. Nothing here
+ * writes, so replica lag is the only cost — acceptable for an operator
+ * dashboard, never for the settlement path, which keeps reading `store`.
+ * `job:` mirrors jobs.js's PREFIX, read directly the same way
+ * payerIndex.js's listPayerLoyaltyTiers() does. */
+const readStore = adminReadStore;
+const getJob = (id) => readStore.get('job:' + id);
+
+const payerReferralLedger = createPayerReferralLedger({ store: readStore, lookupReferralCode });
+
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
 
 /** Tool-forced Claude call, structurally modeled on reconcile.js's
  * REPORT_CONSENSUS_TOOL / reconcileWithClaude() pattern: a single tool whose
@@ -51,7 +84,7 @@ export const REPORT_POSTMORTEM_TOOL = {
  * regardless of payer/worker — the admin analogue of the payer-scoped
  * /payers/:address/questions and worker-scoped leaderboard views. */
 export async function listTransactions({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
-  const ids = await getKnownJobIds();
+  const ids = await getKnownJobIds(readStore);
   const page = ids.slice(offset, offset + limit);
   const jobs = await Promise.all(page.map((id) => getJob(id)));
   return {
@@ -68,10 +101,10 @@ export async function listTransactions({ limit = DEFAULT_LIMIT, offset = 0 } = {
  * listTransactions(): the id list is sliced *before* any per-item work, so
  * a page of N workers only issues on-chain reads for those N. */
 export async function listWorkers({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
-  const ids = await getKnownWorkerIds();
+  const ids = await getKnownWorkerIds(readStore);
   return Promise.all(
     ids.map(async (workerId) => {
-      const rep = await getReputation(workerId);
+      const rep = await getReputation(workerId, readStore);
       const isAddress = StrKey.isValidEd25519PublicKey(workerId);
       const [stakeStroops, owedStroops] = isAddress
         ? await Promise.all([getStakeOnChain(workerId).catch(() => 0n), getOwedOnChain(workerId).catch(() => 0n)])
@@ -94,10 +127,10 @@ export async function listWorkers({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
  * that payer about themselves (payerIndex.js's summarizePayerQuestions),
  * plus the loyalty tier that spend summary now qualifies them for. */
 export async function listPayers() {
-  const addresses = await getKnownPayerAddresses();
+  const addresses = await getKnownPayerAddresses(readStore);
   return Promise.all(
     addresses.map(async (payerAddress) => {
-      const ids = await getPayerQuestionIds(payerAddress);
+      const ids = await getPayerQuestionIds(payerAddress, readStore);
       const jobs = await Promise.all(ids.map((id) => getJob(id)));
       const summary = summarizePayerQuestions(ids, jobs);
       const tier = evaluateLoyaltyTier(summary);
@@ -107,7 +140,7 @@ export async function listPayers() {
         totalSpend: stroopsToUsdc(summary.totalSpendStroops),
         settled: summary.settled,
         successRate: summary.successRate,
-        loyaltyTier: tier?.name ?? null,
+        loyaltyTier: tier?.tier ?? null,
       };
     }),
   );
@@ -177,4 +210,156 @@ export async function getTreasury() {
 }
 
 /** Sums the platform's PLATFORM_FEE_BPS cut across every settled+resolved
- * job this backend has recorded. A derived, historical figure (off
+ * job this backend has recorded. A derived, historical figure (off-chain
+ * bookkeeping over this backend's own job records) — the live treasury
+ * balance above is the on-chain-verifiable ground truth; this is "how much
+ * of that did settlement fees, specifically, account for."
+ *
+ * Deliberately a full-index aggregate: it must sum across every job to
+ * report a total, so it can't be paginated. Its cost is bounded to
+ * O(known jobs) *store* reads only — no chain/RPC calls — which is exactly
+ * the kind of load the read replica exists to absorb. */
+export async function getFeeRevenue() {
+  const ids = await getKnownJobIds(readStore);
+  const jobs = await Promise.all(ids.map((id) => getJob(id)));
+
+  let totalFeeStroops = 0n;
+  let resolvedCount = 0;
+  for (const job of jobs) {
+    if (job?.status !== 'settled' || job.outcome !== 'resolved') continue;
+    totalFeeStroops += (BigInt(job.amountStroops || 0) * PLATFORM_FEE_BPS) / BPS_DENOM;
+    resolvedCount += 1;
+  }
+
+  return {
+    resolvedCount,
+    totalFeeRevenue: stroopsToUsdc(totalFeeStroops),
+  };
+}
+
+/** Bank Payouts — self-reported SEP-24 withdrawal history (see
+ * anchorRecords.js for why this is a self-reported cache, not a live
+ * per-address anchor query: SEP-10 means only the account holder can pull
+ * their own transaction history from the anchor). Paginated like
+ * listTransactions(): slice before per-item work. */
+export async function listAnchorPayouts({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
+  const addresses = await getKnownAnchorAddresses(readStore);
+  const page = addresses.slice(offset, offset + limit);
+  const rows = await mapWithConcurrency(page, MAX_CONCURRENCY, async (address) => {
+    const txs = await getAnchorTransactions(address, readStore);
+    return txs.filter((t) => t.kind === 'withdrawal').map((t) => ({ address, ...t }));
+  });
+  return {
+    total: addresses.length,
+    payouts: rows.flat().sort((a, b) => b.reportedAt - a.reportedAt),
+  };
+}
+
+/** KYC & Tiers — self-reported SEP-12 customer status per address, same
+ * caveat as listAnchorPayouts(). Paginated like listTransactions(): slice
+ * before per-item work. */
+export async function listAnchorKyc({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
+  const addresses = await getKnownAnchorAddresses(readStore);
+  const page = addresses.slice(offset, offset + limit);
+  const rows = await mapWithConcurrency(page, MAX_CONCURRENCY, async (address) => {
+    const kyc = await getAnchorKyc(address, readStore);
+    return kyc ? { address, ...kyc } : null;
+  });
+  return { total: addresses.length, kyc: rows.filter(Boolean) };
+}
+
+/** Payer-referral earnings per worker (#99): every worker who brought in at
+ * least one paying payer, with their informational referral credit and the
+ * payers attributed to them. Same composition as listPayers(): enumerate a
+ * durable index, then one summary per entry. Bookkeeping only — nothing
+ * here has been paid out. */
+export async function listReferralEarnings() {
+  const rows = await payerReferralLedger.listReferralEarnings();
+  return rows.map(({ worker, earnedStroops, referredPayers, referrals }) => ({
+    worker,
+    referredPayers,
+    earnedStroops: earnedStroops.toString(),
+    earned: stroopsToUsdc(earnedStroops),
+    referrals: referrals.map((r) => ({
+      payer: r.payer,
+      code: r.code,
+      questionId: r.questionId,
+      firstPayment: stroopsToUsdc(BigInt(r.firstPaymentStroops || 0)),
+      reward: stroopsToUsdc(BigInt(r.rewardStroops || 0)),
+      attributedAt: r.attributedAt,
+    })),
+  }));
+}
+
+/** Where admin reads are going right now (replica or primary) and the
+ * replica's lag when it can report one, so the console can say "data as of
+ * N seconds ago" instead of presenting a stale number as live. */
+export async function getReadReplicaStatus() {
+  return readStore.status();
+}
+
+/** Filters a slice of structured JSON log lines down to the ones correlated
+ * with an incident: an optional [from, to] time range and/or a job id. Log
+ * lines are the pino JSON objects logger.js already emits (request-id /
+ * job-id correlation fields), so this is a pure, unit-testable filter over
+ * a canned sample — no log-aggregator integration required. */
+export function selectIncidentLogs(logs, { from, to, jobId } = {}) {
+  return (logs || []).filter((line) => {
+    if (jobId && line.jobId !== jobId && line['job-id'] !== jobId) return false;
+    const at = line.time ?? line.timestamp;
+    if (from && at != null && at < from) return false;
+    if (to && at != null && at > to) return false;
+    return true;
+  });
+}
+
+/** Turns a set of correlated log lines into a structured postmortem draft
+ * via a tool-forced Claude call, modeled on reconcile.js's
+ * reconcileWithClaude(). Never throws: on any Claude failure (missing key,
+ * timeout, malformed tool output) it resolves to a clearly-marked fallback
+ * so an operator always gets a response and the process never sees an
+ * unhandled rejection. */
+export async function generatePostmortem(logs, { from, to, jobId } = {}) {
+  const selected = selectIncidentLogs(logs, { from, to, jobId });
+  const fallback = {
+    generated: false,
+    error: 'draft generation failed, see raw logs',
+    logCount: selected.length,
+    logs: selected,
+  };
+
+  let client;
+  try {
+    client = getClient();
+  } catch {
+    return fallback;
+  }
+  if (!client) return fallback;
+
+  try {
+    const message = await client.messages.create({
+      model: config.anthropicModel,
+      max_tokens: 2048,
+      tools: [REPORT_POSTMORTEM_TOOL],
+      tool_choice: { type: 'tool', name: REPORT_POSTMORTEM_TOOL.name },
+      messages: [
+        {
+          role: 'user',
+          content:
+            'Draft an incident postmortem from these correlated log lines. ' +
+            'Use only what the logs support; mark anything uncertain as unknown.\n\n' +
+            JSON.stringify(selected),
+        },
+      ],
+    });
+
+    const toolUse = (message.content || []).find(
+      (block) => block.type === 'tool_use' && block.name === REPORT_POSTMORTEM_TOOL.name,
+    );
+    if (!toolUse?.input) return fallback;
+
+    return { generated: true, logCount: selected.length, ...toolUse.input };
+  } catch {
+    return fallback;
+  }
+}

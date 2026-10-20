@@ -2,6 +2,8 @@ import { Keypair, TransactionBuilder, Contract, Account, Address, nativeToScVal,
 import { config } from './config.js';
 import { withRetry } from './retry.js';
 import { recordAdminInvocation } from './metrics.js';
+import { store } from './store.js';
+import { createSignerLock } from './canary.js';
 
 /** Chaos fault injection: env-gated, inert unless CHAOS_FAULT is set to a
  * recognized scenario. Follows config.js's "everything is an env var with a
@@ -211,16 +213,21 @@ function createSerialQueue() {
 
 const enqueueAdminCall = createSerialQueue();
 
-/** Public entry point for every admin-signed contract call. Serializes
- * through enqueueAdminCall so concurrent callers never collide on the
- * platform account's sequence number, and records a metric per invocation
- * for observability. */
-export async function invokeAsAdmin(method, scValArgs = []) {
-  return enqueueAdminCall(async () => {
-    const startedAt = Date.now();
-    try {
-      const result = await runInvokeAsAdmin(method, scValArgs);
-      recordAdminInvocation(method, 'success', Date.now() - startedAt);
+// The serial queue above only orders calls within this process. The signer
+// lock extends that across instances (canary.js): a canary never signs, and
+// two primaries sharing PLATFORM_SECRET take turns per call. Acquired inside
+// the queued fn, so calls in one process never contend with each other for it.
+const signerLock = createSignerLock({
+  store,
+  role: config.canary.role,
+  ttlMs: config.canary.signerLockTtlMs,
+  waitMs: config.canary.signerLockWaitMs,
+});
+
+function invokeAsAdmin(method, scValArgs) {
+  return serializeAdminCall(() => signerLock.run(() => runInvokeAsAdmin(method, scValArgs))).then(
+    (result) => {
+      recordAdminInvocation(method, true);
       return result;
     } catch (err) {
       recordAdminInvocation(method, 'failure', Date.now() - startedAt);

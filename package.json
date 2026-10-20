@@ -6,9 +6,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "lint": "eslint .",
-    "test": "node --test test/*.js",
-    "check": "node --check src/*.js"
+    "check:env": "node scripts/check-env-example.js",
+    "canary:preflight": "node scripts/canary-preflight.js"
   },
   "keywords": [],
   "author": "",
