@@ -2,6 +2,7 @@ import './helpers/billing-test-env.js';
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import Stripe from 'stripe';
 import {
   reserveCredit,
@@ -10,6 +11,8 @@ import {
   handleStripeWebhook,
   isAllowedRedirectUrl,
   createCheckoutSession,
+  configuredProcessors,
+  getProcessor,
 } from '../src/billing.js';
 import { config } from '../src/config.js';
 
@@ -53,6 +56,37 @@ function checkoutCompletedEvent({ eventId, accountId, amountCents }) {
     type: 'checkout.session.completed',
     data: { object: { id: 'cs_test_1', amount_total: amountCents, metadata: { accountId } } },
   };
+}
+
+// Swaps global fetch for the duration of fn so processor HTTP calls can be
+// asserted without hitting the network. Restores the original afterwards.
+async function withMockFetch(handler, fn) {
+  const original = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    return handler(String(url), init);
+  };
+  try {
+    return await fn(calls);
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+function jsonResponse(body, status = 200) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+    text: async () => JSON.stringify(body),
+  };
+}
+
+// Coinbase Commerce signs webhooks with HMAC-SHA256 over the raw body using
+// the shared secret, hex-encoded in the X-CC-Webhook-Signature header.
+function coinbaseSignature(payload, secret) {
+  return crypto.createHmac('sha256', secret).update(payload).digest('hex');
 }
 
 test('reserveCredit refuses to reserve more than the balance covers', async () => {
@@ -153,3 +187,137 @@ test('createCheckoutSession rejects a disallowed cancelUrl too, not just success
       /allowed origin/,
     );
   }));
+
+// --- PayPal processor coverage -------------------------------------------
+// Mirrors the Stripe coverage above: checkout-session creation against a
+// mocked PayPal orders endpoint, plus webhook signature verification
+// against both a valid and a tampered payload.
+
+test('PayPal createCheckoutSession posts an order and returns the approve link as checkoutUrl', async () => {
+  const paypal = getProcessor('paypal');
+  assert.ok(paypal, 'paypal processor should be registered');
+
+  await withMockFetch(
+    () => jsonResponse({ id: 'ORDER-1', links: [{ rel: 'approve', href: 'https://www.paypal.com/checkoutnow?token=ORDER-1' }] }),
+    async (calls) => {
+      const session = await paypal.createCheckoutSession({
+        amountCents: 2000,
+        successUrl: 'https://app.arbiter.example/success',
+        cancelUrl: 'https://app.arbiter.example/cancel',
+      });
+
+      assert.equal(calls.length, 1);
+      assert.match(calls[0].url, /\/v2\/checkout\/orders/);
+      const body = JSON.parse(calls[0].init.body);
+      assert.equal(body.intent, 'CAPTURE');
+      assert.equal(body.purchase_units[0].amount.value, '20.00');
+      assert.equal(body.purchase_units[0].amount.currency_code, 'USD');
+      assert.equal(session.checkoutUrl, 'https://www.paypal.com/checkoutnow?token=ORDER-1');
+    },
+  );
+});
+
+test('PayPal verifyAndParseWebhook accepts a genuinely valid signature', async () => {
+  const paypal = getProcessor('paypal');
+  const payload = JSON.stringify({ id: uniqueId('evt'), event_type: 'CHECKOUT.ORDER.APPROVED' });
+  const headers = {
+    'paypal-transmission-id': 'tx-1',
+    'paypal-transmission-time': '2024-01-01T00:00:00Z',
+    'paypal-cert-url': 'https://api.paypal.com/cert.pem',
+    'paypal-auth-algo': 'SHA256withRSA',
+    'paypal-transmission-sig': 'valid-sig',
+  };
+
+  await withMockFetch(
+    () => jsonResponse({ verification_status: 'SUCCESS' }),
+    async (calls) => {
+      const event = await paypal.verifyAndParseWebhook(payload, headers);
+      assert.equal(calls.length, 1);
+      assert.match(calls[0].url, /verify-webhook-signature/);
+      assert.equal(event.event_type, 'CHECKOUT.ORDER.APPROVED');
+    },
+  );
+});
+
+test('PayPal verifyAndParseWebhook rejects a tampered payload (verification_status FAILURE)', async () => {
+  const paypal = getProcessor('paypal');
+  const payload = JSON.stringify({ id: uniqueId('evt'), event_type: 'CHECKOUT.ORDER.APPROVED' });
+  const headers = {
+    'paypal-transmission-id': 'tx-1',
+    'paypal-transmission-time': '2024-01-01T00:00:00Z',
+    'paypal-cert-url': 'https://api.paypal.com/cert.pem',
+    'paypal-auth-algo': 'SHA256withRSA',
+    'paypal-transmission-sig': 'tampered-sig',
+  };
+
+  await withMockFetch(
+    () => jsonResponse({ verification_status: 'FAILURE' }),
+    async () => {
+      await assert.rejects(() => paypal.verifyAndParseWebhook(payload, headers));
+    },
+  );
+});
+
+// --- Coinbase Commerce processor coverage --------------------------------
+
+test('Coinbase createCheckoutSession posts a charge and returns hosted_url as checkoutUrl', async () => {
+  const coinbase = getProcessor('coinbase');
+  assert.ok(coinbase, 'coinbase processor should be registered');
+
+  await withMockFetch(
+    () => jsonResponse({ data: { id: 'charge-1', hosted_url: 'https://commerce.coinbase.com/charges/charge-1' } }),
+    async (calls) => {
+      const session = await coinbase.createCheckoutSession({
+        amountCents: 2000,
+        successUrl: 'https://app.arbiter.example/success',
+        cancelUrl: 'https://app.arbiter.example/cancel',
+      });
+
+      assert.equal(calls.length, 1);
+      assert.match(calls[0].url, /\/charges/);
+      const body = JSON.parse(calls[0].init.body);
+      assert.equal(body.pricing_type, 'fixed_price');
+      assert.equal(body.local_price.amount, '20.00');
+      assert.equal(body.local_price.currency, 'USD');
+      assert.equal(session.checkoutUrl, 'https://commerce.coinbase.com/charges/charge-1');
+    },
+  );
+});
+
+test('Coinbase verifyAndParseWebhook accepts a genuinely valid HMAC signature', async () => {
+  const coinbase = getProcessor('coinbase');
+  const payload = JSON.stringify({ id: uniqueId('evt'), type: 'charge:confirmed' });
+  const secret = config.billing.coinbaseWebhookSecret;
+  const headers = { 'x-cc-webhook-signature': coinbaseSignature(payload, secret) };
+
+  const event = await coinbase.verifyAndParseWebhook(payload, headers);
+  assert.equal(event.type, 'charge:confirmed');
+});
+
+test('Coinbase verifyAndParseWebhook rejects a tampered payload (HMAC mismatch)', async () => {
+  const coinbase = getProcessor('coinbase');
+  const payload = JSON.stringify({ id: uniqueId('evt'), type: 'charge:confirmed' });
+  const secret = config.billing.coinbaseWebhookSecret;
+  // Sign the original body, then deliver a mutated one — the HMAC no longer matches.
+  const headers = { 'x-cc-webhook-signature': coinbaseSignature(payload, secret) };
+  const tampered = JSON.stringify({ id: uniqueId('evt'), type: 'charge:confirmed', amount: '999999' });
+
+  await assert.rejects(() => coinbase.verifyAndParseWebhook(tampered, headers));
+});
+
+// --- Processor dispatch --------------------------------------------------
+
+test('configuredProcessors lists every processor with credentials configured', () => {
+  const processors = configuredProcessors();
+  assert.ok(Array.isArray(processors));
+  assert.ok(processors.includes('stripe'));
+  assert.ok(processors.includes('paypal'));
+  assert.ok(processors.includes('coinbase'));
+});
+
+test('getProcessor selects the requested processor when more than one is configured', () => {
+  assert.equal(getProcessor('stripe')?.name, 'stripe');
+  assert.equal(getProcessor('paypal')?.name, 'paypal');
+  assert.equal(getProcessor('coinbase')?.name, 'coinbase');
+  assert.equal(getProcessor('does-not-exist'), null);
+});

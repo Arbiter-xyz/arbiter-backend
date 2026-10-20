@@ -100,7 +100,17 @@ app.post('/oracle/:jobId/cancel', async (req, res) => {
 });
 
 async function start() {
-  await rebuildSubscribedWorkers();
+  // Rebuild the push subscribed-workers index from durable store records so
+  // push-eligible worker indexes are populated immediately after a restart,
+  // rather than staying empty until each worker resubscribes. Guarded so a
+  // push store/DB failure (or push being disabled/unconfigured) cannot crash
+  // boot; the index will simply repopulate as workers resubscribe.
+  try {
+    await rebuildSubscribedWorkers();
+  } catch (err) {
+    console.error('Failed to rebuild subscribed workers on startup:', err);
+  }
+
   const port = process.env.PORT || 3000;
   const server = http.createServer(app);
   attachWebSocketServer(server);

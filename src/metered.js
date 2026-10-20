@@ -25,7 +25,7 @@ import { config } from './config.js';
  * route wiring) — without that, anyone could charge against a balance they
  * don't own just by naming someone else's address.
  */
-export async function askMetered(payerAddress, questionText, tierKey, category, { ownerAccountId } = {}) {
+export async function askMetered(payerAddress, questionText, tierKey, category, { ownerAccountId, consensusRule } = {}) {
   const questionId = (await nextQuestionId()).toString();
   const priced = priceForTier(tierKey, getSmoothedOnlineWorkerCount());
 
@@ -47,7 +47,7 @@ export async function askMetered(payerAddress, questionText, tierKey, category, 
   await stashQuestion(questionId, pending);
 
   const tier = { ...priced };
-  const { jobId } = await startFulfillment(questionId, pending, tier, payerAddress, { ownerAccountId });
+  const { jobId, cancellableUntil } = await startFulfillment(questionId, pending, tier, payerAddress, { ownerAccountId });
 
   return {
     jobId,
@@ -90,7 +90,10 @@ export async function askMeteredBatch(payerAddress, items, { ownerAccountId } = 
       continue;
     }
     try {
-      const result = await askMetered(payerAddress, item.question, item.tier, item.category, { ownerAccountId });
+      const result = await askMetered(payerAddress, item.question, item.tier, item.category, {
+        ownerAccountId,
+        consensusRule: item.consensusRule,
+      });
       results.push({ index, ok: true, ...result });
     } catch (err) {
       results.push({ index, ok: false, error: err.message || 'charge failed' });
