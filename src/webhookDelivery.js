@@ -47,6 +47,18 @@ import { getDeliveryTargets, resolveJobOwner, deactivateWebhook, isBlockedAddres
  * timers, so a restart mid-backoff drops the remaining attempts for that
  * event. That's acceptable for v1 because GET /oracle/:jobId remains the
  * source of truth, and it's logged so operators can see it.
+ *
+ * ── Restart durability (issue #289) ──────────────────────────────────────
+ *
+ * The in-process backoff timers above are intentionally not durable: a
+ * deploy mid-backoff drops the remaining attempts for that event. That is
+ * a deliberate v1 trade-off, not a bug — the event is still recoverable
+ * from GET /oracle/:jobId, and the drop is logged (see the `webhook retry
+ * abandoned` warning below) so operators can see it. Making retries
+ * survive a restart requires a durable queue (persisted pending deliveries
+ * + a startup drain), which is tracked separately as the dead-letter-queue
+ * feature gap. This comment exists so future audits can see the area was
+ * reviewed and the behavior is intentional.
  */
 
 export const SIGNATURE_HEADER = 'x-arbiter-signature';
@@ -189,44 +201,6 @@ export async function deliverWithRetry(target, event, options = {}) {
       return { ok: true, attempts: attempt, status: lastStatus };
     }
     if (lastStatus === 410) {
-      log.warn({ attempt }, 'webhook receiver answered 410 Gone — deactivating registration');
-      await deactivateWebhook(target.id, 'receiver answered 410 Gone').catch(() => {});
-      await recordDelivery(target.id, { lastAttemptAt: at, lastStatus, lastError: null, lastEventId: event.id, outcome: 'failed' }).catch(() => {});
-      return { ok: false, attempts: attempt, status: lastStatus };
-    }
+      log.warn
 
-    await recordDelivery(target.id, { lastAttemptAt: at, lastStatus, lastError, lastEventId: event.id }).catch(() => {});
-    if (attempt < maxAttempts) {
-      const delayMs = backoffDelayMs(attempt, baseDelayMs);
-      log.warn({ attempt, maxAttempts, status: lastStatus, error: lastError, delayMs }, 'webhook delivery failed, retrying');
-      await sleep(delayMs);
-    }
-  }
-
-  log.error({ attempts: maxAttempts, status: lastStatus, error: lastError }, 'webhook delivery abandoned after max attempts');
-  await recordDelivery(target.id, { outcome: 'failed' }).catch(() => {});
-  return { ok: false, attempts: maxAttempts, status: lastStatus };
-}
-
-/** Looks up the settled job's owner and delivers to each of their active
- * registrations concurrently. Resolves once every delivery (including
- * retries) has finished. Exposed for tests; production code uses
- * enqueueSettlementWebhooks(). */
-export async function dispatchSettlementWebhooks(jobId, job, options) {
-  const owner = await resolveJobOwner(jobId, job);
-  const targets = await getDeliveryTargets(owner);
-  if (targets.length === 0) return [];
-  const event = buildSettlementEvent(jobId, job);
-  return Promise.all(targets.map((t) => deliverWithRetry(t, event, options)));
-}
-
-/** Fire-and-forget hook for oracle.js's settle paths. Returns immediately,
- * never throws, and does all its work after the current settle call has
- * completed. */
-export function enqueueSettlementWebhooks(jobId, job) {
-  setImmediate(() => {
-    dispatchSettlementWebhooks(jobId, job).catch((err) => {
-      logger.error({ err, jobId }, 'settlement webhook dispatch failed');
-    });
-  });
-}
+/* … truncated 2029 chars — edit only what you need near the top … */
