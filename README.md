@@ -168,3 +168,8 @@ Instead of polling `GE
 
 <!-- handsoff-issue-84 -->
 - #84: Multi-tenant white-label backend
+
+## Handsoff notes
+
+<!-- handsoff-issue-311 -->
+- #311: Review: workerAnalytics.js has no test file at all
