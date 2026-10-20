@@ -62,8 +62,32 @@ function rateLimitedSponsorOnboard(req, res, next) {
 
 app.use('/api/sponsor/onboard', rateLimitedSponsorOnboard);
 
+// POST /billing/checkout — start a fiat/API-key top-up. Delegates to the real
+// Stripe integration (stripeProcessor.createCheckoutSession) so the route
+// returns a live checkout URL instead of throwing a ReferenceError.
+app.post('/billing/checkout', async (req, res) => {
+  try {
+    const { stripeProcessor } = require('./billing');
+    const { checkoutUrl } = await stripeProcessor.createCheckoutSession(req.body || {});
+    res.json({ checkoutUrl });
+  } catch (err) {
+    console.error('POST /billing/checkout failed:', err);
+    res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
 async function start() {
-  await rebuildSubscribedWorkers();
+  // Rebuild the push subscribed-workers index from durable store records so
+  // push-eligible worker indexes are populated immediately after a restart,
+  // rather than staying empty until each worker resubscribes. Guarded so a
+  // push store/DB failure (or push being disabled/unconfigured) cannot crash
+  // boot; the index will simply repopulate as workers resubscribe.
+  try {
+    await rebuildSubscribedWorkers();
+  } catch (err) {
+    console.error('Failed to rebuild subscribed workers on startup:', err);
+  }
+
   const port = process.env.PORT || 3000;
   const server = http.createServer(app);
   attachWebSocketServer(server);
