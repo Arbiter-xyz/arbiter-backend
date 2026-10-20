@@ -173,3 +173,6 @@ Instead of polling `GE
 
 <!-- handsoff-issue-314 -->
 - #314: Review: healthProbes.js has no test file at all
+
+<!-- handsoff-issue-315 -->
+- #315: Review: oracle.js's cancelJob authorization branch for API-key jobs is untested
