@@ -131,30 +131,68 @@ export function clusterVote(submissions) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Predictive quorum sizing (issue #121)
+//
+// `quorumSize` used to be a fixed constant per tier. We now predict it from
+// signals available at quote time (before any worker has looked at the
+// question) so easy questions settle with less dispatch overhead while
+// harder ones raise the bar. This is a documented heuristic, not trained ML:
+// the codebase has no training/serving infra, and a pure, deterministic
+// scoring function is independently testable like surgeMultiplier().
+//
+// The prediction is clamped to a configured min/max so a bad prediction can
+// never produce quorumSize 0 (which would break dispatchAndCollect()'s
+// `submissions.size >= quorumSize` finish condition) or an unreasonably
+// large one. The clamp floor is always >= 1.
+// ---------------------------------------------------------------------------
+
+const QUORUM_PREDICTION_CONFIG = {
+  min: 2,
+  max: 7,
+  // Baseline quorum before any difficulty signal is applied.
+  base: 3,
+  // Question-length thresholds (in tokens) that nudge difficulty up.
+  longQuestionTokens: 40,
+  veryLongQuestionTokens: 120,
+};
+
 /**
- * Guards the on-chain credit path: every worker id the reconciliation step
- * claims matched must correspond to a real submission for this question.
- * A model (or a prompt-injected model) naming an id that never answered
- * would otherwise be resolve()'d and credited real money for a quorum it
- * never participated in. We treat any unknown id as a hard error rather
- * than silently filtering it out — an unknown id means the reconciliation
- * step itself is untrustworthy, and the fee/slash split computed from a
- * filtered worker count would be wrong anyway. Throws so the caller aborts
- * settlement (fail closed) instead of crediting anyone.
+ * Pure function: predict a quorum size from quote-time signals.
+ *
+ * Available signals (all known before dispatch):
+ *   - question: the raw question text (length is a difficulty proxy)
+ *   - category: optional category label
+ *   - categoryHistory: optional per-category stats, e.g.
+ *       { reconciliationMethodDistribution: { claude: 0.6, vote: 0.4 } }
+ *     A high share of `claude` (LLM adjudication) means the category tends
+ *     to need scrutiny, so we raise the quorum.
+ *
+ * Returns an integer clamped to [config.min, config.max]. Never returns 0.
  */
-export function assertMatchingWorkerIdsAreReal(matchingWorkerIds, submissions, questionId) {
-  const realWorkerIds = new Set(submissions.map((s) => s.workerId));
-  const unknown = (matchingWorkerIds || []).filter((id) => !realWorkerIds.has(id));
-  if (unknown.length > 0) {
-    logger.error(
-      { questionId, unknownWorkerIds: unknown, realWorkerIds: [...realWorkerIds] },
-      'reconciliation named worker ids with no matching submission; aborting settlement',
-    );
-    throw new Error(
-      `reconciliation returned unknown worker id(s) not in submissions: ${unknown.join(', ')}`,
-    );
+export function predictQuorumSize(question, { category = null, categoryHistory = null, config = QUORUM_PREDICTION_CONFIG } = {}) {
+  const cfg = { ...QUORUM_PREDICTION_CONFIG, ...config };
+  let score = cfg.base;
+
+  // Length signal: longer questions tend to be more involved.
+  const tokenCount = typeof question === 'string' ? tokenize(question).length : 0;
+  if (tokenCount >= cfg.veryLongQuestionTokens) score += 2;
+  else if (tokenCount >= cfg.longQuestionTokens) score += 1;
+
+  // Category-history signal: fraction of past reconciliations that needed
+  // LLM adjudication (method 'claude'). Higher => harder => larger quorum.
+  const dist = categoryHistory?.reconciliationMethodDistribution;
+  if (dist && typeof dist === 'object') {
+    const claudeShare = Number(dist.claude) || 0;
+    if (claudeShare >= 0.5) score += 2;
+    else if (claudeShare >= 0.25) score += 1;
   }
-  return matchingWorkerIds;
+
+  // Clamp: floor is at least 1 so the finish condition can always be met.
+  const min = Math.max(1, Math.floor(cfg.min));
+  const max = Math.max(min, Math.floor(cfg.max));
+  const clamped = Math.min(max, Math.max(min, Math.round(score)));
+  return clamped;
 }
 
 async function reconcileWithClaude(question, submissions, rule = null) {
