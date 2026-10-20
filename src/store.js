@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { config } from './config.js';
 import { logger } from './logger.js';
+import { createReplicaReadStore } from './replicaStore.js';
 
 /**
  * Storage abstraction so pendingQuestions/jobs/reputation/rate-limits

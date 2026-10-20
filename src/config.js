@@ -153,6 +153,10 @@ function trustProxy() {
 
 export const config = Object.freeze({
   port: num(process.env.PORT, 4000),
+  // Serve the built frontend (app/dist) from this process (#94). false when
+  // a CDN/Vercel deployment fronts the app build, so static-asset traffic
+  // never enters this process's middleware chain.
+  serveStaticApp: process.env.SERVE_STATIC_APP !== 'false',
   horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
   // Primary RPC URL — kept for backward compatibility with existing callers
   // that read config.sorobanRpcUrl directly. Equals sorobanRpcUrls[0].
@@ -195,6 +199,121 @@ export const config = Object.freeze({
   // with — this copy is for display/UX only (e.g. "auto-refund available
   // after ledger N"); the contract enforces its own stored value regardless.
   timeoutLedgers: num(process.env.TIMEOUT_LEDGERS, 100),
+
+  // Shared state (store.js). Unset = in-memory store: single instance, and
+  // every piece of state is lost on restart.
+  redisUrl: process.env.REDIS_URL || '',
+
+  // Read replica for the admin console's heavy read endpoints (#92, see
+  // replicaStore.js). Only admin.js's list/summary reads use it; dispatch,
+  // jobs and settlement always read the primary, since they need
+  // read-your-writes. Unset = admin reads hit the primary, as before.
+  readReplica: Object.freeze({
+    url: process.env.REDIS_REPLICA_URL || '',
+    // After a replica read fails, admin reads go to the primary for this
+    // long before the replica is tried again.
+    retryAfterMs: num(process.env.REDIS_REPLICA_RETRY_AFTER_MS, 30_000),
+  }),
+
+  // Input bounds on free-form request fields. Category and worker ids are
+  // written into indexes and broadcast to workers, so an unbounded value
+  // inflates storage and every SSE payload.
+  maxQuestionLength: num(process.env.MAX_QUESTION_LENGTH, 2000),
+  maxAnswerLength: num(process.env.MAX_ANSWER_LENGTH, 2000),
+  maxCategoryLength: num(process.env.MAX_CATEGORY_LENGTH, 64),
+  maxWorkerIdLength: num(process.env.MAX_WORKER_ID_LENGTH, 128),
+
+  // Profanity/spam screening of worker answers (answerFilter.js).
+  answerFilter: Object.freeze({
+    enabled: process.env.ANSWER_FILTER_ENABLED === 'true',
+    blocklist: Object.freeze(
+      (process.env.ANSWER_FILTER_BLOCKLIST || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
+    maxLinks: num(process.env.ANSWER_FILTER_MAX_LINKS, 2),
+    maxRepeatedChars: num(process.env.ANSWER_FILTER_MAX_REPEATED_CHARS, 10),
+    maxUppercaseRatio: num(process.env.ANSWER_FILTER_MAX_UPPERCASE_RATIO, 0.8),
+    // Short answers ("YES", "NO", "USA") are legitimately all-caps, so the
+    // uppercase-ratio check only applies once an answer has this many letters.
+    minLettersForCaseCheck: num(process.env.ANSWER_FILTER_MIN_LETTERS_FOR_CASE_CHECK, 20),
+  }),
+
+  // Home domain of the SEP-24/SEP-12 anchor Arbiter integrates with for
+  // fiat rails (bank deposit/withdraw, KYC status). Arbiter is a CLIENT of
+  // this anchor's stellar.toml — it never stores PII or bank details
+  // itself. Unset disables the /anchor/* routes entirely.
+  anchor: Object.freeze({
+    homeDomain: process.env.ANCHOR_HOME_DOMAIN || '',
+  }),
+
+  // The non-crypto onramp (see billing.js): API-key customers pay in fiat
+  // via Stripe and are settled on-chain from ONE pooled balance under this
+  // dedicated identity — deliberately separate from platformSecret/
+  // platformAddress above (which already collects platform fee revenue via
+  // resolve()/refund()), so customer float and fee revenue never commingle
+  // in one account. Unset disables the /billing/* routes and the API-key
+  // branch of POST /oracle entirely.
+  billing: Object.freeze({
+    stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
+    stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
+    fiatPoolSecret: process.env.FIAT_POOL_SECRET || '',
+    fiatPoolAddress: process.env.FIAT_POOL_ADDRESS || '',
+    // 1 USD = 1 USDC face value, at USDC's 7-decimal stroop convention.
+    usdToStroops: 10_000_000n,
+    minTopupUsd: num(process.env.MIN_TOPUP_USD, 10),
+  }),
+
+  // Auto-withdraw (autoWithdraw.js): a worker opts in to having their full
+  // Owed balance prepared for withdrawal once it crosses a threshold.
+  autoWithdraw: Object.freeze({
+    // Floor on the threshold a worker can set, so the sweep can't be
+    // configured to fire on dust amounts not worth a network fee.
+    minThresholdStroops: num(process.env.AUTO_WITHDRAW_MIN_THRESHOLD_STROOPS, 10_000_000),
+    // How long a built-but-unsigned withdraw transaction stays valid before
+    // the worker must request a fresh one.
+    pendingTtlMs: num(process.env.AUTO_WITHDRAW_PENDING_TTL_MS, 10 * 60 * 1000),
+    // How often the sweep checks every opted-in worker's Owed balance.
+    sweepIntervalMs: num(process.env.AUTO_WITHDRAW_SWEEP_INTERVAL_MS, 60 * 60 * 1000),
+  }),
+
+  // Payer referrals (#99, see payerReferrals.js): a worker's referral code
+  // (the same one referrals.js mints for worker onboarding) passed on a
+  // payer's first verified payment attributes that payer to the worker.
+  // Bookkeeping only — the credit is informational, nothing is paid out.
+  payerReferrals: Object.freeze({
+    enabled: process.env.PAYER_REFERRALS_ENABLED !== 'false',
+    // One-time referral credit, as basis points of the referred payer's
+    // first payment. 500 = 5%. 0 records attribution with no credit.
+    rewardBps: num(process.env.PAYER_REFERRAL_REWARD_BPS, 500),
+  }),
+
+  // Canary deployments (#89, see canary.js and
+  // docs/runbooks/canary-deployment.md).
+  canary: Object.freeze({
+    // 'primary' (default) serves everything. 'canary' serves only the
+    // read-only paths below and never signs as the platform key, so it can
+    // take a slice of real traffic with no sequence-number risk.
+    role: process.env.INSTANCE_ROLE === 'canary' ? 'canary' : 'primary',
+    // Comma-separated GET paths a canary serves. Everything else gets a 503
+    // the traffic splitter (or the client's retry) sends to the primary.
+    readPaths: Object.freeze(
+      (process.env.CANARY_READ_PATHS || '/health,/leaderboard,/leaderboard/xp,/stats,/maintenance,/gamification/badges')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
+    // Cross-instance mutex around every platform-key transaction, so two
+    // primaries sharing PLATFORM_SECRET (e.g. during a cutover) never race
+    // the account's sequence number. TTL must outlast one admin call's full
+    // build/sign/submit/poll cycle including retries.
+    signerLockTtlMs: num(process.env.SIGNER_LOCK_TTL_MS, 60_000),
+    // How long an admin call waits for another instance's lock before failing.
+    signerLockWaitMs: num(process.env.SIGNER_LOCK_WAIT_MS, 90_000),
+    // On SIGTERM, how long to keep running so in-flight quorums can settle.
+    drainTimeoutMs: num(process.env.DRAIN_TIMEOUT_MS, 120_000),
+  }),
 
   // Cross-instance quorum collection (#160). When more than one backend
   // instance is running, a question's collector lives in the memory of

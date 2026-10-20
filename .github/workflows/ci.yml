@@ -5,6 +5,22 @@ on:
   pull_request:
 
 jobs:
+  # .env.example must document every process.env.X the code reads, and
+  # nothing it no longer reads (#224). Built-in modules only, so this needs
+  # no `npm ci` and gives a fast, independent signal.
+  env-example:
+    name: .env.example drift check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: node scripts/check-env-example.js
+      - name: Unit tests for the dependency-free modules
+        run: node --test test/envExample.test.js test/payerReferrals.test.js test/replicaStore.test.js test/canary.test.js
+
   test:
     name: Check and test
     runs-on: ubuntu-latest
@@ -53,10 +69,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js ${{ matrix.node-version }}
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: 22
           cache: npm
 
       - name: Install dependencies

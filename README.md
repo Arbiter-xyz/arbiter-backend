@@ -125,7 +125,24 @@ backend is the only thing serving the app.
   `workerId` must prove control of that key before submitting an answer.
 - A read-only admin/ops console (`/admin/*`, bearer-token gated) —
   transactions, workers, payers, live on-chain treasury balance, fee
-  revenue, and fraud/trust monitoring.
+  revenue, and fraud/trust monitoring. Its list/summary reads can go to a
+  Redis read replica (`REDIS_REPLICA_URL`, `replicaStore.js`) so an operator
+  browsing the console never competes with settlement for the primary; a
+  failing replica falls back to the primary, and `GET /admin/read-replica`
+  reports which one is in use and the replica's lag.
+- **Payer referrals (`payerReferrals.js`)** — a payer who passes a worker's
+  referral code (`body.referralCode` on `POST /oracle`) on their first
+  verified payment is attributed to that worker, once and permanently, with
+  an informational credit (`PAYER_REFERRAL_REWARD_BPS` of that payment)
+  listed at `GET /admin/referral-earnings`. Bookkeeping only: nothing is
+  paid out.
+- **Canary deployments ([docs/runbooks/canary-deployment.md](docs/runbooks/canary-deployment.md))** —
+  `INSTANCE_ROLE=canary` serves read-only traffic and never signs as the
+  platform key; a fleet-wide signer lock stops two instances racing the
+  platform account's sequence number; SIGTERM drains in-flight questions
+  before exit; `npm run canary:preflight` checks a canary matches the primary.
+- Every environment variable the code reads is documented in
+  [`.env.example`](.env.example); `npm run check:env` (run in CI) fails on drift.
 - A SEP-24/SEP-12 fiat anchor client (`anchorClient.js`) — Arbiter never
   holds PII or bank details itself, only resolves and caches the
   configured anchor's public `stellar.toml` for the frontend.
@@ -168,3 +185,8 @@ Instead of polling `GE
 
 <!-- handsoff-issue-84 -->
 - #84: Multi-tenant white-label backend
+
+## Handsoff notes
+
+<!-- handsoff-issue-241 -->
+- #241: All three billing processors call an undefined resolveCurrency()/SUPPORTED_CURRENCIES

@@ -113,8 +113,18 @@ function issueSessionToken(address) {
  * intentional and matches the documented "until rotatedAt + graceMs"
  * contract; the exact-boundary and just-past-boundary cases are covered
  * by tests in test/workerAuth.test.js.
+ *
+ * Reads the resolved `config.session.secrets` array (produced by
+ * config.js calling sessionSecrets()) when present, falling back to the
+ * individual fields so the grace window works regardless of which shape
+ * the config exposes.
  */
 function acceptedSessionSecrets(now = Date.now()) {
+  const resolved = config.session.secrets;
+  if (Array.isArray(resolved) && resolved.length > 0) {
+    return resolved;
+  }
+
   const secrets = [config.session.secret];
   const previous = config.session.previousSecret;
   const graceMs = config.session.rotationGraceMs;
@@ -175,11 +185,8 @@ export async function verifySession(token) {
   return parsed.address;
 }
 
-/** Revokes the session `token` itself, returning the address it was for,
- * or null if the token isn't currently valid (an expired token needs no
- * revocation). The revocation record's TTL matches the token's remaining
- * lifetime, so it never outlives the thing it revokes. Tokens minted
- * before sids existed can't be revoked individually and are rejected. */
+/** Revokes a single session by its sid, without touching other sessions
+ * for the same address. */
 export async function revokeSession(token) {
   const parsed = parseSessionToken(token);
   if (!parsed || !parsed.sid) return null;

@@ -128,6 +128,18 @@ export async function getTeam(teamId) {
  * Loads a team and checks the actor holds at least `minRole`. Answers 404
  * (not 403) to non-members, so team ids can't be probed by outsiders —
  * same convention as DELETE /webhooks/:id.
+ *
+ * Reviewed for side channels (#284): a missing team and a team you're not
+ * in get the same status and body, and both do the same one store.get —
+ * the only extra work for a real team is roleOf() over at most
+ * MAX_TEAM_MEMBERS in-memory entries, microseconds against a store
+ * round-trip's jitter. Every check that runs before this one in the team
+ * functions (validateAssignableRole, the ROLES check in setMemberRole)
+ * depends only on the request, never on the team, so error ordering leaks
+ * nothing either. And even a perfect oracle wouldn't enumerate anything:
+ * ids are `team_${randomUUID()}`, 122 random bits, unguessable by design.
+ * Keep it that way — a team-dependent check before this call, or
+ * sequential/derived team ids, would reopen the question.
  */
 export async function requireTeamRole(teamId, actor, minRole) {
   const team = await getTeam(teamId);

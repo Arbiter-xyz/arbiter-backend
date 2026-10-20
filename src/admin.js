@@ -1,5 +1,5 @@
 import { StrKey } from '@stellar/stellar-sdk';
-import { getKnownJobIds, getJob } from './jobs.js';
+import { getKnownJobIds } from './jobs.js';
 import { getKnownWorkerIds, getReputation } from './dispatch.js';
 import { getKnownPayerAddresses, getPayerQuestionIds, summarizePayerQuestions, evaluateLoyaltyTier } from './payerIndex.js';
 import { getKnownAnchorAddresses, getAnchorTransactions, getAnchorKyc } from './anchorRecords.js';
@@ -76,7 +76,7 @@ export const REPORT_POSTMORTEM_TOOL = {
  * regardless of payer/worker — the admin analogue of the payer-scoped
  * /payers/:address/questions and worker-scoped leaderboard views. */
 export async function listTransactions({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
-  const ids = await getKnownJobIds();
+  const ids = await getKnownJobIds(readStore);
   const page = ids.slice(offset, offset + limit);
   const jobs = await Promise.all(page.map((id) => getJob(id)));
   return {

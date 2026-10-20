@@ -9,6 +9,9 @@
     "check": "node --check src/*.js scripts/*.js",
     "test": "node --test --test-timeout=30000"
   },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.0",
     "@opentelemetry/api": "^1.9.1",

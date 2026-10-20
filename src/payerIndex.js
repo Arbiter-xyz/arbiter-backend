@@ -39,8 +39,8 @@ const MAX_TRACKED_CCPA_REQUESTS = 5_000;
 const CCPA_RESPONSE_WINDOW_DAYS = 45;
 const CCPA_RESPONSE_WINDOW_MS = CCPA_RESPONSE_WINDOW_DAYS * 24 * 60 * 60 * 1000;
 
-export async function getKnownPayerAddresses() {
-  return (await store.get(PAYER_INDEX_KEY)) || [];
+export async function getKnownPayerAddresses(readStore = store) {
+  return (await readStore.get(PAYER_INDEX_KEY)) || [];
 }
 
 export async function recordPayerQuestion(payerAddress, questionId) {
@@ -58,8 +58,8 @@ export async function recordPayerQuestion(payerAddress, questionId) {
   }
 }
 
-export async function getPayerQuestionIds(payerAddress) {
-  return (await store.get(PREFIX + payerAddress)) || [];
+export async function getPayerQuestionIds(payerAddress, readStore = store) {
+  return (await readStore.get(PREFIX + payerAddress)) || [];
 }
 
 /**

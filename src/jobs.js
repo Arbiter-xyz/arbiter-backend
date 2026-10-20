@@ -104,8 +104,8 @@ async function indexJob(jobId) {
   await store.set(JOB_INDEX_KEY, [jobId, ...known].slice(0, MAX_TRACKED_JOBS));
 }
 
-export async function getKnownJobIds() {
-  return (await store.get(JOB_INDEX_KEY)) || [];
+export async function getKnownJobIds(readStore = store) {
+  return (await readStore.get(JOB_INDEX_KEY)) || [];
 }
 
 async function indexReview(jobId) {
@@ -192,107 +192,34 @@ export async function getEscalatedItems() {
 }
 
 /**
- * Returns the set of escalated ids for a given kind, for cheap membership
- * checks when annotating admin listings.
+ * Tags a job as synthetic monitoring (issue #111). Idempotent. Synthetic jobs
+ * are excluded from /stats the same way sandbox settlements are, so a
+ * monitoring run never inflates real customer metrics.
  */
-export async function getEscalatedIds(kind) {
-  const escalated = await getEscalatedItems();
-  return new Set(escalated.filter((e) => e.kind === kind).map((e) => e.id));
+export async function markSynthetic(jobId) {
+  const synthetic = (await store.get(SYNTHETIC_INDEX_KEY)) || [];
+  if (synthetic.includes(jobId)) return;
+  await store.set(
+    SYNTHETIC_INDEX_KEY,
+    [jobId, ...synthetic].slice(0, MAX_TRACKED_SYNTHETIC_JOBS),
+  );
 }
 
 /**
- * Marks a job as synthetic (a scheduled monitor run, not a real customer
- * question) and records it in a separate index so /stats can exclude it.
- * Called by the synthetic runner right after createJob(), before dispatch,
- * so the tag is present for the entire lifetime of the job and every log
- * line emitted for it can carry `synthetic: true`.
+ * Returns the jobIds tagged as synthetic monitoring, most-recent-first.
+ * Backs /stats' exclusion of synthetic runs.
  */
-export async function markSynthetic(jobId) {
-  await updateJob(jobId, { synthetic: true });
-  const known = (await store.get(SYNTHETIC_INDEX_KEY)) || [];
-  if (!known.includes(jobId)) {
-    await store.set(
-      SYNTHETIC_INDEX_KEY,
-      [jobId, ...known].slice(0, MAX_TRACKED_SYNTHETIC_JOBS),
-    );
-  }
-}
-
 export async function getSyntheticJobIds() {
   return (await store.get(SYNTHETIC_INDEX_KEY)) || [];
 }
 
 /**
- * True when a job record is a synthetic monitor run. Used by /stats to keep
- * synthetic settlements out of the public counters, consistent with how
- * sandbox traffic is already excluded (see stats.js).
+ * True if the given jobId was tagged as synthetic monitoring. Used by /stats
+ * to exclude synthetic runs from real customer metrics.
  */
-export function isSyntheticJob(job) {
-  return Boolean(job && job.synthetic);
-}
-
-async function indexScheduled(jobId) {
-  const scheduled = (await store.get(SCHEDULED_INDEX_KEY)) || [];
-  if (scheduled.includes(jobId)) return;
-  await store.set(
-    SCHEDULED_INDEX_KEY,
-    [jobId, ...scheduled].slice(0, MAX_TRACKED_SCHEDULED),
-  );
-}
-
-async function unindexScheduled(jobId) {
-  const scheduled = (await store.get(SCHEDULED_INDEX_KEY)) || [];
-  if (!scheduled.includes(jobId)) return;
-  await store.set(SCHEDULED_INDEX_KEY, scheduled.filter((id) => id !== jobId));
-}
-
-/**
- * Returns the jobIds currently in the `scheduled` state, most-recent-first.
- * Backs the scheduling sweep (scheduled.js), which dispatches any job whose
- * `scheduledFor` has arrived and prunes entries that have left the state.
- */
-export async function getScheduledJobIds() {
-  return (await store.get(SCHEDULED_INDEX_KEY)) || [];
-}
-
-/**
- * Returns the full job records currently in `scheduled`, sorted by execute
- * time ascending (soonest first). Jobs whose record has expired (TTL) or
- * already left the scheduled state are pruned from the index so the queue
- * self-heals, mirroring getPendingReviews().
- */
-export async function getScheduledJobs() {
-  const jobIds = await getScheduledJobIds();
-  const jobs = [];
-  for (const jobId of jobIds) {
-    const job = await getJob(jobId);
-    if (job && job.status === 'scheduled') {
-      jobs.push(job);
-    } else {
-      await unindexScheduled(jobId);
-    }
-  }
-  return jobs.sort((a, b) => (a.scheduledFor || 0) - (b.scheduledFor || 0));
-}
-
-/**
- * Cancels a scheduled question before its dispatch time. Only valid while the
- * job is still in `scheduled` — once the sweep has moved it to
- * `awaiting_workers` the normal undo window / refund path applies instead.
- * Returns the updated job, or null if the job is missing or no longer
- * cancellable. Releasing reserved funds is the caller's responsibility (the
- * route layer refunds the prepaid charge); this only flips the state and
- * removes the job from the schedule index so it is never dispatched.
- */
-export async function cancelScheduledJob(jobId) {
-  const job = await getJob(jobId);
-  if (!job || job.status !== 'scheduled') return null;
-  const updated = await updateJob(jobId, {
-    status: 'cancelled',
-    cancelledAt: Date.now(),
-  });
-  await unindexScheduled(jobId);
-  return updated;
+export async function isSyntheticJob(jobId) {
+  const synthetic = (await store.get(SYNTHETIC_INDEX_KEY)) || [];
+  return synthetic.includes(jobId);
 }
 
 /**
