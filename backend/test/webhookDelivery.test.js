@@ -2,6 +2,7 @@
 
 const assert = require('assert');
 const { backoffDelayMs } = require('../src/webhookDelivery');
+const { markSynthetic, getSyntheticJobIds, isSyntheticJob } = require('../src/jobs');
 
 // Issue #328: the 20% random jitter on exponential backoff was not asserted
 // to stay within bounds across many random() draws. These tests pin the

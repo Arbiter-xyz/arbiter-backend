@@ -59,6 +59,7 @@ export class RedisPubSub {
     this.sub = typeof base.duplicate === 'function' ? base.duplicate() : base;
     this.pub = base;
     this.handlers = new Map();
+    this.closed = false;
     this.sub.on('message', (channel, message) => {
       const set = this.handlers.get(channel);
       if (!set) return;
@@ -71,6 +72,26 @@ export class RedisPubSub {
         }
       }
     });
+    // A dropped subscriber connection silently stops delivering messages.
+    // Re-subscribe every active channel once the connection is back so
+    // cross-instance routing recovers instead of going dark until restart.
+    this.sub.on('error', (err) => {
+      // eslint-disable-next-line no-console
+      console.error('[pubsub] subscriber connection error', err);
+    });
+    this.sub.on('ready', () => {
+      this.resubscribeAll();
+    });
+  }
+
+  resubscribeAll() {
+    if (this.closed) return;
+    for (const channel of this.handlers.keys()) {
+      this.sub.subscribe(channel).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error('[pubsub] resubscribe error', err);
+      });
+    }
   }
 
   subscribe(channel, handler) {
@@ -102,6 +123,7 @@ export class RedisPubSub {
   }
 
   async close() {
+    this.closed = true;
     this.handlers.clear();
     try {
       await this.sub.quit();
