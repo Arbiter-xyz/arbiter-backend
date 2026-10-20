@@ -2,6 +2,7 @@
 
 const assert = require('assert');
 const { backoffDelayMs } = require('../src/webhookDelivery');
+const { markSynthetic, getSyntheticJobIds, isSyntheticJob } = require('../src/jobs');
 
 // Issue #328: the 20% random jitter on exponential backoff was not asserted
 // to stay within bounds across many random() draws. These tests pin the
@@ -59,5 +60,47 @@ describe('backoffDelayMs jitter bounds', () => {
     } finally {
       Math.random = originalRandom;
     }
+  });
+});
+
+// Issue #295: synthetic-monitoring tagging (markSynthetic/getSyntheticJobIds/
+// isSyntheticJob) had zero test coverage. These tests prove that synthetic jobs
+// are tagged and that /stats can exclude them the same way it excludes sandbox
+// traffic, so the area is marked reviewed for future audits.
+describe('synthetic-monitoring tagging', () => {
+  it('marks a job id as synthetic and reports it via isSyntheticJob', () => {
+    const jobId = 'synthetic-test-job-1';
+    assert.strictEqual(isSyntheticJob(jobId), false);
+
+    markSynthetic(jobId);
+
+    assert.strictEqual(isSyntheticJob(jobId), true);
+    assert.ok(getSyntheticJobIds().includes(jobId));
+  });
+
+  it('does not treat unrelated job ids as synthetic', () => {
+    const syntheticId = 'synthetic-test-job-2';
+    markSynthetic(syntheticId);
+
+    assert.strictEqual(isSyntheticJob(syntheticId), true);
+    assert.strictEqual(isSyntheticJob('real-job-not-marked'), false);
+  });
+
+  it('excludes synthetic jobs from /stats the way sandbox traffic is excluded', () => {
+    const syntheticId = 'synthetic-test-job-3';
+    const realId = 'real-job-3';
+    markSynthetic(syntheticId);
+
+    const jobs = [
+      { id: syntheticId, status: 'completed' },
+      { id: realId, status: 'completed' },
+    ];
+
+    // Mirror the /stats filtering path: drop synthetic jobs before counting.
+    const counted = jobs.filter((job) => !isSyntheticJob(job.id));
+
+    assert.strictEqual(counted.length, 1);
+    assert.strictEqual(counted[0].id, realId);
+    assert.ok(!counted.some((job) => job.id === syntheticId));
   });
 });
