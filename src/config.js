@@ -90,6 +90,10 @@ export const WEBHOOK_RETRY_POLICY_BOUNDS = Object.freeze({
 
 // Baseline policy #56 ships with when a customer has no policy configured.
 // Matches the existing bounded-retry posture in retry.js.
+// NOTE (#321): retry.js defines a second DEFAULT_WEBHOOK_RETRY_POLICY /
+// validateWebhookRetryPolicy with different values (default 3 attempts /
+// 200ms; minBaseDelayMs 0 vs 100 here). Neither is imported outside its own
+// module today; reconcile the two before wiring either into delivery.
 export const DEFAULT_WEBHOOK_RETRY_POLICY = Object.freeze({
   attempts: 2,
   baseDelayMs: 1_000,
