@@ -1,6 +1,10 @@
 import { store } from './store.js';
 import { PROVENANCE_VERSION, hashRecord } from './provenanceVerify.js';
 
+// Review note (#322): this re-export block is intentional. Callers inside src/
+// (oracle.js, server.js) and test/provenance.test.js import the verify surface
+// from here; scripts/verify-provenance.js imports provenanceVerify.js directly
+// because it must stay free of the store dependency this module pulls in.
 export {
   PROVENANCE_VERSION,
   canonicalJson,
