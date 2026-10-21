@@ -86,6 +86,14 @@ export function normalizeCode(code) {
   return CODE_PATTERN.test(withPrefix) ? withPrefix : null;
 }
 
+// Bounded-list review (#325): teams.js (TEAM_INDEX_KEY), privatePools.js
+// (POOL_OWNER_INDEX_KEY) and webhooks.js (WEBHOOK_INDEX_KEY) hand-roll this
+// "prepend, slice to MAX" index update too; pricing.js has no such list.
+// They are deliberately not merged into one helper: teams.js and
+// webhooks.js prepend freshly minted ids and skip the dedupe, privatePools.js
+// dedupes with its own includes() guard before a separate write, and each
+// call site reads its list through its own accessor. Keep the slice(0, max)
+// newest-first eviction identical if you edit any copy.
 async function pushBounded(key, value, max) {
   const list = (await store.get(key)) || [];
   if (list.includes(value)) return;
