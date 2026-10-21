@@ -158,35 +158,18 @@ const QUORUM_PREDICTION_CONFIG = {
   veryLongQuestionTokens: 120,
 };
 
-/**
- * Pure function: predict a quorum size from quote-time signals.
- *
- * Available signals (all known before dispatch):
- *   - question: the raw question text (length is a difficulty proxy)
- *   - category: optional category label
- *   - categoryHistory: optional per-category stats, e.g.
- *       { reconciliationMethodDistribution: { claude: 0.6, vote: 0.4 } }
- *     A high share of `claude` (LLM adjudication) means the category tends
- *     to need scrutiny, so we raise the quorum.
- *
- * Returns an integer clamped to [config.min, config.max]. Never returns 0.
- */
-export function predictQuorumSize(question, { category = null, categoryHistory = null, config = QUORUM_PREDICTION_CONFIG } = {}) {
-  const cfg = { ...QUORUM_PREDICTION_CONFIG, ...config };
-  let score = cfg.base;
-
-  // Length signal: longer questions tend to be more involved.
-  const tokenCount = typeof question === 'string' ? tokenize(question).length : 0;
-  if (tokenCount >= cfg.veryLongQuestionTokens) score += 2;
-  else if (tokenCount >= cfg.longQuestionTokens) score += 1;
-
-  // Category-history signal: fraction of past reconciliations that needed
-  // LLM adjudication (method 'claude'). Higher => harder => larger quorum.
-  const dist = categoryHistory?.reconciliationMethodDistribution;
-  if (dist && typeof dist === 'object') {
-    const claudeShare = Number(dist.claude) || 0;
-    if (claudeShare >= 0.5) score += 2;
-    else if (claudeShare >= 0.25) score += 1;
+let anthropicClient = null;
+export function getClient() {
+  if (!config.anthropicApiKey) return null;
+  if (!anthropicClient) {
+    // The SDK's own defaults (2 retries, but a 10-MINUTE timeout) are tuned
+    // for long-running batch/agentic use, not a call sitting in the
+    // critical path of settling a question with a fail-closed fallback
+    // waiting behind it. Keep the SDK's built-in retry (it already handles
+    // backoff + which errors are retryable correctly) but cut the ceiling
+    // down to something that fails fast enough to still hit the
+    // deterministic vote fallback promptly if Claude is genuinely down.
+    anthropicClient = new Anthropic({ apiKey: config.anthropicApiKey, timeout: 15_000, maxRetries: 2 });
   }
 
   // Clamp: floor is at least 1 so the finish condition can always be met.
