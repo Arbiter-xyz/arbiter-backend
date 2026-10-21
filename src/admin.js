@@ -37,6 +37,10 @@ async function mapWithConcurrency(items, limit, fn) {
   return results;
 }
 
+// NOTE (#323): consensus.js also exports a REPORT_POSTMORTEM_TOOL with a
+// different shape (timestamp/correlationId, no summary). This admin.js one is
+// the schema actually sent to Claude by the admin postmortem call below; the
+// consensus.js copy only pairs with its own normalizePostmortemDraft().
 /** Tool-forced Claude call, structurally modeled on reconcile.js's
  * REPORT_CONSENSUS_TOOL / reconcileWithClaude() pattern: a single tool whose
  * input_schema is the postmortem's structured shape, forced via tool_choice

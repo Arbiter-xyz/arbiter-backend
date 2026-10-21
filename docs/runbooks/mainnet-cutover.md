@@ -236,6 +236,8 @@ admin signing is ever required. Do **not** run two active admin signers.
 | Payer/worker-signed fee-bump relays (`sponsor.js`) | **Yes** | These do not touch the admin sequence number. |
 | Admin-signed calls (resolve/refund/charge/touch) | **No** | Share the admin sequence number; active-passive only. |
 
+> Review note (#320): this runbook does not reference `resolve_batch` or `refund_batch`; its settlement-related steps only mention the single-item resolve/refund calls above. If batch settlement methods are added to the contract later, re-check this table and the cutover steps.
+
 ### Out of scope
 
 - Provisioning multi-region infrastructure (hosting-specific setup).
