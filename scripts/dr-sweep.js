@@ -14,7 +14,8 @@
  *   node scripts/dr-sweep.js --out report.json
  *
  * Exit code: 0 on success, 1 if the chain scan failed, 2 if any question was
- * flagged 'inconsistent' or any refund errored (i.e. a human needs to look).
+ * flagged 'inconsistent', any refund errored, or the Pending snapshot could
+ * not be read consistently (i.e. a human needs to look).
  */
 import { writeFileSync } from 'node:fs';
 
@@ -61,5 +62,21 @@ const json = JSON.stringify(report, null, 2);
 if (outPath) writeFileSync(outPath, json + '\n');
 console.log(json);
 
-const needsHuman = report.summary.flagged > 0 || report.summary.errors > 0;
+// snapshotPendingIds gives up after a few inconsistent scans and returns an
+// incomplete Pending snapshot. The sweep must not treat that as a complete
+// view of the chain: refunding against a truncated snapshot silently
+// under-refunds. Surface it loudly so the operator re-runs once the index
+// settles instead of trusting a partial report.
+if (report.snapshotIncomplete) {
+  console.error(
+    'WARNING: Pending snapshot was inconsistent across all scan attempts; ' +
+      'the report is INCOMPLETE and may under-refund. Re-run once the ' +
+      'on-chain Pending index settles.',
+  );
+}
+
+const needsHuman =
+  report.summary.flagged > 0 ||
+  report.summary.errors > 0 ||
+  report.snapshotIncomplete === true;
 process.exit(needsHuman ? 2 : 0);

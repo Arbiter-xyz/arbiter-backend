@@ -33,6 +33,14 @@ const MAX_TRACKED_REVIEWS = 5_000;
 const ESCALATION_INDEX_KEY = 'escalated-item-ids';
 const MAX_TRACKED_ESCALATIONS = 5_000;
 
+// Scheduled-question index (#80). Holds the jobIds of questions that have been
+// paid for up front but whose dispatch is deferred to a future execute time.
+// Same bounded durable-index pattern as the indexes above; entries are removed
+// once the job is dispatched (or cancelled). The sweep in scheduled.js reads
+// this list and dispatches any job whose `scheduledFor` has arrived.
+const SCHEDULED_INDEX_KEY = 'scheduled-job-ids';
+const MAX_TRACKED_SCHEDULED = 5_000;
+
 // Terminal states never need reconciliation again. Everything else is
 // "in-flight" and must be checked against on-chain truth on startup.
 const TERMINAL_STATUSES = new Set(['settled']);
@@ -47,14 +55,57 @@ const TERMINAL_STATUSES = new Set(['settled']);
 const SYNTHETIC_INDEX_KEY = 'synthetic-job-ids';
 const MAX_TRACKED_SYNTHETIC_JOBS = 1_000;
 
+// gRPC job-status streaming (issue #76). A gRPC server-streaming call needs to
+// be woken whenever a job's status changes, rather than polling the store on
+// an interval. updateJob() is the single choke point every state transition
+// (awaiting_workers -> reconciling -> settled, plus holding/pending_review)
+// already flows through, so we fan out change notifications from there. This
+// keeps the gRPC stream reflecting exactly the same transitions the REST
+// GET /oracle/:jobId polling endpoint shows, without reimplementing any of
+// the state machine. Listeners are in-process only (the gRPC server runs in
+// the same process as Express), so a plain Map of Sets is sufficient.
+const jobStatusListeners = new Map();
+
+/**
+ * Subscribe to status changes for a single job. Returns an unsubscribe
+ * function. Used by the gRPC server-streaming handler to push updates as
+ * updateJob() writes them.
+ */
+export function onJobStatusChange(jobId, listener) {
+  let set = jobStatusListeners.get(jobId);
+  if (!set) {
+    set = new Set();
+    jobStatusListeners.set(jobId, set);
+  }
+  set.add(listener);
+  return () => {
+    const current = jobStatusListeners.get(jobId);
+    if (!current) return;
+    current.delete(listener);
+    if (current.size === 0) jobStatusListeners.delete(jobId);
+  };
+}
+
+function notifyJobStatusChange(jobId, job) {
+  const set = jobStatusListeners.get(jobId);
+  if (!set) return;
+  for (const listener of set) {
+    try {
+      listener(job);
+    } catch {
+      // A misbehaving listener must never break the state transition itself.
+    }
+  }
+}
+
 async function indexJob(jobId) {
   const known = (await store.get(JOB_INDEX_KEY)) || [];
   if (known.includes(jobId)) return;
   await store.set(JOB_INDEX_KEY, [jobId, ...known].slice(0, MAX_TRACKED_JOBS));
 }
 
-export async function getKnownJobIds() {
-  return (await store.get(JOB_INDEX_KEY)) || [];
+export async function getKnownJobIds(readStore = store) {
+  return (await readStore.get(JOB_INDEX_KEY)) || [];
 }
 
 async function indexReview(jobId) {
@@ -141,43 +192,34 @@ export async function getEscalatedItems() {
 }
 
 /**
- * Returns the set of escalated ids for a given kind, for cheap membership
- * checks when annotating admin listings.
+ * Tags a job as synthetic monitoring (issue #111). Idempotent. Synthetic jobs
+ * are excluded from /stats the same way sandbox settlements are, so a
+ * monitoring run never inflates real customer metrics.
  */
-export async function getEscalatedIds(kind) {
-  const escalated = await getEscalatedItems();
-  return new Set(escalated.filter((e) => e.kind === kind).map((e) => e.id));
+export async function markSynthetic(jobId) {
+  const synthetic = (await store.get(SYNTHETIC_INDEX_KEY)) || [];
+  if (synthetic.includes(jobId)) return;
+  await store.set(
+    SYNTHETIC_INDEX_KEY,
+    [jobId, ...synthetic].slice(0, MAX_TRACKED_SYNTHETIC_JOBS),
+  );
 }
 
 /**
- * Marks a job as synthetic (a scheduled monitor run, not a real customer
- * question) and records it in a separate index so /stats can exclude it.
- * Called by the synthetic runner right after createJob(), before dispatch,
- * so the tag is present for the entire lifetime of the job and every log
- * line emitted for it can carry `synthetic: true`.
+ * Returns the jobIds tagged as synthetic monitoring, most-recent-first.
+ * Backs /stats' exclusion of synthetic runs.
  */
-export async function markSynthetic(jobId) {
-  await updateJob(jobId, { synthetic: true });
-  const known = (await store.get(SYNTHETIC_INDEX_KEY)) || [];
-  if (!known.includes(jobId)) {
-    await store.set(
-      SYNTHETIC_INDEX_KEY,
-      [jobId, ...known].slice(0, MAX_TRACKED_SYNTHETIC_JOBS),
-    );
-  }
-}
-
 export async function getSyntheticJobIds() {
   return (await store.get(SYNTHETIC_INDEX_KEY)) || [];
 }
 
 /**
- * True when a job record is a synthetic monitor run. Used by /stats to keep
- * synthetic settlements out of the public counters, consistent with how
- * sandbox traffic is already excluded (see stats.js).
+ * True if the given jobId was tagged as synthetic monitoring. Used by /stats
+ * to exclude synthetic runs from real customer metrics.
  */
-export function isSyntheticJob(job) {
-  return Boolean(job && job.synthetic);
+export async function isSyntheticJob(jobId) {
+  const synthetic = (await store.get(SYNTHETIC_INDEX_KEY)) || [];
+  return synthetic.includes(jobId);
 }
 
 /**
@@ -280,7 +322,6 @@ export async function markPendingReview(jobId, extra = {}) {
     updatedAt: Date.now(),
   };
   await store.set(key, next, config.jobResultTtlMs);
-  settlementsTotal.inc({ outcome: outcome || 'unknown' });
   return true;
 }
 

@@ -22,6 +22,33 @@ function usdcAsset() {
   return new Asset(config.usdc.code, config.usdc.issuer);
 }
 
+// ---------------------------------------------------------------------
+// Per-worker onboarding throttle. buildSponsoredOnboardTx is the one
+// sponsor route whose every call costs the platform a real
+// sponsored-reserve transaction (base reserve + fees for a brand-new
+// account and trustline), so the generic server.js rateLimited('sponsor',
+// byIp) wrapper is not sufficient on its own: a single IP can rotate
+// through many distinct worker addresses, and each distinct address
+// bypasses any per-address accounting while still draining the platform's
+// reserve. This in-process guard caps how often a given worker address can
+// request a sponsored-onboard build, independent of the IP-based limiter.
+// It is intentionally best-effort (single-process, in-memory) — the goal
+// is to blunt address-rotation abuse, not to be a distributed limiter.
+// ---------------------------------------------------------------------
+const ONBOARD_WINDOW_MS = 60_000;
+const ONBOARD_MAX_PER_WINDOW = 3;
+const onboardAttempts = new Map();
+
+function assertOnboardRateLimit(workerAddress) {
+  const now = Date.now();
+  const recent = (onboardAttempts.get(workerAddress) || []).filter((t) => now - t < ONBOARD_WINDOW_MS);
+  if (recent.length >= ONBOARD_MAX_PER_WINDOW) {
+    throw new Error('sponsor/onboard: too many sponsored-onboard requests for this address, try again later');
+  }
+  recent.push(now);
+  onboardAttempts.set(workerAddress, recent);
+}
+
 /**
  * The standard Stellar "sponsored reserves" sandwich: the platform pays the
  * base reserve + fees for creating the worker's account and USDC trustline,
@@ -30,6 +57,8 @@ function usdcAsset() {
  * added in finalizeSponsoredOnboardTx.
  */
 export async function buildSponsoredOnboardTx(workerAddress) {
+  assertOnboardRateLimit(workerAddress);
+
   const admin = getAdminKeypair();
   const platformAccount = await withRetry(() => getHorizon().loadAccount(admin.publicKey()), {
     ...HORIZON_RETRY_OPTS,

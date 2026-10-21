@@ -3,6 +3,7 @@ import { getKnownWorkerIds, getReputation } from './dispatch.js';
 import { getStakeOnChain } from './stellarClient.js';
 import { config } from './config.js';
 import { stroopsToUsdc } from './pricing.js';
+import { store } from './store.js';
 
 /**
  * Worker reputation is already used internally to gate routing (see
@@ -38,7 +39,32 @@ export function rankLeaderboard(rows, limit = 50) {
     .slice(0, limit);
 }
 
+/**
+ * Short-TTL cache for the computed leaderboard, keyed by limit. Match
+ * ratios shift as questions resolve, so the window is seconds, not
+ * minutes: a leaderboard response reflects match-ratio changes within
+ * LEADERBOARD_CACHE_TTL_MS (default 10s). The cache lives in store.js so
+ * RedisStore instances share it across processes rather than each
+ * instance re-simulating getStakeOnChain() independently. Any store
+ * failure (e.g. Redis briefly unreachable) degrades to the uncached path
+ * rather than surfacing a 500.
+ */
+export const LEADERBOARD_CACHE_TTL_MS = 10_000;
+
+function leaderboardCacheKey(limit) {
+  return `leaderboard:${limit}`;
+}
+
 export async function getLeaderboard(limit = 50) {
+  const cacheKey = leaderboardCacheKey(limit);
+
+  try {
+    const cached = await store.get(cacheKey);
+    if (cached) return cached;
+  } catch {
+    // Cache backend unavailable — fall through to the uncached computation.
+  }
+
   const ids = await getKnownWorkerIds();
 
   const rows = await Promise.all(
@@ -58,7 +84,15 @@ export async function getLeaderboard(limit = 50) {
     }),
   );
 
-  return rankLeaderboard(rows, limit);
+  const ranked = rankLeaderboard(rows, limit);
+
+  try {
+    await store.set(cacheKey, ranked, LEADERBOARD_CACHE_TTL_MS);
+  } catch {
+    // Cache write failure is non-fatal; the response is still correct.
+  }
+
+  return ranked;
 }
 
 /**

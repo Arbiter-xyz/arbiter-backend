@@ -51,6 +51,20 @@ const ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 const CODE_BODY_LENGTH = 8;
 const CODE_PATTERN = /^ARB-[0-9A-HJKMNP-TV-Z]{8}$/;
 
+/**
+ * Why 5 mint attempts is enough (reviewed in #283). The birthday bound is
+ * the wrong model here: it's the odds of an UNDETECTED duplicate somewhere
+ * in the set, but every candidate is claimed with setNX, so a collision is
+ * always detected and just costs a retry. What matters is the odds that one
+ * mint draws an already-taken code 5 times in a row: (N / 32^8)^5, where
+ * 32^8 = 2^40 ≈ 1.1e12 and N is every code ever minted. That's all codes,
+ * not MAX_REFERRERS_TRACKED — that only caps the index, and code keys never
+ * expire — but N is also at most one per Stellar address that ever asked.
+ * At N = 5,000 that's ~2e-42; even at N = 1e9 it's ~6e-16 per mint, and the
+ * failure mode is a retryable 503, not a duplicate or a hijacked code.
+ */
+const MAX_MINT_ATTEMPTS = 5;
+
 export class ReferralError extends Error {
   constructor(message, status = 400) {
     super(message);
@@ -72,6 +86,14 @@ export function normalizeCode(code) {
   return CODE_PATTERN.test(withPrefix) ? withPrefix : null;
 }
 
+// Bounded-list review (#325): teams.js (TEAM_INDEX_KEY), privatePools.js
+// (POOL_OWNER_INDEX_KEY) and webhooks.js (WEBHOOK_INDEX_KEY) hand-roll this
+// "prepend, slice to MAX" index update too; pricing.js has no such list.
+// They are deliberately not merged into one helper: teams.js and
+// webhooks.js prepend freshly minted ids and skip the dedupe, privatePools.js
+// dedupes with its own includes() guard before a separate write, and each
+// call site reads its list through its own accessor. Keep the slice(0, max)
+// newest-first eviction identical if you edit any copy.
 async function pushBounded(key, value, max) {
   const list = (await store.get(key)) || [];
   if (list.includes(value)) return;
@@ -102,7 +124,7 @@ export async function getOrCreateReferralCode(owner) {
   const existing = await getReferralCodeFor(owner);
   if (existing) return existing;
 
-  for (let attempt = 0; attempt < 5; attempt += 1) {
+  for (let attempt = 0; attempt < MAX_MINT_ATTEMPTS; attempt += 1) {
     const code = generateCode();
     const record = { code, owner, createdAt: Date.now() };
     if (!(await store.setNX(CODE_PREFIX + code, record))) continue; // code collision, try another

@@ -65,12 +65,24 @@ export async function probeChain(getLatestLedgerSequence, { timeoutMs = 5_000 } 
 }
 
 /** Walks the job index and publishes the in-flight counts and the oldest
- * in-flight job's age (the QuestionsStuckInFlight alert). */
-export async function probeJobs({ getKnownJobIds, getJob }, now = Date.now()) {
+ * in-flight job's age (the QuestionsStuckInFlight alert). Reads are issued
+ * with bounded concurrency so a large index (up to MAX_TRACKED_JOBS) doesn't
+ * serialize into a scan that outlasts the probe interval. */
+export async function probeJobs({ getKnownJobIds, getJob }, now = Date.now(), { concurrency = 32 } = {}) {
   try {
     const ids = await getKnownJobIds();
-    const jobs = [];
-    for (const id of ids) jobs.push(await getJob(id));
+    const jobs = new Array(ids.length);
+    let next = 0;
+    const worker = async () => {
+      while (next < ids.length) {
+        const i = next++;
+        jobs[i] = await getJob(ids[i]);
+      }
+    };
+    const workers = [];
+    const n = Math.min(concurrency, ids.length);
+    for (let i = 0; i < n; i++) workers.push(worker());
+    await Promise.all(workers);
     recordJobScan(jobs, now);
     return { scanned: ids.length };
   } catch (err) {
@@ -82,6 +94,30 @@ export async function probeJobs({ getKnownJobIds, getJob }, now = Date.now()) {
 
 function every(intervalMs, fn) {
   const run = () => fn().catch((err) => logger.error({ err }, 'health probe threw'));
+  run();
+  const timer = setInterval(run, intervalMs);
+  timer.unref();
+  return timer;
+}
+
+/** Runs fn on an interval, skipping a tick if the previous run is still in
+ * flight so a slow scan can't overlap itself and pile up concurrent scans. */
+function everyNoOverlap(intervalMs, fn) {
+  let running = false;
+  const run = async () => {
+    if (running) {
+      logger.warn('health probe still running, skipping tick');
+      return;
+    }
+    running = true;
+    try {
+      await fn();
+    } catch (err) {
+      logger.error({ err }, 'health probe threw');
+    } finally {
+      running = false;
+    }
+  };
   run();
   const timer = setInterval(run, intervalMs);
   timer.unref();

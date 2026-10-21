@@ -14,6 +14,13 @@ import { store } from './store.js';
 
 const KEY_PREFIX = 'ak_live_';
 
+/** Trust tiers, lowest to highest. `base` is equivalent to today's fixed
+ * config.rateLimits[bucket].max; higher tiers get a larger ceiling. */
+export const TRUST_TIERS = ['base', 'trusted', 'premium'];
+
+/** Multiplier applied to a bucket's base `max` for each elevated tier. */
+const TIER_MULTIPLIERS = { base: 1, trusted: 5, premium: 20 };
+
 export function hashApiKey(rawKey) {
   return createHash('sha256').update(rawKey).digest('hex');
 }
@@ -40,4 +47,25 @@ export async function resolveApiKey(req) {
   if (account && account.suspended) return null;
 
   return record.accountId;
+}
+
+/** Returns the trust tier for an accountId, defaulting to `base`. Fails
+ * closed to `base` on any lookup error or unknown tier — never returns an
+ * elevated tier unless the store explicitly says so. */
+export async function resolveTrustTier(accountId) {
+  if (!accountId) return 'base';
+  try {
+    const account = await store.get(`account:${accountId}`);
+    const tier = account && account.tier;
+    return TRUST_TIERS.includes(tier) ? tier : 'base';
+  } catch {
+    return 'base';
+  }
+}
+
+/** Scales a bucket's base `max` by the multiplier for `tier`. Unknown tiers
+ * fall back to the base multiplier (fail closed). */
+export function tieredMax(baseMax, tier) {
+  const multiplier = TIER_MULTIPLIERS[tier] || TIER_MULTIPLIERS.base;
+  return Math.floor(baseMax * multiplier);
 }

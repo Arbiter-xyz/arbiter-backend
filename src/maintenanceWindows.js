@@ -80,6 +80,12 @@ export function parseWindowInput(input, now = Date.now()) {
  * treated as one continuous pause, so `resumesAt` is when dispatch actually
  * comes back — not just the end of whichever window happened to match
  * first. Pure, for the same reason as parseWindowInput().
+ *
+ * The extend step is a single linear sweep over the start-sorted windows
+ * (O(n log n) for the sort, O(n) for the sweep) rather than the previous
+ * repeated full scans, which were O(n^2) in the worst case. Because the
+ * list is sorted by startsAt, once a window starts after the current
+ * `resumesAt` no later window can extend it, so we can stop early.
  */
 export function computePause(windows, now = Date.now()) {
   const active = windows.filter((w) => w.startsAt <= now && now < w.endsAt);
@@ -88,15 +94,9 @@ export function computePause(windows, now = Date.now()) {
   let resumesAt = Math.max(...active.map((w) => w.endsAt));
   // Extend across any window that starts at or before the current end.
   const sorted = [...windows].sort((a, b) => a.startsAt - b.startsAt);
-  let extended = true;
-  while (extended) {
-    extended = false;
-    for (const w of sorted) {
-      if (w.startsAt <= resumesAt && w.endsAt > resumesAt) {
-        resumesAt = w.endsAt;
-        extended = true;
-      }
-    }
+  for (const w of sorted) {
+    if (w.startsAt > resumesAt) break;
+    if (w.endsAt > resumesAt) resumesAt = w.endsAt;
   }
 
   // The earliest-starting active window names the pause.

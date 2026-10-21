@@ -20,14 +20,32 @@
 const FAULT_TYPES = new Set(['http_error', 'latency']);
 const MAX_DELAY_MS = 30_000;
 
+// Never let a drill lock itself out of clearing the fault, or blind the scrape.
+const PROTECTED_PREFIXES = ['/admin', '/metrics'];
+
+/**
+ * Whether a request path is one no fault may touch. Checked per request in
+ * the middleware, not only when a fault is added (#282): validateFault()
+ * can only refuse prefixes INSIDE a protected path, but a broader prefix
+ * like '/' or '/m' also matches /metrics. Lower-cased because Express
+ * routes case-insensitively by default, so /ADMIN/faults reaches the same
+ * handler as /admin/faults.
+ */
+export function isProtectedPath(path) {
+  const p = path.toLowerCase();
+  return PROTECTED_PREFIXES.some((prefix) => p === prefix || p.startsWith(`${prefix}/`));
+}
+
 export function validateFault(input) {
   const fault = { ...input };
   if (!FAULT_TYPES.has(fault.type)) throw new Error(`type must be one of ${[...FAULT_TYPES].join(', ')}`);
   if (typeof fault.pathPrefix !== 'string' || !fault.pathPrefix.startsWith('/')) {
     throw new Error('pathPrefix must be a path starting with /');
   }
-  if (fault.pathPrefix.startsWith('/admin') || fault.pathPrefix.startsWith('/metrics')) {
-    // Never let a drill lock itself out of clearing the fault, or blind the scrape.
+  const lowerPrefix = fault.pathPrefix.toLowerCase();
+  if (PROTECTED_PREFIXES.some((prefix) => lowerPrefix.startsWith(prefix))) {
+    // A fault that could only ever hit protected paths is a mistake, so say so
+    // up front. Broader prefixes ('/') are fine: the middleware skips them.
     throw new Error('faults cannot target /admin or /metrics');
   }
   fault.rate = fault.rate ?? 1;
@@ -49,6 +67,7 @@ export function createFaultInjector({ random = Math.random } = {}) {
   const faults = new Map();
 
   function middleware(req, res, next) {
+    if (isProtectedPath(req.path)) return next();
     let delayMs = 0;
     let errorStatus = null;
     for (const fault of faults.values()) {

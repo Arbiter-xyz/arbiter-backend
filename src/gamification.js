@@ -107,6 +107,16 @@ export function computeXp({ total, matched, longestStreak }) {
   return total * XP_PER_ANSWER + matched * XP_PER_MATCH + longestStreak * XP_PER_STREAK_DAY;
 }
 
+/**
+ * Counts perfect days from the retained activity buckets. NOTE: this is a
+ * lower bound, not a lifetime total — workerAnalytics.js prunes day buckets
+ * older than MAX_DAYS_RETAINED (400), so a perfect day that ages out stops
+ * being counted here. That is acceptable because the `perfect-day` badge is
+ * latched: once earned, its earnedAt is persisted in wbadges:{workerId} and
+ * evaluateBadges keeps it earned regardless of the current count. The count
+ * only ever needs to be accurate enough to cross the threshold (>= 1) while
+ * the triggering day is still retained, which it always is at earn time.
+ */
 function countPerfectDays(days) {
   return Object.values(days || {}).filter((b) => b.answered >= 10 && b.matched === b.answered).length;
 }

@@ -319,8 +319,8 @@ export async function unregisterWorker(workerId) {
  * new workers always get a fair first run, and this never blocks a worker
  * from receiving broadcasts when the fallback-to-everyone path kicks in).
  */
-export async function getReputation(workerId) {
-  return (await store.get(REPUTATION_PREFIX + workerId)) || { matched: 0, total: 0 };
+export async function getReputation(workerId, readStore = store) {
+  return (await readStore.get(REPUTATION_PREFIX + workerId)) || { matched: 0, total: 0 };
 }
 
 export async function recordOutcome(workerId, matched) {
@@ -349,8 +349,8 @@ export async function recordOutcome(workerId, matched) {
   }
 }
 
-export async function getKnownWorkerIds() {
-  return (await store.get(WORKER_INDEX_KEY)) || [];
+export async function getKnownWorkerIds(readStore = store) {
+  return (await readStore.get(WORKER_INDEX_KEY)) || [];
 }
 
 // Periodically-refreshed cache of established workers' on-chain stake — see

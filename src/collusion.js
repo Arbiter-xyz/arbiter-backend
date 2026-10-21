@@ -55,6 +55,28 @@ const MAX_FLAGGED_TRACKED = 5_000;
 const TIMING_TTL_MS = 60 * 60 * 1000;
 const IP_TTL_MS = 30 * 24 * 60 * 60 * 1000; // IPs get reassigned; old ones shouldn't link strangers forever
 
+/**
+ * Per-signal weights for the noisy-OR combination below.
+ *
+ * How these were chosen: hand-tuned by ranking the signals by how hard they
+ * are to produce innocently, then spacing the weights so that no single
+ * signal reaches the flag threshold on its own and any two moderate signals
+ * together do. sameWrong is the only signal that is genuinely rare for two
+ * independent honest workers (identical normalized wrong answers), so it
+ * carries the most weight; referral is the weakest because referring people
+ * you know is expected behavior. The ordering is the load-bearing part; the
+ * exact decimals are not.
+ *
+ * Caveat — no formal sensitivity analysis is on record. These numbers were
+ * NOT derived from a measured false-positive-rate curve, and no backtest
+ * over historical quorums has been run to confirm the flag/suspend
+ * thresholds they feed. They are a documented heuristic, not a calibrated
+ * model. If false positives or false negatives are observed in practice,
+ * the right move is to re-derive them from labeled data (or at least sweep
+ * them against a replay of settled quorums) rather than nudge them ad hoc.
+ * Treat any change here as a behavior change to the routing gate and the
+ * operator flag surface, and note it in the PR.
+ */
 export const SIGNAL_WEIGHTS = Object.freeze({
   sameWrong: 0.7,
   lift: 0.5,
@@ -141,6 +163,62 @@ export function pairObservations(submissions, matchingWorkerIds, timings = {}, s
 }
 
 /**
+ * Pure: combines per-signal scores (each 0..1) into a single 0..1 score via
+ * a weighted noisy-OR: score = 1 - Π(1 - w_i * s_i). Exported so the
+ * combination rule can be tested without a store. Missing/zero signals
+ * contribute nothing; the result is monotonic in each signal and never
+ * exceeds 1.
+ */
+export function scorePair(signals = {}) {
+  let miss = 1;
+  for (const [name, weight] of Object.entries(SIGNAL_WEIGHTS)) {
+    const raw = signals[name];
+    if (typeof raw !== 'number' || !(raw > 0)) continue;
+    const s = raw > 1 ? 1 : raw;
+    miss *= 1 - weight * s;
+  }
+  return 1 - miss;
+}
+
+/**
+ * Pure: given a pair's counters and context, derives the per-signal scores
+ * that feed scorePair(). Exported for testing. `counters` is the object
+ * stored under PAIR_PREFIX; `context` carries { referral, sharedIp }.
+ */
+export function pairSignals(counters = {}, context = {}) {
+  const shared = counters.shared || 0;
+  const sameAnswer = counters.sameAnswer || 0;
+  const sameWrong = counters.sameWrong || 0;
+  const synced = counters.synced || 0;
+  const signals = {};
+  if (shared > 0) {
+    signals.sameWrong = sameWrong / shared;
+    signals.sync = synced / shared;
+    if (shared >= config.collusion.minSharedQuestions) {
+      // Lift: observed co-match rate over the 0.5 baseline two independent
+      // workers would hit by chance on a binary question. Clamped to 0..1.
+      const observed = sameAnswer / shared;
+      const lift = (observed - 0.5) / 0.5;
+      if (lift > 0) signals.lift = lift > 1 ? 1 : lift;
+    }
+  }
+  if (context.referral) signals.referral = 1;
+  if (context.sharedIp) signals.sharedIp = 1;
+  return signals;
+}
+
+/**
+ * Pure: maps a score to the pair's disposition. `flag` denies the reconcile
+ * fast path and surfaces the pair to operators; `suspend` additionally drops
+ * them from routing. Thresholds come from config.collusion.
+ */
+export function assessQuorum(score) {
+  if (score >= config.collusion.suspendThreshold) return 'suspend';
+  if (score >= config.collusion.flagThreshold) return 'flag';
+  return 'ok';
+}
+
+/**
  * Records a settled quorum and re-scores every pair in it, flagging or
  * suspending as thresholds are crossed. `getReputation` is injected (from
  * dispatch.js) rather than imported, since dispatch.js imports this module
@@ -154,34 +232,41 @@ export async function recordQuorumObservation(questionId, submissions, matchingW
     const observations = pairObservations(submissions, matchingWorkerIds || [], timings);
 
     for (const { key, a, b, deltas } of observations) {
-      await Promise.all(
-        COUNTERS.filter((c) => deltas[c] > 0).map((c) => store.incrBy(`${PAIR_PREFIX}${key}:${c}`, deltas[c])),
-      );
+      const pairStoreKey = PAIR_PREFIX + key;
+      const counters = (await store.get(pairStoreKey)) || {};
+      for (const name of COUNTERS) {
+        if (deltas[name]) counters[name] = (counters[name] || 0) + deltas[name];
+      }
+      await store.set(pairStoreKey, counters);
       await pushBounded(PARTNERS_PREFIX + a, b, MAX_PARTNERS_TRACKED);
       await pushBounded(PARTNERS_PREFIX + b, a, MAX_PARTNERS_TRACKED);
-      if (getReputation) await rescorePair(a, b, getReputation);
+      await rescorePair(key, { getReputation });
     }
-    await store.delete(TIMING_PREFIX + questionId);
   } catch (err) {
-    logger.error({ err, questionId }, 'failed to record quorum for collusion heuristics');
+    logger.warn({ err, questionId }, 'failed to record collusion observation');
   }
 }
 
-// ---------------------------------------------------------------------
-// Scoring — the read side.
-// ---------------------------------------------------------------------
+/**
+ * Re-scores one pair from its stored counters and context, then applies the
+ * resulting disposition. Exported so callers (and tests) can force a
+ * re-score after context changes (e.g. a new referral link). Never throws.
+ */
+export async function rescorePair(key, { getReputation } = {}) {
+  try {
+    const [a, b] = splitPair(key);
+    const counters = (await store.get(PAIR_PREFIX + key)) || {};
+    const referral = Boolean(await store.get(LINK_PREFIX + key));
+    const ipsA = (await store.get(WORKER_IPS_PREFIX + a)) || [];
+    const ipsB = (await store.get(WORKER_IPS_PREFIX + b)) || [];
+    const sharedIp = ipsA.some((ip) => ipsB.includes(ip));
+    const signals = pairSignals(counters, { referral, sharedIp });
+    const score = scorePair(signals);
+    const disposition = assessQuorum(score);
 
-async function getPairCounters(key) {
-  const values = await Promise.all(COUNTERS.map((c) => store.get(`${PAIR_PREFIX}${key}:${c}`)));
-  return Object.fromEntries(COUNTERS.map((c, i) => [c, Number(values[i]) || 0]));
-}
+    await store.set(PAIR_PREFIX + key, { ...counters, score, disposition });
 
-async function sharesIp(a, b) {
-  const [ipsA, ipsB] = await Promise.all([store.get(WORKER_IPS_PREFIX + a), store.get(WORKER_IPS_PREFIX + b)]);
-  if (!ipsA || !ipsB) return false;
-  const setB = new Set(ipsB);
-  return ipsA.some((h) => setB.has(h));
-}
+    if (disposition === 'ok') return { key, score, disposition };
 
 function matchRatio(rep) {
   return rep && rep.total > 0 ? rep.matched / rep.total : null;

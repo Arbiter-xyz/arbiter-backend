@@ -14,6 +14,7 @@ import { notifyWorker } from './push.js';
 import { enqueueSettlementWebhooks } from './webhookDelivery.js';
 import { setJobWebhookOwner } from './webhooks.js';
 import { jobLogger } from './logger.js';
+import { raiseAlert } from './alerting.js';
 import { store } from './store.js';
 import { buildProvenanceRecord, saveProvenance, attachSettlement } from './provenance.js';
 import { config } from './config.js';
@@ -22,6 +23,21 @@ import { verifySession } from './workerAuth.js';
 import { restoreCredit } from './billing.js';
 import { recordWorkerCredits } from './earnings.js';
 import { checkAutoWithdrawForWorkers } from './autoWithdraw.js';
+import { lookupReferralCode } from './referrals.js';
+import { createPayerReferralLedger } from './payerReferrals.js';
+import { createDrainController } from './canary.js';
+
+const payerReferralLedger = createPayerReferralLedger({
+  store,
+  lookupReferralCode,
+  rewardBps: config.payerReferrals.rewardBps,
+  enabled: config.payerReferrals.enabled,
+});
+
+// Every running fulfillment, so a SIGTERM (canary promotion/rollback,
+// ordinary redeploy) can wait for in-flight quorums to settle instead of
+// abandoning them in awaiting_workers. See canary.js and server.js.
+export const fulfillmentDrain = createDrainController();
 
 const IDEMPOTENCY_PREFIX = 'idempotency:';
 // Who may cancel an API-key-funded job. Kept out of the job record itself,
@@ -45,7 +61,7 @@ export function consensusRuleFromPending(pending) {
   return { mode: pending.consensusMode, tolerance: pending.consensusTolerance };
 }
 
-export async function issueChallenge(questionText, tierKey, category, consensusRule = null) {
+export async function issueChallenge(questionText, tierKey, category, consensusRule = null, { referralCode = null } = {}) {
   const questionId = (await nextQuestionId()).toString();
   // Price is snapshotted NOW, at quote time, from a SMOOTHED (trailing-
   // average) worker-supply signal rather than the instantaneous online
@@ -67,6 +83,9 @@ export async function issueChallenge(questionText, tierKey, category, consensusR
     category: category || null,
     createdAt: Date.now(),
     ...consensusStashFields(consensusRule),
+    // Carried to step 2: attribution happens once payment is verified and
+    // the payer's address is known (see attributePayerReferral below).
+    ...(referralCode ? { referralCode } : {}),
   });
 
   return {
@@ -103,14 +122,14 @@ export async function issueChallenge(questionText, tierKey, category, consensusR
  * questionId itself is already a natural idempotency key there (see
  * startFulfillment's claimJob() usage).
  */
-export async function issueChallengeIdempotent(questionText, tierKey, category, idempotencyKey, consensusRule = null) {
-  if (!idempotencyKey) return issueChallenge(questionText, tierKey, category, consensusRule);
+export async function issueChallengeIdempotent(questionText, tierKey, category, idempotencyKey, consensusRule = null, options = {}) {
+  if (!idempotencyKey) return issueChallenge(questionText, tierKey, category, consensusRule, options);
 
   const cacheKey = IDEMPOTENCY_PREFIX + idempotencyKey;
   const cached = await store.get(cacheKey);
   if (cached) return cached;
 
-  const challenge = await issueChallenge(questionText, tierKey, category, consensusRule);
+  const challenge = await issueChallenge(questionText, tierKey, category, consensusRule, options);
   await store.set(cacheKey, challenge, config.pendingQuestionTtlMs);
   return challenge;
 }
@@ -166,8 +185,11 @@ export async function verifyPayment(questionId) {
  * a cancelJob() claiming the job first. `apiKeyAccountId` marks a job
  * funded through the API-key path, whose `payerAddress` is the platform's
  * pooled fiat address — it's what cancelJob() authenticates against there.
+ *
+ * `referralCode` (or one stashed at step 1) attributes a payer to the worker
+ * who referred them, but only on that payer's first payment (#99).
  */
-export async function startFulfillment(questionId, pending, tier, payerAddress, { ownerAccountId } = {}) {
+export async function startFulfillment(questionId, pending, tier, payerAddress, { ownerAccountId, referralCode } = {}) {
   const claimed = await claimJob(questionId);
   if (!claimed) return { jobId: questionId };
 
@@ -198,7 +220,15 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
   if (ownerAccountId) {
     await store.set(JOB_OWNER_PREFIX + questionId, { apiKeyAccountId: ownerAccountId }, config.jobResultTtlMs);
   }
-  if (payerAddress) await recordPayerQuestion(payerAddress, questionId);
+  if (payerAddress) {
+    // Read before recordPayerQuestion() adds this question, so "first
+    // payment" means no earlier verified payment from this address. Skipped
+    // for API-key jobs, whose payerAddress is the shared fiat pool.
+    const code = ownerAccountId ? null : referralCode || pending.referralCode;
+    const isFirstPayment = code ? (await getPayerQuestionIds(payerAddress)).length === 0 : false;
+    await recordPayerQuestion(payerAddress, questionId);
+    if (code) await attributePayerReferral(questionId, payerAddress, code, tier, isFirstPayment);
+  }
   // API-key customers are charged from the shared fiat pool, so `payer`
   // can't identify them; record who to send settlement webhooks to instead.
   if (ownerAccountId) await setJobWebhookOwner(questionId, `account:${ownerAccountId}`);
@@ -225,6 +255,30 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
   );
 
   return { jobId: questionId, cancellableUntil };
+}
+
+/**
+ * Records a payer referral without ever failing the payment it rides on:
+ * the escrow has already landed by now, so a bad code or a store hiccup is
+ * logged and dropped.
+ */
+async function attributePayerReferral(questionId, payerAddress, code, tier, isFirstPayment) {
+  try {
+    const result = await payerReferralLedger.recordFirstPaymentReferral({
+      payerAddress,
+      code,
+      questionId,
+      amountStroops: tier.priceStroops,
+      isFirstPayment,
+    });
+    if (result.recorded) {
+      jobLogger(questionId).info({ referrer: result.referral.referrer, payer: payerAddress }, 'payer referral attributed');
+    } else if (result.reason !== 'already_attributed') {
+      jobLogger(questionId).info({ reason: result.reason, payer: payerAddress }, 'payer referral not attributed');
+    }
+  } catch (err) {
+    jobLogger(questionId).warn({ err, payer: payerAddress }, 'failed to record payer referral');
+  }
 }
 
 async function dispatchUnlessPaused(questionId, pending, tier) {
@@ -255,11 +309,15 @@ async function refundForDispatchPause(questionId, tier, pause) {
 }
 
 function runFulfillment(questionId, pending, tier) {
-  fulfillOracleCall(questionId, pending, tier).catch((err) => {
+  fulfillmentDrain.track(fulfillOracleCall(questionId, pending, tier)).catch((err) => {
     // fulfillOracleCall is written to always settle the escrow before
     // returning; this catch is a last-resort net so a bug there can't leave
     // the job record stuck in 'awaiting_workers' forever.
     jobLogger(questionId).error({ err }, 'fulfillment crashed unexpectedly');
+    raiseAlert('fulfillment_crashed', `fulfillment crashed for question ${questionId}`, {
+      questionId,
+      error: err.message,
+    });
     updateJob(questionId, {
       status: 'settled',
       outcome: 'refund_pending_timeout',
@@ -685,6 +743,10 @@ async function settleRefunded(questionId, submissions, result, extraJobFields = 
         { err },
         "refund() ALSO failed — payer can fall back to refund_timeout()",
       );
+      raiseAlert('refund_pending_timeout', `refund() failed for question ${questionId}; payer must wait for refund_timeout()`, {
+        questionId,
+        error: err.message,
+      });
       return null;
     });
 

@@ -20,8 +20,8 @@ When reconciliation finishes, `oracle.js` builds one record:
 | `v` | Record format version (`1`) |
 | `questionId`, `question`, `tier` | What was asked |
 | `submissions[]` | Every worker answer, in arrival order: `workerId`, raw `answer`, and `established` (the backend's reputation flag that gates the no-LLM fast path) |
-| `reconciliation.method` | `exact-match-fastpath`, `exact-match-fallback`, `claude`, `llm-draft` (instant tier), `no-answers`, or `llm-draft-unavailable` |
-| `reconciliation.llm` | For `claude` / `llm-draft`: the exact Messages API `request` body, and the `response` (`id`, `model`, `stop_reason`, `content` including the tool call). Otherwise `null` |
+| `reconciliation.method` | `exact-match-fastpath`, `exact-match-fallback`, `claude`, `openai`, `llm-draft` / `llm-draft-openai` (instant tier), `no-answers`, or `llm-draft-unavailable` |
+| `reconciliation.llm` | For the LLM methods: the exact `request` body (Messages API for `claude` / `llm-draft`, Chat Completions for `openai` / `llm-draft-openai`), and the `response` (`id`, `model`, `stop_reason`, `content` including the tool call, normalized to the same `tool_use` block shape for both providers). Otherwise `null` |
 | `reconciliation.llmError` | Why the LLM wasn't used, when the vote fallback ran |
 | `result` | `consensus`, `confidence`, `matchingWorkerIds` |
 | `decision` | `minConfidence` in force, and `action`: `resolve` or `refund` |

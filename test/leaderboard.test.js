@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { rankLeaderboard } from '../src/leaderboard.js';
+import { rankLeaderboard, toLeaderboardV2 } from '../src/leaderboard.js';
 
 function row(workerId, matched, total, established = true) {
   return { workerId, matched, totalAnswers: total, matchRatio: matched / total, established };
@@ -41,4 +41,17 @@ test('respects the limit', () => {
 
 test('empty input returns an empty leaderboard, not a throw', () => {
   assert.deepEqual(rankLeaderboard([]), []);
+});
+
+test('toLeaderboardV2 renders matchRatioPct: null (not 0) for a worker with no answers', () => {
+  const v2 = toLeaderboardV2([
+    { workerId: 'fresh', matched: 0, totalAnswers: 0, matchRatio: null, stakeStroops: '0', stake: '0', established: false },
+    { workerId: 'zero-acc', matched: 0, totalAnswers: 4, matchRatio: 0, stakeStroops: '0', stake: '0', established: true },
+    { workerId: 'half', matched: 1, totalAnswers: 2, matchRatio: 0.5, stakeStroops: '0', stake: '0', established: true },
+  ]);
+  assert.equal(v2.apiVersion, 'v2');
+  assert.equal(v2.workers[0].matchRatioPct, null);
+  assert.equal(v2.workers[1].matchRatioPct, 0);
+  assert.equal(v2.workers[2].matchRatioPct, 50);
+  assert.deepEqual(v2.workers.map((w) => w.rank), [1, 2, 3]);
 });

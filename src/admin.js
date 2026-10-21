@@ -1,5 +1,5 @@
 import { StrKey } from '@stellar/stellar-sdk';
-import { getKnownJobIds, getJob } from './jobs.js';
+import { getKnownJobIds } from './jobs.js';
 import { getKnownWorkerIds, getReputation } from './dispatch.js';
 import { getKnownPayerAddresses, getPayerQuestionIds, summarizePayerQuestions, evaluateLoyaltyTier } from './payerIndex.js';
 import { getKnownAnchorAddresses, getAnchorTransactions, getAnchorKyc } from './anchorRecords.js';
@@ -76,7 +76,7 @@ export const REPORT_POSTMORTEM_TOOL = {
  * regardless of payer/worker — the admin analogue of the payer-scoped
  * /payers/:address/questions and worker-scoped leaderboard views. */
 export async function listTransactions({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
-  const ids = await getKnownJobIds();
+  const ids = await getKnownJobIds(readStore);
   const page = ids.slice(offset, offset + limit);
   const jobs = await Promise.all(page.map((id) => getJob(id)));
   return {
@@ -94,48 +94,46 @@ export async function listTransactions({ limit = DEFAULT_LIMIT, offset = 0 } = {
  * a page of N workers only issues on-chain reads for those N. */
 export async function listWorkers({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
   const ids = await getKnownWorkerIds();
-  return Promise.all(
-    ids.map(async (workerId) => {
-      const rep = await getReputation(workerId);
-      const isAddress = StrKey.isValidEd25519PublicKey(workerId);
-      const [stakeStroops, owedStroops] = isAddress
-        ? await Promise.all([getStakeOnChain(workerId).catch(() => 0n), getOwedOnChain(workerId).catch(() => 0n)])
-        : [0n, 0n];
-      return {
-        workerId,
-        totalAnswers: rep.total,
-        matched: rep.matched,
-        matchRatio: rep.total > 0 ? rep.matched / rep.total : null,
-        established: rep.total >= config.worker.minAnswersBeforeReputationGate,
-        stake: stroopsToUsdc(stakeStroops),
-        owed: stroopsToUsdc(owedStroops),
-      };
-    }),
-  );
+  const page = ids.slice(offset, offset + limit);
+  return mapWithConcurrency(page, MAX_CONCURRENCY, async (workerId) => {
+    const rep = await getReputation(workerId);
+    const isAddress = StrKey.isValidEd25519PublicKey(workerId);
+    const [stakeStroops, owedStroops] = isAddress
+      ? await Promise.all([getStakeOnChain(workerId).catch(() => 0n), getOwedOnChain(workerId).catch(() => 0n)])
+      : [0n, 0n];
+    return {
+      workerId,
+      totalAnswers: rep.total,
+      matched: rep.matched,
+      matchRatio: rep.total > 0 ? rep.matched / rep.total : null,
+      established: rep.total >= config.worker.minAnswersBeforeReputationGate,
+      stake: stroopsToUsdc(stakeStroops),
+      owed: stroopsToUsdc(owedStroops),
+    };
+  });
 }
 
 /** Every payer address this backend has seen a verified on-chain payment
  * from, with the same spend/success aggregation the buyer dashboard shows
  * that payer about themselves (payerIndex.js's summarizePayerQuestions),
  * plus the loyalty tier that spend summary now qualifies them for. */
-export async function listPayers() {
+export async function listPayers({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
   const addresses = await getKnownPayerAddresses();
-  return Promise.all(
-    addresses.map(async (payerAddress) => {
-      const ids = await getPayerQuestionIds(payerAddress);
-      const jobs = await Promise.all(ids.map((id) => getJob(id)));
-      const summary = summarizePayerQuestions(ids, jobs);
-      const tier = evaluateLoyaltyTier(summary);
-      return {
-        payerAddress,
-        totalTracked: summary.totalTracked,
-        totalSpend: stroopsToUsdc(summary.totalSpendStroops),
-        settled: summary.settled,
-        successRate: summary.successRate,
-        loyaltyTier: tier?.name ?? null,
-      };
-    }),
-  );
+  const page = addresses.slice(offset, offset + limit);
+  return mapWithConcurrency(page, MAX_CONCURRENCY, async (payerAddress) => {
+    const ids = await getPayerQuestionIds(payerAddress);
+    const jobs = await Promise.all(ids.map((id) => getJob(id)));
+    const summary = summarizePayerQuestions(ids, jobs);
+    const tier = evaluateLoyaltyTier(summary);
+    return {
+      payerAddress,
+      totalTracked: summary.totalTracked,
+      totalSpend: stroopsToUsdc(summary.totalSpendStroops),
+      settled: summary.settled,
+      successRate: summary.successRate,
+      loyaltyTier: tier?.name ?? null,
+    };
+  });
 }
 
 /** Admin-only provisioning for enterprise customers who can't use a credit
@@ -242,10 +240,7 @@ export async function listAnchorPayouts({ limit = DEFAULT_LIMIT, offset = 0 } = 
     const txs = await getAnchorTransactions(address);
     return txs.filter((t) => t.kind === 'withdrawal').map((t) => ({ address, ...t }));
   });
-  return {
-    total: addresses.length,
-    payouts: rows.flat().sort((a, b) => b.reportedAt - a.reportedAt),
-  };
+  return rows.flat().sort((a, b) => b.reportedAt - a.reportedAt);
 }
 
 /** KYC & Tiers — self-reported SEP-12 customer status per address, same
@@ -258,7 +253,7 @@ export async function listAnchorKyc({ limit = DEFAULT_LIMIT, offset = 0 } = {}) 
     const kyc = await getAnchorKyc(address);
     return kyc ? { address, ...kyc } : null;
   });
-  return { total: addresses.length, kyc: rows.filter(Boolean) };
+  return rows.filter(Boolean);
 }
 
 /** Operator override for the anomaly auto-suspend (issue #153): clears the

@@ -15,6 +15,16 @@ load, and at what load? It has three parts:
    something breaks. Section 4 gives the exact procedure. The local numbers
    below are the baseline to compare it against.
 
+> **Pricing note (issue #319).** Reviewed against `src/pricing.js`. The
+> measured figures below do not depend on pricing tiers: the `challenge`
+> scenario quotes a price but the run applies no account volume history, so
+> `VOLUME_DISCOUNT_TIERS` (multipliers 1 / 0.9 / 0.8 / 0.7 at 0 / 1,000 /
+> 10,000 / 100,000 volume) was not exercised, and the settlement ceiling in
+> section 2 counts admin transactions per question, which a price discount
+> does not change. Whether the escalating-tier cost model changes request
+> cost or load has not been measured; re-run the `challenge` scenario with a
+> discounted account if that matters.
+
 ## 1. Measured locally (2026-09-24)
 
 **Setup.** The backend (`node src/server.js`) and the load generator ran on

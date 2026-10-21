@@ -1,5 +1,7 @@
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { config } from './config.js';
 import { logger } from './logger.js';
+import { createReplicaReadStore } from './replicaStore.js';
 
 /**
  * Storage abstraction so pendingQuestions/jobs/reputation/rate-limits
@@ -127,6 +129,36 @@ class MemoryStore {
     this.map.set(key, { value: current - amount, expiresAt: null });
     return true;
   }
+
+  /** Cluster-wide worker presence: each instance registers its own live
+   * worker count under a per-instance field in one shared hash, so a
+   * cluster-wide total is a sum over fields rather than a per-process
+   * number. MemoryStore has no peers, so its own field is the whole
+   * cluster — identical to today's single-instance behavior. */
+  async setPresence(instanceId, count, ttlMs) {
+    const key = 'presence:workers';
+    const now = Date.now();
+    const entry = this.map.get(key);
+    const alive = entry && (!entry.expiresAt || entry.expiresAt >= now);
+    const hash = alive ? entry.value : {};
+    hash[instanceId] = { count, at: now };
+    this.map.set(key, { value: hash, expiresAt: ttlMs ? now + ttlMs : null });
+  }
+
+  async getPresence() {
+    const key = 'presence:workers';
+    const entry = this.map.get(key);
+    if (!entry) return {};
+    if (entry.expiresAt && entry.expiresAt < Date.now()) {
+      this.map.delete(key);
+      return {};
+    }
+    const result = {};
+    for (const [field, value] of Object.entries(entry.value)) {
+      result[field] = value.count;
+    }
+    return result;
+  }
 }
 
 // Exported (unlike MemoryStore) so its methods are directly unit-testable
@@ -193,23 +225,33 @@ export class RedisStore {
     return this.client.incrby(key, delta);
   }
 
-  // Redis has no single-command "decrement only if the result would stay
-  // >= 0" — INCRBY/DECRBY are unconditional, so getting this right without
-  // a race between two concurrent reservations against the same account
-  // needs a server-side script: Redis evaluates a Lua script atomically
-  // (no other command runs while it's mid-flight), which is what makes
-  // "check then act" safe as one indivisible step here.
+  // Atomic conditional decrement via a Lua script so the read-compare-write
+  // can't interleave with a concurrent reservation on the same account.
   async decrIfAtLeast(key, amount) {
-    const result = await this.client.eval(
-      `local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-       if current < tonumber(ARGV[1]) then return 0 end
-       redis.call('DECRBY', KEYS[1], ARGV[1])
-       return 1`,
-      1,
-      key,
-      amount,
-    );
+    const script = `
+      local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+      local amount = tonumber(ARGV[1])
+      if current < amount then return 0 end
+      redis.call('SET', KEYS[1], current - amount)
+      return 1
+    `;
+    const result = await this.client.eval(script, 1, key, amount);
     return result === 1;
+  }
+
+  async setPresence(instanceId, count, ttlMs) {
+    const key = 'presence:workers';
+    await this.client.hset(key, instanceId, JSON.stringify({ count, at: Date.now() }));
+    if (ttlMs) await this.client.pexpire(key, ttlMs);
+  }
+
+  async getPresence() {
+    const raw = await this.client.hgetall('presence:workers');
+    const result = {};
+    for (const [field, value] of Object.entries(raw)) {
+      result[field] = JSON.parse(value).count;
+    }
+    return result;
   }
 }
 
@@ -231,3 +273,87 @@ async function createStore() {
 }
 
 export const store = await createStore();
+
+/**
+ * Federation reputation credentials (#86).
+ *
+ * A worker with established reputation on deployment A can present a signed,
+ * portable credential to deployment B so B's dispatch.js::isEligible() can
+ * accept it without B trusting A's API by fiat. The credential is signed by
+ * A's federation key (config.worker.federation.signingKey) and carries the
+ * origin deployment id, workerId, matched/total counts, and an issuedAt
+ * timestamp. B verifies the signature against the origin's published key
+ * (config.worker.federation.trustedOrigins) before accepting it.
+ *
+ * Federation is opt-in: when config.worker.federation.enabled is false,
+ * verifyFederatedReputation() always returns null and callers fall back to
+ * the local rep: record exactly as before.
+ */
+
+function federationConfig() {
+  return (config.worker && config.worker.federation) || {};
+}
+
+function canonicalCredentialPayload(cred) {
+  // Deterministic field order so signer and verifier hash identical bytes.
+  return JSON.stringify({
+    origin: cred.origin,
+    workerId: cred.workerId,
+    matched: cred.matched,
+    total: cred.total,
+    issuedAt: cred.issuedAt,
+  });
+}
+
+/**
+ * Sign a reputation credential with the local deployment's federation key.
+ * Returns the credential object (including `signature`) or null when
+ * federation is disabled / no signing key is configured.
+ */
+export function signReputationCredential({ workerId, matched, total }) {
+  const fed = federationConfig();
+  if (!fed.enabled || !fed.signingKey || !fed.deploymentId) return null;
+  const cred = {
+    origin: fed.deploymentId,
+    workerId,
+    matched,
+    total,
+    issuedAt: Date.now(),
+  };
+  cred.signature = createHmac('sha256', fed.signingKey)
+    .update(canonicalCredentialPayload(cred))
+    .digest('hex');
+  return cred;
+}
+
+/**
+ * Verify a presented credential. Returns the credential's { matched, total }
+ * when the signature is valid and the origin is trusted, otherwise null.
+ * A forged/tampered credential (e.g. inflated matched/total with an invalid
+ * signature) is rejected here.
+ */
+export function verifyFederatedReputation(cred) {
+  const fed = federationConfig();
+  if (!fed.enabled) return null;
+  if (!cred || typeof cred !== 'object') return null;
+  const { origin, workerId, matched, total, issuedAt, signature } = cred;
+  if (typeof origin !== 'string' || typeof workerId !== 'string') return null;
+  if (!Number.isFinite(matched) || !Number.isFinite(total)) return null;
+  if (matched < 0 || total < 0 || matched > total) return null;
+  if (typeof signature !== 'string') return null;
+
+  const trusted = fed.trustedOrigins || {};
+  const originKey = trusted[origin];
+  if (!originKey) return null;
+
+  const expected = createHmac('sha256', originKey)
+    .update(canonicalCredentialPayload({ origin, workerId, matched, total, issuedAt }))
+    .digest('hex');
+
+  // Constant-time compare to avoid leaking signature bytes via timing.
+  const a = Buffer.from(expected, 'hex');
+  const b = Buffer.from(signature, 'hex');
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
+
+  return { matched, total, origin };
+}

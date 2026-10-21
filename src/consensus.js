@@ -154,6 +154,11 @@ export function describeTolerance(tolerance) {
 }
 
 /**
+ * NOTE (#323): admin.js exports a different REPORT_POSTMORTEM_TOOL (`at`
+ * instead of `timestamp`/`correlationId`, plus `summary`) and that is the one
+ * the admin postmortem call sends to Claude. This copy is not wired to a
+ * route; keep it in sync with normalizePostmortemDraft() below, or retire it.
+ *
  * Tool-forced Claude schema for the incident postmortem generator (#109),
  * the sibling of reconcile.js's REPORT_CONSENSUS_TOOL. Given a set of
  * correlated log lines (request-id/job-id fields already emitted by
