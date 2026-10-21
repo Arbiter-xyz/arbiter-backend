@@ -8,6 +8,19 @@ workers of an open question, the response window in which workers may claim
 that question, and the quorum logic that decides which worker is awarded the
 work.
 
+> **Review note (issue #318).** Checked against the current `src/dispatch.js`:
+> the "Mitigation: randomized selection within an early-response window"
+> section below describes a *proposed* design, not implemented behavior. No
+> `FAIRNESS_WINDOW_MS` setting or response-window/random-winner selection
+> exists anywhere in `src/`. What dispatch does today is route the broadcast
+> through `selectTargets()`: optional private-pool `whitelist` (fails closed),
+> category routing (fails open), a reputation eligibility filter (fails open),
+> and `preferEstablished` (restricts to established workers only if at least
+> `quorumSize` of them are online). A soft stake gate, `stakeGateAllows()`
+> (`WORKER_MIN_STAKE_STROOPS`, default 0 = disabled), also exists, which the
+> "out of scope" stake-based admission remark below does not mention. How the
+> winner is chosen among responses was not re-audited here.
+
 ## Assets and actors
 
 - **Asset:** the right to answer a question (and the payout/credit attached to
