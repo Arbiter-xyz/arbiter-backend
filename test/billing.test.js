@@ -160,9 +160,10 @@ test('handleStripeWebhook ignores event types other than checkout.session.comple
 // could point successUrl at a domain they control and have Stripe hand
 // the key straight to them once a real payer completed checkout.
 
-test('isAllowedRedirectUrl allows any origin when ALLOWED_ORIGINS is wide open (the default)', () =>
+test('isAllowedRedirectUrl fails closed (rejects any origin) when ALLOWED_ORIGINS is wide open "*" (#226)', () =>
   withAllowedOrigins(['*'], () => {
-    assert.equal(isAllowedRedirectUrl('https://anything.example.com/success'), true);
+    assert.equal(isAllowedRedirectUrl('https://anything.example'), false);
+    assert.equal(isAllowedRedirectUrl('https://anything.example.com/success'), false);
   }));
 
 test('isAllowedRedirectUrl restricts to the configured allowlist once one is set', () =>

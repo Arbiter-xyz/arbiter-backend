@@ -174,7 +174,11 @@ export async function restoreCredit(accountId, stroops) {
 }
 
 export function isAllowedRedirectUrl(url) {
-  if (config.allowedOrigins.includes('*')) return true; // wide-open dev mode, same default as CORS
+  if (!config.allowedOrigins || config.allowedOrigins.length === 0 || config.allowedOrigins.includes('*')) {
+    // Fail closed: checkout redirects embed a freshly minted raw API key in
+    // success_url and must never trust a wildcard CORS default (#226).
+    return false;
+  }
   try {
     return config.allowedOrigins.includes(new URL(url).origin);
   } catch {

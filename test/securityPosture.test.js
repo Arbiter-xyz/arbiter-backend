@@ -11,6 +11,7 @@ const SECURE_PROD = {
   NODE_ENV: 'production',
   SESSION_SECRET: 'a'.repeat(64),
   ALLOWED_ORIGINS: 'https://app.example.com',
+  METRICS_TOKEN: 'm'.repeat(32),
   REDIS_URL: 'rediss://default:pw@redis.example.com:6380',
 };
 
@@ -65,9 +66,9 @@ describe('evaluateSecurityPosture', () => {
     assert.deepEqual(result.findings, []);
   });
 
-  test('production with all three insecure defaults flags all three by name', () => {
+  test('production with all insecure defaults flags all of them by name', () => {
     const result = evaluateSecurityPosture({ NODE_ENV: 'production', REDIS_URL: 'redis://redis.example.com:6379' });
-    assert.deepEqual(settingsOf(result), ['ALLOWED_ORIGINS', 'REDIS_URL', 'SESSION_SECRET']);
+    assert.deepEqual(settingsOf(result), ['ALLOWED_ORIGINS', 'METRICS_TOKEN', 'REDIS_URL', 'SESSION_SECRET']);
   });
 
   test('SESSION_SECRET unset in production is fatal, and the message says why and how to fix it', () => {
@@ -79,13 +80,23 @@ describe('evaluateSecurityPosture', () => {
     assert.match(finding.message, /openssl rand -hex 32/);
   });
 
-  test('ALLOWED_ORIGINS unset, "*", or containing "*" in production is an error, not fatal', () => {
+  test('ALLOWED_ORIGINS unset, "*", or containing "*" in production is an error and calls out both CORS and checkout open-redirect API key leak risk (#226)', () => {
     for (const ALLOWED_ORIGINS of [undefined, '*', 'https://app.example.com, *']) {
       const findings = evaluateSecurityPosture({ ...SECURE_PROD, ALLOWED_ORIGINS }).findings;
       assert.equal(findings.length, 1, `ALLOWED_ORIGINS=${ALLOWED_ORIGINS}`);
       assert.equal(findings[0].setting, 'ALLOWED_ORIGINS');
       assert.equal(findings[0].severity, 'error');
+      assert.match(findings[0].message, /checkout redirect|raw API key/i);
     }
+  });
+
+  test('METRICS_TOKEN unset in production is an error (non-fatal warning) naming the /metrics exposure risk (#222)', () => {
+    const { METRICS_TOKEN, ...env } = SECURE_PROD;
+    const findings = evaluateSecurityPosture(env).findings;
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0].setting, 'METRICS_TOKEN');
+    assert.equal(findings[0].severity, 'error');
+    assert.match(findings[0].message, /\/metrics/);
   });
 
   test('a non-TLS REDIS_URL in production is an error; rediss:// passes', () => {
@@ -97,7 +108,7 @@ describe('evaluateSecurityPosture', () => {
   });
 
   test('a platform marker alone (no NODE_ENV) still catches a missing SESSION_SECRET', () => {
-    const result = evaluateSecurityPosture({ RENDER: 'true', ALLOWED_ORIGINS: 'https://app.example.com' });
+    const result = evaluateSecurityPosture({ RENDER: 'true', ALLOWED_ORIGINS: 'https://app.example.com', METRICS_TOKEN: 'tok' });
     assert.deepEqual(settingsOf(result), ['SESSION_SECRET']);
   });
 });
