@@ -110,9 +110,20 @@ export function evaluateSecurityPosture(env) {
       setting: 'ALLOWED_ORIGINS',
       severity: 'error',
       message:
-        `ALLOWED_ORIGINS is ${env.ALLOWED_ORIGINS ? `"${env.ALLOWED_ORIGINS}"` : 'unset (defaults to "*")'}, so CORS is wide open: ` +
-        'any website can call this API from a visitor\'s browser. ' +
+        `ALLOWED_ORIGINS is ${env.ALLOWED_ORIGINS ? `"${env.ALLOWED_ORIGINS}"` : 'unset (defaults to "*")'}, so CORS is wide open ` +
+        '(any website can call this API from a visitor\'s browser) and checkout redirect validation cannot safely allow redirects ' +
+        '(an open redirect on /billing/checkout successUrl leaks a freshly-minted raw API key). ' +
         'Set it to a comma-separated list of your real frontend origins, e.g. "https://app.example.com".',
+    });
+  }
+
+  if (!env.METRICS_TOKEN) {
+    findings.push({
+      setting: 'METRICS_TOKEN',
+      severity: 'error',
+      message:
+        'METRICS_TOKEN is not set, so GET /metrics is unauthenticated and exposes operational gauges (job throughput, admin-invocation counts, fiat-pool balance) to anyone who can reach this port. ' +
+        'Set METRICS_TOKEN to a bearer secret unless /metrics is strictly isolated on a private scrape network.',
     });
   }
 
