@@ -161,6 +161,7 @@ export const recoverySweepLastSuccess = new client.Gauge({
 export const recoverySweepFailuresTotal = new client.Counter({
   name: 'arbiter_recovery_sweep_failures_total',
   help: 'Recovery sweeps that could not complete their chain scan.',
+  labelNames: ['reason'],
   registers: [registry],
 });
 

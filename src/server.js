@@ -71,7 +71,6 @@ import {
   normalizeCode,
 } from './referrals.js';
 import { recordWorkerIp, noteAnswerTiming, listFlaggedPairs, getWorkerCollusionReport, clearPairFlag } from './collusion.js';
-import { store } from './store.js';
 import { getKnownJobIds, getJob } from './jobs.js';
 import {
   metricsMiddleware,
