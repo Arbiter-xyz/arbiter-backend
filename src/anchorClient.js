@@ -66,10 +66,6 @@ function asEndpointUrl(value) {
  * `withRetry` (which applies `withTimeout`) so a hanging third-party domain
  * rejects within the configured bound instead of hanging the request.
  */
-export function isAnchorConfigured() {
-  return Boolean(config.anchor.homeDomain);
-}
-
 export async function getAnchorConfig() {
   const now = Date.now();
   if (cache.value && cache.expiresAt > now) {
@@ -102,7 +98,7 @@ export async function getAnchorConfig() {
  * matching the same shape `getAnchorConfig()` returns. Kept in sync with the
  * cache so callers get a cheap synchronous check without re-fetching.
  */
-export function isAnchorConfigured(config) {
+export function isAnchorConfigured() {
   const value = cache.value;
   if (!value) {
     return Boolean(config?.anchor?.homeDomain);
