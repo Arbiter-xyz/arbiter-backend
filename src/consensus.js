@@ -60,14 +60,23 @@ const APPROX_PREFIX = /^(?:about|approximately|approx\.?|around|roughly|circa|ca
 const CURRENCY_SYMBOLS = /[$€£¥₹]/g;
 const PLAIN_NUMBER = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/;
 const THOUSANDS_GROUPED = /^[+-]?\d{1,3}(?:,\d{3})+(?:\.\d*)?$/;
+// European style: "." groups thousands, "," is the decimal mark ("1.234,56").
+const EU_THOUSANDS_GROUPED = /^[+-]?\d{1,3}(?:\.\d{3})+(?:,\d+)?$/;
+// Decimal comma with no grouping ("3,5"): only accepted when the integer part
+// is not a valid thousands group, so "1,234" stays ambiguous (see below).
+const DECIMAL_COMMA = /^[+-]?\d+,\d+$/;
 
 /**
  * Parses a worker's answer as a number, or returns null if it isn't one.
  * Handles an approximation prefix ("about", "~"), currency symbols, a
  * trailing percent sign ("42%" parses as 42, since every answer to one
- * question is presumably in the same unit), and comma thousands separators
- * in groups of three. A bare decimal comma ("3,5") is ambiguous and is NOT
- * parsed; it goes down the string path instead of risking a 1000x misread.
+ * question is presumably in the same unit), US comma thousands separators
+ * in groups of three, and European formatting where "." groups thousands and
+ * "," is the decimal mark ("1.234,56" -> 1234.56, "3,5" -> 3.5).
+ *
+ * Ambiguous inputs are deliberately NOT parsed and go down the string path
+ * instead of risking a 1000x misread: "1,234" (US thousands or EU decimal?)
+ * and "1.234" (US decimal or EU thousands?) both return null.
  */
 export function parseNumericAnswer(text) {
   if (typeof text !== 'string') return null;
@@ -78,6 +87,8 @@ export function parseNumericAnswer(text) {
   s = s.replace(/\.$/, ''); // trailing sentence period: "42."
   if (s.endsWith('%')) s = s.slice(0, -1);
   if (THOUSANDS_GROUPED.test(s)) s = s.replace(/,/g, '');
+  else if (EU_THOUSANDS_GROUPED.test(s)) s = s.replace(/\./g, '').replace(',', '.');
+  else if (DECIMAL_COMMA.test(s) && !THOUSANDS_GROUPED.test(s)) s = s.replace(',', '.');
   if (!PLAIN_NUMBER.test(s)) return null;
   const n = Number(s);
   return Number.isFinite(n) ? n : null;
