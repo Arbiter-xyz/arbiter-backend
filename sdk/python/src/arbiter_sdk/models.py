@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Dict, List, Literal, Optional
 
-TierKey = Literal["instant", "standard", "express", "priority"]
+TierKey = Literal["instant", "standard", "express", "priority", "auto"]
 JobStatus = Literal["holding", "awaiting_workers", "reconciling", "cancelling", "settled"]
 JobOutcome = Literal["resolved", "refunded", "refund_pending_timeout", "lost_race_to_timeout_refund"]
 SandboxSimulation = Literal["resolved", "disagreement", "no-answers"]
@@ -41,6 +41,9 @@ class Tier:
     amount_stroops: str
     quorum_size: int
     timeout_ms: int
+    escalating: bool = False
+    initial_quorum: Optional[int] = None
+    max_quorum: Optional[int] = None
     raw: Dict[str, Any] = field(repr=False, compare=False, default_factory=dict)
 
     @classmethod
@@ -52,6 +55,9 @@ class Tier:
             amount_stroops=d.get("amountStroops", ""),
             quorum_size=d.get("quorumSize", 0),
             timeout_ms=d.get("timeoutMs", 0),
+            escalating=bool(d.get("escalating", False)),
+            initial_quorum=d.get("initialQuorum"),
+            max_quorum=d.get("maxQuorum"),
             raw=d,
         )
 

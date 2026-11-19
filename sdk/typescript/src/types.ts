@@ -7,7 +7,7 @@
  * Unix epoch milliseconds.
  */
 
-export type TierKey = 'instant' | 'standard' | 'express' | 'priority';
+export type TierKey = 'instant' | 'standard' | 'express' | 'priority' | 'auto';
 
 /** One entry of pricing.js's listTiersForClient(). */
 export interface Tier {
@@ -17,6 +17,10 @@ export interface Tier {
   amountStroops: string;
   quorumSize: number;
   timeoutMs: number;
+  /** Present only on escalating tiers (e.g. `auto`). */
+  escalating?: true;
+  initialQuorum?: number;
+  maxQuorum?: number;
 }
 
 /** 402 body of POST /oracle with no payment (oracle.js's issueChallenge). */
