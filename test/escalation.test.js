@@ -11,6 +11,8 @@ import {
 } from '../src/dispatch.js';
 import { PRICING_TIERS, priceForTier, effectiveEscalatedPriceStroops, listTiersForClient } from '../src/pricing.js';
 import { reserveCredit, settleReservation, getCreditBalanceStroops } from '../src/billing.js';
+import { store } from '../src/store.js';
+import { writePresence, onlineWorkerCount } from '../src/dispatch.js';
 
 const base = { targetSize: 1, maxQuorum: 5, threshold: 0.8, singleConfidence: 0, allAgree: false };
 
@@ -64,6 +66,98 @@ test('established confidence is Laplace-smoothed and drops with misses', () => {
   assert.ok(singleAnswerConfidence({ matched: 5, total: 5 }, 5) >= 0.8);
   assert.ok(singleAnswerConfidence({ matched: 4, total: 5 }, 5) < 0.8);
   assert.ok(singleAnswerConfidence({ matched: 50, total: 50 }, 5) > singleAnswerConfidence({ matched: 5, total: 5 }, 5));
+});
+
+// ---- Redis-mode presence TTL (crashed worker must expire) ----------------
+
+// Minimal fake ioredis client: hashes with per-field TTLs (HEXPIRE) and
+// plain keys with EX TTLs, enough to prove writePresence() actually sets an
+// expiry on the entry readPresence() reads back.
+function fakeRedis({ hexpire = true } = {}) {
+  const hashes = new Map(); // key -> Map(field -> { value, expiresAt })
+  const keys = new Map(); // key -> { value, expiresAt }
+  const now = () => Date.now();
+  const live = (entry) => entry && (!entry.expiresAt || entry.expiresAt > now());
+  const client = {
+    hashes,
+    keys,
+    async hset(key, field, value) {
+      const hash = hashes.get(key) || new Map();
+      const prev = hash.get(field);
+      hash.set(field, { value, expiresAt: live(prev) ? prev.expiresAt : null });
+      hashes.set(key, hash);
+      return 1;
+    },
+    async hgetall(key) {
+      const out = {};
+      for (const [field, entry] of hashes.get(key) || []) {
+        if (live(entry)) out[field] = entry.value;
+      }
+      return out;
+    },
+    async hdel(key, field) {
+      hashes.get(key)?.delete(field);
+    },
+    async set(key, value, _ex, seconds) {
+      keys.set(key, { value, expiresAt: now() + seconds * 1000 });
+      return 'OK';
+    },
+    async get(key) {
+      const entry = keys.get(key);
+      return live(entry) ? entry.value : null;
+    },
+    async del(key) {
+      keys.delete(key);
+    },
+    async keys(pattern) {
+      const prefix = pattern.replace(/\*$/, '');
+      return [...keys.keys()].filter((k) => k.startsWith(prefix) && live(keys.get(k)));
+    },
+  };
+  if (hexpire) {
+    client.hexpire = async (key, seconds, _mod, _n, field) => {
+      const entry = hashes.get(key)?.get(field);
+      if (!entry) return 0;
+      entry.expiresAt = now() + seconds * 1000;
+      return 1;
+    };
+  }
+  return client;
+}
+
+async function withRedisClient(client, fn) {
+  const original = store.getClient;
+  store.getClient = () => client;
+  try {
+    return await fn();
+  } finally {
+    store.getClient = original;
+  }
+}
+
+test('Redis mode: writePresence sets a TTL on the hash field so a crashed worker expires', async () => {
+  const client = fakeRedis();
+  await withRedisClient(client, async () => {
+    await writePresence('crashed-worker', ['general']);
+    assert.equal(await onlineWorkerCount(), 1);
+    const field = client.hashes.get('presence:workers').get('crashed-worker');
+    assert.ok(field.expiresAt, 'the presence hash field must carry a TTL');
+    // Simulate the TTL elapsing with no graceful unregister (crashed worker).
+    field.expiresAt = Date.now() - 1;
+    assert.equal(await onlineWorkerCount(), 0);
+  });
+});
+
+test('Redis mode without HEXPIRE: presence falls back to an expiring per-worker key', async () => {
+  const client = fakeRedis({ hexpire: false });
+  await withRedisClient(client, async () => {
+    await writePresence('crashed-worker-2', ['general']);
+    assert.equal(await onlineWorkerCount(), 1);
+    const entry = client.keys.get('presence:crashed-worker-2');
+    assert.ok(entry && entry.expiresAt, 'the per-worker presence key must carry a TTL');
+    entry.expiresAt = Date.now() - 1;
+    assert.equal(await onlineWorkerCount(), 0);
+  });
 });
 
 // ---- dispatchEscalating end to end (fake SSE workers, real state machine) -
