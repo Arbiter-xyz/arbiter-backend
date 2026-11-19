@@ -232,15 +232,19 @@ const signerLock = createSignerLock({
 });
 
 function invokeAsAdmin(method, scValArgs) {
-  return serializeAdminCall(() => signerLock.run(() => runInvokeAsAdmin(method, scValArgs))).then(
+  const startedAt = Date.now();
+  return enqueueAdminCall(() => signerLock.run(() => runInvokeAsAdmin(method, scValArgs))).then(
     (result) => {
       recordAdminInvocation(method, true);
       return result;
-    } catch (err) {
-      recordAdminInvocation(method, 'failure', Date.now() - startedAt);
+    },
+    (err) => {
+      // startedAt is captured before the call so the failure path can report
+      // how long the admin invocation ran before it failed.
+      recordAdminInvocation(method, false, Date.now() - startedAt);
       throw err;
-    }
-  });
+    },
+  );
 }
 
 /** Reads a contract method via simulation (no submission, no signing). */
