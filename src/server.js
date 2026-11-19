@@ -71,7 +71,6 @@ import {
   normalizeCode,
 } from './referrals.js';
 import { recordWorkerIp, noteAnswerTiming, listFlaggedPairs, getWorkerCollusionReport, clearPairFlag } from './collusion.js';
-import { store } from './store.js';
 import { getKnownJobIds, getJob } from './jobs.js';
 import {
   metricsMiddleware,
@@ -1389,7 +1388,7 @@ app.post('/admin/collusion/clear', requireAdmin, async (req, res) => {
 // ---------------------------------------------------------------------
 
 app.get('/anchor/config', async (req, res) => {
-  if (!isAnchorConfigured()) {
+  if (!isAnchorConfigured(config)) {
     return res.status(503).json({ error: 'no fiat anchor is configured on this server (ANCHOR_HOME_DOMAIN unset)' });
   }
   try {
