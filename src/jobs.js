@@ -322,6 +322,7 @@ export async function markPendingReview(jobId, extra = {}) {
     updatedAt: Date.now(),
   };
   await store.set(key, next, config.jobResultTtlMs);
+  await indexReview(jobId);
   return true;
 }
 
