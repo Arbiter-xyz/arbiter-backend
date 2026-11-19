@@ -341,3 +341,45 @@ test('startFulfillment persists recruited count + effective price on the job and
   assert.equal(job.effectiveAmountStroops, (auto.priceStroops / 5n).toString());
   assert.equal(hookValue, auto.priceStroops / 5n);
 });
+
+// ---- crash recovery reads the real job fields (issue #272) --------------
+
+test('recoverInFlightJobs distinguishes terminal from in-flight jobs by status', async () => {
+  const { createJob, updateJob, getJob } = await import('../src/jobs.js');
+  const { isTerminalJob, reconcileJob, recoverInFlightJobs } = await import('../src/reconcile.js');
+
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const settledId = `crash-settled-${suffix}`;
+  const refundedId = `crash-refunded-${suffix}`;
+  const inFlightId = `crash-inflight-${suffix}`;
+  const reviewId = `crash-review-${suffix}`;
+
+  await createJob(settledId, { questionId: settledId });
+  await updateJob(settledId, { status: 'settled', outcome: 'resolved' });
+  await createJob(refundedId, { questionId: refundedId });
+  await updateJob(refundedId, { status: 'settled', outcome: 'refunded' });
+  await createJob(inFlightId, { questionId: inFlightId });
+  await updateJob(inFlightId, { status: 'reconciling' });
+  await createJob(reviewId, { questionId: reviewId });
+  await updateJob(reviewId, { status: 'pending_review' });
+
+  assert.equal(isTerminalJob(await getJob(settledId)), true);
+  assert.equal(isTerminalJob(await getJob(refundedId)), true);
+  assert.equal(isTerminalJob(await getJob(inFlightId)), false);
+  assert.equal(isTerminalJob(await getJob(reviewId)), false);
+  assert.equal(isTerminalJob(null), false);
+
+  assert.deepEqual(reconcileJob(await getJob(settledId)), { action: 'skip', outcome: 'resolved' });
+  assert.deepEqual(reconcileJob(await getJob(inFlightId)), { action: 'reconcile', status: 'reconciling' });
+  assert.deepEqual(reconcileJob(undefined), { action: 'drop' });
+
+  const recovered = await recoverInFlightJobs(
+    [settledId, refundedId, inFlightId, reviewId, `crash-missing-${suffix}`],
+    getJob,
+  );
+  assert.deepEqual(
+    recovered.map((r) => r.jobId),
+    [inFlightId, reviewId],
+    'only non-terminal jobs are re-checked after a crash',
+  );
+});
