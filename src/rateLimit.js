@@ -105,7 +105,11 @@ export async function settleClaudeBudget(reservedCents, actualCents) {
   if (delta > 0) {
     await store.incr(key, windowMs, delta);
   } else {
-    await store.decr(key, -delta);
+    // Refund the over-estimate with a negative delta. incrBy is durable (no
+    // TTL), so re-apply the window TTL to keep the rolling-window aging-out
+    // behaviour the reservation's incr() established.
+    await store.incrBy(key, delta);
+    await store.set(key, await store.get(key), windowMs);
   }
 }
 
