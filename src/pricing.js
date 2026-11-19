@@ -31,6 +31,18 @@ export const PRICING_TIERS = Object.freeze(
     express: Object.freeze({ key: 'express', instant: false, quorumSize: 2, timeoutMs: 12_000, preferEstablished: false, priceStroops: 4_000_000n }),
     // Priority buys the highest-confidence consensus: route to proven workers first.
     priority: Object.freeze({ key: 'priority', instant: false, quorumSize: 5, timeoutMs: 30_000, preferEstablished: true, priceStroops: 6_000_000n }),
+    // auto: variable-quorum tier. Quoted at the ceiling (the full maxQuorum
+    // price, same per-worker rate as priority) and charged proportionally to
+    // the workers actually recruited — see effectiveEscalatedPriceStroops().
+    auto: Object.freeze({
+      key: 'auto',
+      instant: false,
+      quorumSize: 5,
+      timeoutMs: 30_000,
+      preferEstablished: false,
+      priceStroops: 6_000_000n,
+      escalation: Object.freeze({ initialQuorum: 1, maxQuorum: 5 }),
+    }),
   }),
 );
 
@@ -152,6 +164,7 @@ export const TIER_TIMEOUT_MS = Object.freeze(
     standard: 45_000,
     express: 12_000,
     priority: 30_000,
+    auto: 30_000,
   }),
 );
 
@@ -238,9 +251,16 @@ export function effectiveEscalatedPriceStroops(tier, recruitedWorkers) {
   return (tier.priceStroops * BigInt(n)) / BigInt(maxQuorum);
 }
 
+/**
+ * Client-facing tier catalogue (the `tiers` array of the 402 challenge and
+ * the metered quote). Escalating tiers additionally advertise their quorum
+ * range so a payer can see the ceiling they're quoted at and the floor they
+ * may be charged.
+ */
 export function listTiersForClient() {
   return Object.values(PRICING_TIERS).map((t) => ({
     key: t.key,
+    label: t.key,
     amount: stroopsToUsdc(t.priceStroops),
     amountStroops: t.priceStroops.toString(),
     quorumSize: t.quorumSize,
