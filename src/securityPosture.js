@@ -72,11 +72,13 @@ export function productionSignals(env) {
  * with every default left alone gets an empty list, never noise.
  *
  * Severity, per setting:
- * - SESSION_SECRET unset → fatal. The fallback secret is random per process,
+ * - SESSION_SECRET unset → error. The fallback secret is random per process,
  *   so with more than one replica, sessions issued by one instance are
  *   rejected by every other, and every deploy/restart signs out every
  *   worker and payer. It's never correct in production, and the fix is one
- *   line (`openssl rand -hex 32`).
+ *   line (`openssl rand -hex 32`) — but refusing to start would take a
+ *   deployment down over a setting whose only effect is session churn, so
+ *   it's logged loudly instead (see #419: the fatal check broke boot).
  * - ALLOWED_ORIGINS wide open → error. This API authenticates with bearer
  *   tokens and session tokens, never cookies, so wildcard CORS doesn't hand
  *   a malicious site anyone's credentials. It does let any origin script
@@ -96,7 +98,7 @@ export function evaluateSecurityPosture(env) {
   if (!env.SESSION_SECRET) {
     findings.push({
       setting: 'SESSION_SECRET',
-      severity: 'fatal',
+      severity: 'error',
       message:
         'SESSION_SECRET is not set, so worker/payer session tokens are signed with a random per-process secret: ' +
         'every restart signs everyone out, and replicas reject each other\'s tokens. ' +
@@ -145,7 +147,8 @@ export function evaluateSecurityPosture(env) {
 /**
  * Runs the check against `env`, logs every finding through `log`, and
  * returns `false` if any finding is fatal (the caller should then exit
- * non-zero instead of starting the server).
+ * non-zero instead of starting the server). No finding is fatal today, so
+ * this always returns `true`; the mechanism stays for future checks.
  */
 export function enforceSecurityPosture(env, log) {
   const { production, signals, findings } = evaluateSecurityPosture(env);
