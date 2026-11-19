@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { isAnchorConfigured, getAnchorConfig } from '../src/anchorClient.js';
+import { config } from '../src/config.js';
 import {
   recordAnchorTransaction,
   getAnchorTransactions,
@@ -16,7 +17,7 @@ function uniqueAddress(prefix) {
 }
 
 test('isAnchorConfigured is false by default (ANCHOR_HOME_DOMAIN unset, see backend/.env.example)', () => {
-  assert.equal(isAnchorConfigured(), false);
+  assert.equal(isAnchorConfigured(config), false);
 });
 
 test('getAnchorConfig rejects within the configured bound when the stellar.toml resolve hangs', async () => {
