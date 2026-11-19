@@ -262,6 +262,18 @@ function fiatToStroops(amount, currency) {
 }
 
 /**
+ * Reads the minor-unit multiplier snapshotted at checkout creation. Orders
+ * created before the snapshot existed fall back to the currency's current
+ * minorUnits (USD-only today, so 100 — the value the old hardcoded `* 100`
+ * assumed), never to a bare literal.
+ */
+function snapshotMinorUnits(snapshot) {
+  const snapshotted = Number(snapshot?.minorUnits);
+  if (Number.isFinite(snapshotted) && snapshotted > 0) return snapshotted;
+  return resolveCurrency(snapshot?.currency || 'usd').minorUnits;
+}
+
+/**
  * Stripe processor — the original concrete implementation of the
  * processor-agnostic interface. Behavior is unchanged from before the
  * abstraction: same account creation, same session metadata snapshot, same
@@ -352,7 +364,7 @@ const paypalProcessor = {
     if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
       throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
     }
-    const { code, usdPerUnit } = resolveCurrency(currency);
+    const { code, minorUnits, usdPerUnit } = resolveCurrency(currency);
     const { accountId, rawKey } = await createAccount();
 
     const auth = Buffer.from(
@@ -379,11 +391,14 @@ const paypalProcessor = {
     const order = await res.json();
     const approve = (order.links || []).find((l) => l.rel === 'approve');
     if (!approve) throw new Error('paypal order missing approve link');
-    // Snapshot the FX rate so the webhook credits at the rate the customer saw.
+    // Snapshot the FX rate and minor-unit multiplier so the webhook credits
+    // at the rate the customer saw, in the currency they actually paid in.
     await store.set(`paypal-order:${order.id}`, {
       accountId,
       stroopsPerUnit: String(fiatToStroops(1, code)),
       usdPerUnit: String(usdPerUnit),
+      minorUnits,
+      currency: code,
     });
     return { checkoutUrl: approve.href };
   },
@@ -422,7 +437,8 @@ const paypalProcessor = {
     if (!accountId || !orderId) return null;
     const snapshot = await store.get(`paypal-order:${orderId}`);
     if (!snapshot) return null;
-    const stroops = BigInt(snapshot.stroopsPerUnit) * BigInt(Math.round(Number(resource.amount?.value || 0) * 100));
+    const minorUnits = snapshotMinorUnits(snapshot);
+    const stroops = BigInt(snapshot.stroopsPerUnit) * BigInt(Math.round(Number(resource.amount?.value || 0) * minorUnits));
     return { id: event.id, type: event.event_type, accountId, stroops };
   },
 };
@@ -444,7 +460,7 @@ const coinbaseProcessor = {
     if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
       throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
     }
-    const { code, usdPerUnit } = resolveCurrency(currency);
+    const { code, minorUnits, usdPerUnit } = resolveCurrency(currency);
     const { accountId, rawKey } = await createAccount();
 
     const res = await fetch('https://api.commerce.coinbase.com/charges', {
@@ -469,6 +485,8 @@ const coinbaseProcessor = {
       accountId,
       stroopsPerUnit: String(fiatToStroops(1, code)),
       usdPerUnit: String(usdPerUnit),
+      minorUnits,
+      currency: code,
     });
     return { checkoutUrl: data.hosted_url };
   },
@@ -497,7 +515,8 @@ const coinbaseProcessor = {
     if (!accountId) return null;
     const snapshot = await store.get(`coinbase-charge:${charge.id}`);
     if (!snapshot) return null;
-    const stroops = BigInt(snapshot.stroopsPerUnit) * BigInt(Math.round(Number(charge.pricing?.local?.amount || 0) * 100));
+    const minorUnits = snapshotMinorUnits(snapshot);
+    const stroops = BigInt(snapshot.stroopsPerUnit) * BigInt(Math.round(Number(charge.pricing?.local?.amount || 0) * minorUnits));
     return { id: event.id, type: event.event.type, accountId, stroops };
   },
 };
