@@ -77,6 +77,21 @@ own integration against the developer sandbox:
 This keeps your integration independent of Arbiter's platform key and of
 any single hot key's funding.
 
+## Teams and member roles
+
+Team/organization accounts (`teams.js`) are a named group of Stellar
+addresses that can see each other's question history and spend in one
+place. A team adds no new credential: it is a membership list over
+existing identities, so every member keeps paying from, and owning, their
+own address. Roles, strongest first:
+
+- **owner** — exactly one per team. Everything an admin can do, plus
+  promoting/demoting admins, transferring ownership, and deleting the
+  team. Can't leave or be removed without first transferring ownership, so
+  a team is never ownerless.
+- **admin** — add and remove plain members, rename the team.
+- **member** — read the team and its combined question history; leave.
+
 ## Static frontend hosting (`SERVE_STATIC_APP`)
 
 By default the backend also serves the built worker-console/dashboard/
