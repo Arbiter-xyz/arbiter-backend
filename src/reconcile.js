@@ -158,27 +158,6 @@ const QUORUM_PREDICTION_CONFIG = {
   veryLongQuestionTokens: 120,
 };
 
-let anthropicClient = null;
-export function getClient() {
-  if (!config.anthropicApiKey) return null;
-  if (!anthropicClient) {
-    // The SDK's own defaults (2 retries, but a 10-MINUTE timeout) are tuned
-    // for long-running batch/agentic use, not a call sitting in the
-    // critical path of settling a question with a fail-closed fallback
-    // waiting behind it. Keep the SDK's built-in retry (it already handles
-    // backoff + which errors are retryable correctly) but cut the ceiling
-    // down to something that fails fast enough to still hit the
-    // deterministic vote fallback promptly if Claude is genuinely down.
-    anthropicClient = new Anthropic({ apiKey: config.anthropicApiKey, timeout: 15_000, maxRetries: 2 });
-  }
-
-  // Clamp: floor is at least 1 so the finish condition can always be met.
-  const min = Math.max(1, Math.floor(cfg.min));
-  const max = Math.max(min, Math.floor(cfg.max));
-  const clamped = Math.min(max, Math.max(min, Math.round(score)));
-  return clamped;
-}
-
 async function reconcileWithClaude(question, submissions, rule = null) {
   const { consensus, confidence, matchingWorkerIds, llm } = await llmProvider.reportConsensus(question, submissions, rule);
   assertMatchingWorkerIdsAreReal(matchingWorkerIds, submissions, question?.id);

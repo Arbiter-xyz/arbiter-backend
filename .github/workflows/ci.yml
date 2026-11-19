@@ -18,6 +18,13 @@ jobs:
         with:
           node-version: 22
       - run: node scripts/check-env-example.js
+      - name: Parse every file under src/
+        run: |
+          status=0
+          for file in src/*.js; do
+            node --check "$file" || status=1
+          done
+          exit $status
       - name: Unit tests for the dependency-free modules
         run: node --test test/envExample.test.js test/payerReferrals.test.js test/replicaStore.test.js test/canary.test.js
 
