@@ -208,4 +208,57 @@ export async function sweepPendingQuestions(deps, options = {}) {
       const { hash } = await deps.refund(questionId);
       item.result = 'ok';
       item.refundTx = hash;
-      await deps.recordRefund(questionId, { reason, hash,
+      await deps.recordRefund(questionId, { reason, hash, question: fresh, job });
+    } catch (err) {
+      item.result = 'error';
+      item.error = err?.message ?? String(err);
+      logger.error({ err, questionId }, 'disaster recovery: failed to process pending question');
+    }
+  }
+
+  const refunded = items.filter((i) => i.result === 'ok').length;
+  const actionable = items.filter((i) => i.action === 'refund').length;
+  recoveryActionable.set(actionable);
+  if (!opts.dryRun) recoverySweepLastSuccess.set(Date.now() / 1000);
+
+  return {
+    startedAt,
+    finishedAt: Date.now(),
+    consistent: true,
+    scanned: snapshot.ids.length,
+    items,
+    refundsAttempted,
+    refunded,
+  };
+}
+
+/**
+ * Production dependency wiring for sweepPendingQuestions(), built from the
+ * chain client and the local store. Kept here (not in server.js) so the CLI
+ * (scripts/dr-sweep.js) and the in-process sweeper share one definition.
+ */
+export function defaultRecoveryDeps({ getPendingCount, listPending, getQuestion, getLatestLedger, getJob, getStash, refund, recordRefund }) {
+  return { getPendingCount, listPending, getQuestion, getLatestLedger, getJob, getStash, refund, recordRefund };
+}
+
+/**
+ * Runs the sweep on an interval. Never throws out of the timer: a failed
+ * sweep is counted and logged, and the next tick retries.
+ */
+export function startRecoverySweeper(deps, { intervalMs = 5 * 60 * 1000, options = {} } = {}) {
+  const run = async () => {
+    try {
+      return await sweepPendingQuestions(deps, options);
+    } catch (err) {
+      recoverySweepFailuresTotal.inc({ reason: 'sweep_error' });
+      logger.error({ err }, 'disaster recovery: sweep failed');
+      return null;
+    }
+  };
+  const timer = setInterval(run, intervalMs);
+  if (typeof timer.unref === 'function') timer.unref();
+  return { run, stop: () => clearInterval(timer) };
+}
+
+/** Alias kept for callers that refer to the sweep by its runbook name. */
+export const runRecoverySweep = sweepPendingQuestions;

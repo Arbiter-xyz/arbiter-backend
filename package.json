@@ -7,7 +7,7 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "check": "node --check src/*.js scripts/*.js",
-    "test": "node --test --test-timeout=30000"
+    "test": "node --test --test-timeout=30000 test/"
   },
   "keywords": [],
   "author": "",
