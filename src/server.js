@@ -115,9 +115,9 @@ import { startHealthProbes } from './healthProbes.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Refuse to boot a real deployment that left a severe insecure default in
-// place, and log loudly about the rest — see securityPosture.js. Local dev
-// with every default untouched passes silently.
+// Log loudly about a real deployment that left a severe insecure default in
+// place — see securityPosture.js. Local dev with every default untouched
+// passes silently. No finding is fatal today, so this never blocks boot.
 if (!enforceSecurityPosture(process.env, logger)) {
   console.error('[security-posture] refusing to start: fix the setting(s) named above.');
   await new Promise((resolve) => logger.flush(resolve));
