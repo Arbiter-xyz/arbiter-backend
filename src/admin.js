@@ -1,5 +1,5 @@
 import { StrKey } from '@stellar/stellar-sdk';
-import { getKnownJobIds } from './jobs.js';
+import { getKnownJobIds, getJob } from './jobs.js';
 import { getKnownWorkerIds, getReputation } from './dispatch.js';
 import { getKnownPayerAddresses, getPayerQuestionIds, summarizePayerQuestions, evaluateLoyaltyTier } from './payerIndex.js';
 import { getKnownAnchorAddresses, getAnchorTransactions, getAnchorKyc } from './anchorRecords.js';
@@ -9,6 +9,8 @@ import { config } from './config.js';
 import { stroopsToUsdc } from './pricing.js';
 import { getClient } from './reconcile.js';
 import { store } from './store.js';
+
+const readStore = store;
 import { createAccount, unsuspendAccount } from './billing.js';
 
 const PLATFORM_FEE_BPS = 2000n; // mirrors contracts/oracle-escrow/src/lib.rs's PLATFORM_FEE_BPS

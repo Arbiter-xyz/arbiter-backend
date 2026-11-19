@@ -6,6 +6,7 @@ import {
   withinTolerance,
   largestToleranceCluster,
   numericToleranceVote,
+  DEFAULT_CONSENSUS_MODE,
 } from '../src/consensus.js';
 import { reconcile, groupByNormalizedAnswer } from '../src/reconcile.js';
 import { startFulfillment, getJobStatus, issueChallenge, consensusRuleFromPending } from '../src/oracle.js';
@@ -236,6 +237,13 @@ test('issueChallenge stashes a non-default rule and echoes it; the default leave
   const plainStash = await getStashedQuestion(plain.questionId);
   assert.equal('consensusMode' in plainStash, false);
   assert.equal(consensusRuleFromPending(plainStash), null);
+});
+
+test('consensusRuleFromPending falls back to the default rule without throwing', () => {
+  assert.equal(consensusRuleFromPending(undefined), null);
+  assert.equal(consensusRuleFromPending(null), null);
+  assert.equal(consensusRuleFromPending({}), null);
+  assert.equal(consensusRuleFromPending({ consensusMode: DEFAULT_CONSENSUS_MODE }), null);
 });
 
 async function waitForSettled(jobId, timeoutMs = 10_000) {
