@@ -201,6 +201,42 @@ export async function deliverWithRetry(target, event, options = {}) {
       return { ok: true, attempts: attempt, status: lastStatus };
     }
     if (lastStatus === 410) {
-      log.warn
+      log.warn({ attempt, status: lastStatus }, 'webhook receiver answered 410 Gone; deactivating registration');
+      await deactivateWebhook(target.id, 'receiver answered 410 Gone').catch(() => {});
+      await recordDelivery(target.id, { lastAttemptAt: at, lastStatus, lastError: null, lastEventId: event.id, outcome: 'failed' }).catch(() => {});
+      return { ok: false, attempts: attempt, status: lastStatus };
+    }
 
-/* … truncated 2029 chars — edit only what you need near the top … */
+    await recordDelivery(target.id, { lastAttemptAt: at, lastStatus, lastError, lastEventId: event.id }).catch(() => {});
+
+    if (attempt < maxAttempts) {
+      const delay = backoffDelayMs(attempt, baseDelayMs);
+      log.warn({ attempt, status: lastStatus, error: lastError, retryInMs: delay }, 'webhook delivery failed; retrying');
+      await sleep(delay);
+    }
+  }
+
+  log.warn({ attempts: maxAttempts, status: lastStatus, error: lastError }, 'webhook retry abandoned');
+  await recordDelivery(target.id, { lastAttemptAt: Date.now(), lastStatus, lastError, lastEventId: event.id, outcome: 'failed' }).catch(() => {});
+  return { ok: false, attempts: maxAttempts, status: lastStatus };
+}
+
+/**
+ * Fire-and-forget: queues one settlement event for every active registration
+ * owned by the job's payer/customer. Returns synchronously and never throws.
+ */
+export function enqueueSettlementWebhooks(jobId, job) {
+  const event = buildSettlementEvent(jobId, job);
+  resolveJobOwner(jobId, job)
+    .then((owner) => getDeliveryTargets(owner))
+    .then((targets) => {
+      for (const target of targets) {
+        deliverWithRetry(target, event).catch((err) => {
+          logger.warn({ err, webhookId: target.id, eventId: event.id }, 'webhook delivery task failed');
+        });
+      }
+    })
+    .catch((err) => {
+      logger.warn({ err, eventId: event.id }, 'failed to resolve settlement webhook targets');
+    });
+}
