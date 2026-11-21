@@ -235,6 +235,65 @@ export async function checkAutoWithdraw(workerAddress) {
   }
 }
 
+/** Settlement hook (oracle.js): runs checkAutoWithdraw() for each worker
+ * just credited. Best-effort — one worker's failure never affects another. */
+export async function checkAutoWithdrawForWorkers(workerAddresses = []) {
+  await Promise.all(
+    workerAddresses.map((workerAddress) =>
+      checkAutoWithdraw(workerAddress).catch((err) => {
+        logger.warn({ err, workerAddress }, 'auto-withdraw: post-settlement check failed');
+      }),
+    ),
+  );
+}
+
+/**
+ * The worker (or an agent holding their key) signs the pending transaction
+ * and posts it back here. Validates the pending record, fee-bumps it through
+ * the same relay as /sponsor/withdraw (so the worker needs zero XLM),
+ * records the withdrawal in the earnings ledger, and clears the pending
+ * record so a stale one can't be submitted twice.
+ */
+export async function submitAutoWithdraw(workerAddress, signedXdr) {
+  if (!StrKey.isValidEd25519PublicKey(workerAddress)) {
+    throw new AutoWithdrawError('auto-withdraw needs a real Stellar worker address');
+  }
+  if (typeof signedXdr !== 'string' || signedXdr.length === 0) {
+    throw new AutoWithdrawError('signedXdr is required');
+  }
+
+  const pending = await store.get(PENDING_PREFIX + workerAddress);
+  if (!pending) {
+    throw new AutoWithdrawError('no pending auto-withdraw transaction for this worker', 404);
+  }
+  if (pending.expiresAt && Date.now() > pending.expiresAt) {
+    await store.delete(PENDING_PREFIX + workerAddress);
+    throw new AutoWithdrawError('pending auto-withdraw transaction has expired; request a fresh one', 410);
+  }
+
+  const amountStroops = BigInt(pending.amountStroops);
+  const beneficiaryAddress = pending.beneficiaryAddress || null;
+
+  const { hash } = beneficiaryAddress
+    ? await feeBumpWithdrawTo(signedXdr, workerAddress, beneficiaryAddress, amountStroops)
+    : await feeBumpWithdraw(signedXdr, workerAddress, amountStroops);
+
+  await recordWorkerWithdrawal(workerAddress, {
+    amountStroops,
+    txHash: hash,
+    beneficiaryAddress,
+    auto: true,
+  });
+  await store.delete(PENDING_PREFIX + workerAddress);
+
+  return {
+    hash,
+    amountStroops: amountStroops.toString(),
+    amount: stroopsToUsdc(amountStroops),
+    beneficiaryAddress,
+  };
+}
+
 /**
  * Periodic backstop: checks every opted-in worker. Runs with bounded
  * concurrency (SWEEP_CONCURRENCY) so wall-clock time stays roughly flat as
@@ -265,4 +324,31 @@ export async function sweepAutoWithdraw() {
   await Promise.all(Array.from({ length: lanes }, () => runWorker()));
 
   return { checked: workers.length, prepared };
+}
+
+/**
+ * Schedules sweepAutoWithdraw() on config.autoWithdraw.sweepIntervalMs.
+ * Returns a stop() for tests and graceful shutdown. Ticks never overlap: a
+ * sweep still in flight makes the next tick a no-op.
+ */
+export function startAutoWithdrawSweep({ intervalMs = config.autoWithdraw.sweepIntervalMs } = {}) {
+  let running = false;
+  const run = async () => {
+    if (running) {
+      logger.warn('auto-withdraw sweep still running, skipping tick');
+      return;
+    }
+    running = true;
+    try {
+      await sweepAutoWithdraw();
+    } catch (err) {
+      logger.error({ err }, 'auto-withdraw sweep failed');
+    } finally {
+      running = false;
+    }
+  };
+  run();
+  const timer = setInterval(run, intervalMs);
+  timer.unref();
+  return () => clearInterval(timer);
 }
