@@ -19,7 +19,7 @@ import { store } from './store.js';
 import { buildProvenanceRecord, saveProvenance, attachSettlement } from './provenance.js';
 import { config } from './config.js';
 import { undoWindowFor, holdThenDispatch, cancelHeld } from './undoWindow.js';
-import { verifySession } from './workerAuth.js';
+import { verifySession, requiresAuth } from './workerAuth.js';
 import { restoreCredit } from './billing.js';
 import { recordWorkerCredits } from './earnings.js';
 import { checkAutoWithdrawForWorkers } from './autoWithdraw.js';
@@ -657,7 +657,16 @@ async function settleResolved(questionId, submissions, result) {
     const matchingSet = new Set(result.matchingWorkerIds);
     const losingWorkerIds = submissions.map((s) => s.workerId).filter((id) => !matchingSet.has(id));
 
-    const { hash } = await resolveQuestion(questionId, result.matchingWorkerIds, losingWorkerIds);
+    // resolve() takes Vec<Address>, so only real Stellar addresses can be
+    // settled on-chain. A workerId that isn't a valid address (the
+    // no-signup convenience path, see workerAuth.js) can never hold stake or
+    // withdraw, so it is left out of the on-chain payout set rather than
+    // making the whole resolve() call throw.
+    const { hash } = await resolveQuestion(
+      questionId,
+      result.matchingWorkerIds.filter(requiresAuth),
+      losingWorkerIds.filter(requiresAuth),
+    );
     await recordReputationOutcomes(questionId, submissions, result.matchingWorkerIds);
     await dropStashedQuestion(questionId);
     await incrementStat('resolved');

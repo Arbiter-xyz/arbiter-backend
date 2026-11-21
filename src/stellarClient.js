@@ -206,7 +206,7 @@ async function runInvokeAsAdmin(method, scValArgs) {
  * for the *chain* (so one failed call can't poison every subsequent
  * call) while still being propagated to that task's own caller.
  */
-function createSerialQueue() {
+export function createSerialQueue() {
   let tail = Promise.resolve();
   return function enqueue(task) {
     const run = tail.then(task, task);
@@ -218,7 +218,7 @@ function createSerialQueue() {
   };
 }
 
-const enqueueAdminCall = createSerialQueue();
+const serializeAdminCall = createSerialQueue();
 
 // The serial queue above only orders calls within this process. The signer
 // lock extends that across instances (canary.js): a canary never signs, and
@@ -267,8 +267,12 @@ export async function simulateRead(method, scValArgs = []) {
 }
 
 /** Settles a single question on-chain as the platform admin. */
-export async function resolveQuestion(questionId, matchingPool, losingPool) {
-  return invokeAsAdmin('resolve', [u64Arg(questionId), i128Arg(matchingPool), i128Arg(losingPool)]);
+export async function resolveQuestion(questionId, matchingWorkerAddresses, losingWorkerAddresses) {
+  return invokeAsAdmin('resolve', [
+    u64Arg(questionId),
+    vecOfAddresses(matchingWorkerAddresses),
+    vecOfAddresses(losingWorkerAddresses),
+  ]);
 }
 
 /** Refunds a single question on-chain as the platform admin. */
