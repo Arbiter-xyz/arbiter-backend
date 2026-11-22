@@ -142,7 +142,11 @@ export function startHealthProbes({
     every(intervalMs, () => probeStore(store)),
     every(intervalMs, () => probeChain(getLatestLedgerSequence)),
     every(intervalMs, async () => onlineWorkers.set(await getOnlineWorkerCount())),
-    every(jobScanIntervalMs, () => probeJobs({ getKnownJobIds, getJob })),
+    // The job scan walks every indexed job and can take longer than
+    // jobScanIntervalMs under a large index; everyNoOverlap() (not every())
+    // skips a tick instead of starting a second scan on top of one still in
+    // flight, so slow scans can't pile up concurrently.
+    everyNoOverlap(jobScanIntervalMs, () => probeJobs({ getKnownJobIds, getJob })),
   ];
   return () => timers.forEach(clearInterval);
 }

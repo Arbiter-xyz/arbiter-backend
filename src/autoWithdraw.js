@@ -207,12 +207,15 @@ export async function checkAutoWithdraw(workerAddress) {
       return { status: 'below_threshold', owedStroops: owed.toString(), thresholdStroops: threshold.toString() };
     }
 
-    const { xdr, expiresAt } = await buildWorkerWithdrawTx(workerAddress, owed, settings.beneficiaryAddress);
+    const ttlMs = config.autoWithdraw.pendingTtlMs;
+    const xdr = await buildWorkerWithdrawTx(workerAddress, owed, settings.beneficiaryAddress, Math.floor(ttlMs / 1000));
+    const now = Date.now();
+    const expiresAt = now + ttlMs;
     const record = {
       xdr,
       amountStroops: owed.toString(),
       beneficiaryAddress: settings.beneficiaryAddress || null,
-      createdAt: Date.now(),
+      createdAt: now,
       expiresAt,
     };
     await store.set(PENDING_PREFIX + workerAddress, record);
@@ -235,25 +238,11 @@ export async function checkAutoWithdraw(workerAddress) {
   }
 }
 
-/** Settlement hook (oracle.js): runs checkAutoWithdraw() for each worker
- * just credited. Best-effort — one worker's failure never affects another. */
-export async function checkAutoWithdrawForWorkers(workerAddresses = []) {
-  await Promise.all(
-    workerAddresses.map((workerAddress) =>
-      checkAutoWithdraw(workerAddress).catch((err) => {
-        logger.warn({ err, workerAddress }, 'auto-withdraw: post-settlement check failed');
-      }),
-    ),
-  );
-}
-
-/**
- * The worker (or an agent holding their key) signs the pending transaction
- * and posts it back here. Validates the pending record, fee-bumps it through
- * the same relay as /sponsor/withdraw (so the worker needs zero XLM),
- * records the withdrawal in the earnings ledger, and clears the pending
- * record so a stale one can't be submitted twice.
- */
+/** Relays the worker-signed pending transaction through the fee-bump
+ * relay. On a failed relay the pending transaction is dropped either way:
+ * the usual causes (stale sequence number, expired time bound, Owed
+ * changed) all mean it can never succeed as-is, and the next check
+ * prepares a fresh one. */
 export async function submitAutoWithdraw(workerAddress, signedXdr) {
   if (!StrKey.isValidEd25519PublicKey(workerAddress)) {
     throw new AutoWithdrawError('auto-withdraw needs a real Stellar worker address');
@@ -261,37 +250,47 @@ export async function submitAutoWithdraw(workerAddress, signedXdr) {
   if (typeof signedXdr !== 'string' || signedXdr.length === 0) {
     throw new AutoWithdrawError('signedXdr is required');
   }
-
   const pending = await store.get(PENDING_PREFIX + workerAddress);
   if (!pending) {
-    throw new AutoWithdrawError('no pending auto-withdraw transaction for this worker', 404);
+    throw new AutoWithdrawError('no pending auto-withdraw for this worker; it may have expired or already been submitted', 404);
   }
   if (pending.expiresAt && Date.now() > pending.expiresAt) {
     await store.delete(PENDING_PREFIX + workerAddress);
     throw new AutoWithdrawError('pending auto-withdraw transaction has expired; request a fresh one', 410);
   }
 
-  const amountStroops = BigInt(pending.amountStroops);
-  const beneficiaryAddress = pending.beneficiaryAddress || null;
+  let result;
+  try {
+    result = pending.beneficiaryAddress
+      ? await feeBumpWithdrawTo(signedXdr, workerAddress, pending.beneficiaryAddress, pending.amountStroops)
+      : await feeBumpWithdraw(signedXdr, workerAddress, pending.amountStroops);
+  } catch (err) {
+    await store.delete(PENDING_PREFIX + workerAddress);
+    throw new AutoWithdrawError(`auto-withdraw relay failed: ${err.message}. A fresh transaction will be prepared on the next check.`);
+  }
 
-  const { hash } = beneficiaryAddress
-    ? await feeBumpWithdrawTo(signedXdr, workerAddress, beneficiaryAddress, amountStroops)
-    : await feeBumpWithdraw(signedXdr, workerAddress, amountStroops);
-
-  await recordWorkerWithdrawal(workerAddress, {
-    amountStroops,
-    txHash: hash,
-    beneficiaryAddress,
-    auto: true,
-  });
   await store.delete(PENDING_PREFIX + workerAddress);
+  await recordWorkerWithdrawal(workerAddress, {
+    amountStroops: pending.amountStroops,
+    txHash: result.hash,
+    beneficiaryAddress: pending.beneficiaryAddress,
+    auto: true,
+  }).catch((err) => logger.error({ err, workerAddress }, 'failed to record auto-withdraw in earnings ledger'));
 
-  return {
-    hash,
-    amountStroops: amountStroops.toString(),
-    amount: stroopsToUsdc(amountStroops),
-    beneficiaryAddress,
-  };
+  return { hash: result.hash, amountStroops: pending.amountStroops, amount: stroopsToUsdc(pending.amountStroops) };
+}
+
+/** Settlement hook: checks every credited worker who has auto-withdraw on.
+ * Fire-and-forget from the caller's side; never throws. */
+export async function checkAutoWithdrawForWorkers(workerIds) {
+  for (const workerId of workerIds) {
+    if (!StrKey.isValidEd25519PublicKey(workerId)) continue;
+    try {
+      await checkAutoWithdraw(workerId);
+    } catch (err) {
+      logger.error({ err, workerId }, 'auto-withdraw check failed after settlement');
+    }
+  }
 }
 
 /**
@@ -326,29 +325,25 @@ export async function sweepAutoWithdraw() {
   return { checked: workers.length, prepared };
 }
 
-/**
- * Schedules sweepAutoWithdraw() on config.autoWithdraw.sweepIntervalMs.
- * Returns a stop() for tests and graceful shutdown. Ticks never overlap: a
- * sweep still in flight makes the next tick a no-op.
- */
-export function startAutoWithdrawSweep({ intervalMs = config.autoWithdraw.sweepIntervalMs } = {}) {
-  let running = false;
-  const run = async () => {
-    if (running) {
-      logger.warn('auto-withdraw sweep still running, skipping tick');
-      return;
-    }
-    running = true;
-    try {
-      await sweepAutoWithdraw();
-    } catch (err) {
-      logger.error({ err }, 'auto-withdraw sweep failed');
-    } finally {
-      running = false;
-    }
-  };
-  run();
-  const timer = setInterval(run, intervalMs);
-  timer.unref();
-  return () => clearInterval(timer);
+let sweepHandle = null;
+
+export function startAutoWithdrawSweep() {
+  const intervalMs = config.autoWithdraw.sweepIntervalMs;
+  if (!intervalMs || sweepHandle || !config.contractId) return null;
+  sweepHandle = setInterval(() => {
+    sweepAutoWithdraw()
+      .then((summary) => {
+        if (summary.checked > 0) logger.info(summary, 'auto-withdraw sweep complete');
+      })
+      .catch((err) => logger.error({ err }, 'auto-withdraw sweep failed'));
+  }, intervalMs);
+  // Unlike a pending webhook retry, nothing is lost if the process exits
+  // between sweeps; the next boot just sweeps again.
+  sweepHandle.unref();
+  return sweepHandle;
+}
+
+export function stopAutoWithdrawSweep() {
+  if (sweepHandle) clearInterval(sweepHandle);
+  sweepHandle = null;
 }

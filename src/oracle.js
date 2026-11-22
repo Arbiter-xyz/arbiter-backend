@@ -3,7 +3,7 @@ import { createJob, updateJob, getJob, claimJob } from './jobs.js';
 import { dispatchAndCollect, recordOutcome, getReputation, getSmoothedOnlineWorkerCount, hasOnlineWhitelistedWorker } from './dispatch.js';
 import { assessQuorum, recordQuorumObservation } from './collusion.js';
 import { reconcile, draftAnswer } from './reconcile.js';
-import { resolveQuestion, refundQuestion, getQuestionOnChain } from './stellarClient.js';
+import { resolveQuestion, refundQuestion, getQuestionOnChain, getContractId } from './stellarClient.js';
 import { getDispatchPause, describePause } from './maintenanceWindows.js';
 import { resolveTier, listTiersForClient, stroopsToUsdc, priceForTier, effectiveEscalatedPriceStroops } from './pricing.js';
 import { incrementStat } from './stats.js';
@@ -94,7 +94,7 @@ export async function issueChallenge(questionText, tierKey, category, consensusR
     amountStroops: priced.priceStroops.toString(),
     surgeMultiplier: priced.surgeMultiplier,
     asset: { code: config.usdc.code, issuer: config.usdc.issuer, sacId: config.usdc.sacId },
-    contractId: config.contractId,
+    contractId: getContractId(),
     network: config.networkPassphrase,
     tier: priced.key,
     tiers: listTiersForClient(),
@@ -103,7 +103,7 @@ export async function issueChallenge(questionText, tierKey, category, consensusR
     ...consensusStashFields(consensusRule),
     autoRefundAfterLedgers: config.timeoutLedgers,
     instructions:
-      `Call submit(payer, ${questionId}, ${priced.priceStroops.toString()}) on contract ${config.contractId}, ` +
+      `Call submit(payer, ${questionId}, ${priced.priceStroops.toString()}) on contract ${getContractId()}, ` +
       'then retry POST /oracle with X-Payment-Tx and X-Question-Id headers. This call returns 202 immediately ' +
       `once payment is confirmed — poll GET /oracle/${questionId} for the result. If nobody settles this ` +
       `question within ${config.timeoutLedgers} ledgers of your payment landing, anyone (including you) may call ` +

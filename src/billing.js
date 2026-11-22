@@ -6,6 +6,7 @@ import { hashApiKey } from './apiKeyAuth.js';
 import { logger } from './logger.js';
 import { recordPaymentReversal } from './paymentReversals.js';
 import { billingReservationCount, billingSettlementCount, fiatPoolBalanceStroops } from './metrics.js';
+import { isLoopbackHost } from './securityPosture.js';
 
 /**
  * The non-crypto onramp: a fiat customer pays via Stripe and is issued an
@@ -174,12 +175,18 @@ export async function restoreCredit(accountId, stroops) {
 }
 
 export function isAllowedRedirectUrl(url) {
-  if (config.allowedOrigins.includes('*')) return true; // wide-open dev mode, same default as CORS
+  let parsed;
   try {
-    return config.allowedOrigins.includes(new URL(url).origin);
+    parsed = new URL(url);
   } catch {
     return false;
   }
+  // A wildcard CORS allowlist must NOT disable redirect validation: the raw
+  // API key is appended to successUrl, so any origin would receive it. With
+  // '*' we fall back to loopback-only redirects (local dev), never arbitrary
+  // hosts. Set ALLOWED_ORIGINS to an explicit list to allow real frontends.
+  if (config.allowedOrigins.includes('*')) return isLoopbackHost(parsed.hostname);
+  return config.allowedOrigins.includes(parsed.origin);
 }
 
 /**
@@ -277,6 +284,18 @@ const stripeProcessor = {
     }
     if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
       throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
+    }
+
+    // Apple Pay / Google Pay (issue #105) require the redirect domain to be
+    // registered with Stripe for Apple Pay domain association. Resolve and
+    // log the origin Stripe will associate with this session so an operator
+    // can confirm it's registered; isAllowedRedirectUrl() above already
+    // guarantees this resolves to a real origin, never null, for both URLs.
+    const applePayOrigin = getApplePayVerificationOrigin(successUrl);
+    if (applePayOrigin) {
+      logger.info({ applePayOrigin }, 'createCheckoutSession: Apple Pay/Google Pay domain for this session');
+    } else {
+      logger.warn({ successUrl }, 'createCheckoutSession: could not resolve Apple Pay verification origin for successUrl');
     }
 
     // Reject unsupported/malformed currencies before creating any account or
