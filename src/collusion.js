@@ -344,7 +344,7 @@ export async function evaluatePair(a, b, getReputation) {
     referral: link?.kind === 'referral',
     sharedIp,
   });
-  result.disposition = pairDisposition(result.score);
+  result.disposition = classifyPairScore(result.score);
   return { pair: key, workers: splitPair(key), counters, referral: link || null, ...result };
 }
 
