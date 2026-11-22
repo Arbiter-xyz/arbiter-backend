@@ -14,7 +14,7 @@ import {
   getReputation,
 } from './dispatch.js';
 import { getStats } from './stats.js';
-import { getVapidPublicKey, isPushConfigured, saveSubscription, removeSubscription } from './push.js';
+import { getVapidPublicKey, isPushConfigured, saveSubscription, removeSubscription, initPush } from './push.js';
 import { getPayerQuestionIds, summarizePayerQuestions, bucketPayerSpend } from './payerIndex.js';
 import { requiresAuth, verifySession, mountSessionRoutes, verifySessionToken } from './workerAuth.js';
 import {
@@ -24,6 +24,7 @@ import {
   feeBumpStake,
   feeBumpWithdraw,
   feeBumpWithdrawTo,
+  feeBumpWithdrawBalance,
 } from './sponsor.js';
 import { getStashedQuestion, nextQuestionId } from './pendingQuestions.js';
 import { getOwedOnChain, getStakeOnChain, getLatestLedgerSequence } from './stellarClient.js';
@@ -908,6 +909,24 @@ app.post('/sponsor/withdraw', rateLimited('sponsor', byIp), async (req, res) => 
   }
 });
 
+// Gasless relay for a metered/prepaid-balance payer reclaiming unused
+// deposited funds (see metered.js's depositInstructions()). Closes the
+// one withdrawal path in this backend that previously required the caller
+// to hold XLM (#470).
+app.post('/sponsor/withdraw-balance', rateLimited('sponsor', byIp), async (req, res) => {
+  const { xdr, payerAddress, amountStroops } = req.body || {};
+  if (!xdr || !payerAddress || !amountStroops) {
+    return res.status(400).json({ error: 'xdr, payerAddress, and amountStroops are required' });
+  }
+  try {
+    const result = await feeBumpWithdrawBalance(xdr, payerAddress, amountStroops);
+    res.json(result);
+  } catch (err) {
+    req.log.error({ err }, 'sponsor withdraw-balance failed');
+    res.status(400).json({ error: err.message });
+  }
+});
+
 // ---------------------------------------------------------------------
 // Worker on-chain balances — accrued earnings and staked bond.
 // ---------------------------------------------------------------------
@@ -1452,6 +1471,10 @@ const server = app.listen(config.port, () => {
     startAutoWithdrawSweep();
     startTreasuryMonitor();
   }
+  // Rebuild the push subscribed-workers index from the durable store so
+  // push subscriptions survive a restart instead of staying empty until
+  // each worker happens to resubscribe (see push.js). Never throws.
+  initPush().catch((err) => logger.error({ err }, 'initPush failed on startup'));
   logger.info(
     { port: config.port, contractId: config.contractId || null, network: config.networkPassphrase, allowedOrigins: config.allowedOrigins },
     `Arbiter backend listening on :${config.port}`,

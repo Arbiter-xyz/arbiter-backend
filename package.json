@@ -9,7 +9,8 @@
     "check": "find src scripts -name '*.js' -print0 | xargs -0 -n1 node --check",
     "test": "node --test --test-timeout=30000",
     "lint": "find src scripts -name '*.js' -print0 | xargs -0 -n1 node --check",
-    "verify-provenance": "node scripts/verify-provenance.js"
+    "verify-provenance": "node scripts/verify-provenance.js",
+    "boot-smoke-test": "node scripts/boot-smoke-test.js"
   },
   "keywords": [],
   "author": "",
