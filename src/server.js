@@ -54,7 +54,7 @@ import { parseConsensusRule } from './consensus.js';
 import { getPrivatePool, addPoolWorkers, removePoolWorkers, PoolValidationError } from './privatePools.js';
 import { isBillingConfigured, createCheckoutSession, handleStripeWebhook, rotateApiKey, getCreditBalanceStroops, reserveCredit, settleReservation } from './billing.js';
 import { registerWebhook, listWebhooks, deleteWebhook, WebhookError } from './webhooks.js';
-import { getDispatchPause, listUpcomingWindows, describePause } from './maintenanceWindows.js';
+import { getDispatchPause, listUpcomingWindows, describePause, addWindow, removeWindow, listWindows, MaintenanceWindowError } from './maintenanceWindows.js';
 import { logger, httpLogger } from './logger.js';
 import { startTreasuryMonitor } from './alerting.js';
 import { getProvenance } from './provenance.js';
@@ -1361,6 +1361,33 @@ app.get('/admin/collusion', requireAdmin, async (req, res) => {
 
 app.get('/admin/collusion/workers/:workerId', requireAdmin, async (req, res) => {
   res.json(await getWorkerCollusionReport(req.params.workerId, getReputation));
+});
+
+// #461: the actual admin routes for scheduling/cancelling maintenance
+// windows that this module's own docstring (maintenanceWindows.js) already
+// named — POST /admin/maintenance-windows and DELETE
+// /admin/maintenance-windows/:id — wired to the existing addWindow()/
+// removeWindow() primitives, which previously had no caller at all.
+// body: { startsAt, endsAt, reason? } (see parseWindowInput for format).
+app.get('/admin/maintenance-windows', requireAdmin, async (req, res) => {
+  res.json({ windows: await listWindows() });
+});
+
+app.post('/admin/maintenance-windows', requireAdmin, async (req, res) => {
+  try {
+    const window = await addWindow(req.body || {});
+    res.status(201).json(window);
+  } catch (err) {
+    if (err instanceof MaintenanceWindowError) return res.status(400).json({ error: err.message });
+    req.log.error({ err }, 'failed to schedule maintenance window');
+    res.status(500).json({ error: 'failed to schedule maintenance window' });
+  }
+});
+
+app.delete('/admin/maintenance-windows/:id', requireAdmin, async (req, res) => {
+  const removed = await removeWindow(req.params.id);
+  if (!removed) return res.status(404).json({ error: 'no maintenance window with that id' });
+  res.json({ ok: true });
 });
 
 // The one admin write: an operator reviewed a pair and lifts its routing
