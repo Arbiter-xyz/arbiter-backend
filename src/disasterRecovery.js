@@ -208,97 +208,155 @@ export async function sweepPendingQuestions(deps, options = {}) {
       const { hash } = await deps.refund(questionId);
       item.result = 'ok';
       item.refundTx = hash;
-      recoveryRefundsTotal.inc({ reason });
-      await deps.recordRefund(questionId, { reason, hash, at: Date.now() });
+      await deps.recordRefund(questionId, { reason, hash, question: fresh, job });
     } catch (err) {
       item.result = 'error';
       item.error = err.message;
-      logger.error({ err, questionId }, 'disaster recovery: failed to process pending question');
+      logger.error({ err, questionId }, 'recovery sweep: failed to handle pending question');
     }
   }
 
-  recoveryActionable.set(items.filter((i) => i.action === 'refund').length);
-  onchainPendingQuestions.set(snapshot.ids.length);
-  recoverySweepLastSuccess.set(Date.now());
-
   return {
-    startedAt,
-    finishedAt: Date.now(),
-    consistent: true,
-    scanned: snapshot.ids.length,
+    dryRun: Boolean(opts.dryRun),
+    startedAt: new Date(startedAt).toISOString(),
+    durationMs: Date.now() - startedAt,
+    currentLedger,
+    onChainPending: snapshot.count,
+    consistentSnapshot: snapshot.consistent,
     items,
-    refundsAttempted,
+    summary: summarize(items),
   };
 }
 
-let sweepInFlight = false;
+function summarize(items) {
+  const summary = { refunded: 0, alreadySettled: 0, errors: 0, deferred: 0, skipped: 0, flagged: 0, byReason: {} };
+  for (const item of items) {
+    if (item.reason) summary.byReason[item.reason] = (summary.byReason[item.reason] || 0) + 1;
+    if (item.action === 'skip') summary.skipped += 1;
+    if (item.action === 'flag') summary.flagged += 1;
+    if (item.result === 'ok') summary.refunded += 1;
+    if (item.result === 'already_settled') summary.alreadySettled += 1;
+    if (item.result === 'error') summary.errors += 1;
+    if (item.result === 'deferred') summary.deferred += 1;
+  }
+  return summary;
+}
+
+/** Publishes a (non-dry-run) sweep's outcome. The actionable gauge counts
+ * what is STILL stranded after this sweep acted — so a sweep that refunded
+ * everything drops it back to 0, and one whose refunds keep failing holds it
+ * up long enough for EscrowOrphaned to fire. */
+export function recordSweepMetrics(report) {
+  onchainPendingQuestions.set(report.onChainPending);
+  const remaining = Object.fromEntries(RECOVERY_REASONS.map((r) => [r, 0]));
+  for (const item of report.items) {
+    if (item.action === 'flag' || (item.action === 'refund' && item.result !== 'ok' && item.result !== 'already_settled')) {
+      remaining[item.reason] += 1;
+    }
+    if (item.action === 'refund' && item.result && item.result !== 'deferred') {
+      recoveryRefundsTotal.inc({ reason: item.reason, result: item.result });
+    }
+  }
+  for (const [reason, count] of Object.entries(remaining)) recoveryActionable.set({ reason }, count);
+  recoverySweepLastSuccess.set(Date.now() / 1000);
+}
+
+const LOCK_KEY = 'recovery:sweep-lock';
+const instanceId = randomUUID();
 
 /**
- * Serializes sweeps: `/admin/recovery/sweep` and the background scheduler
- * both call this, and a sweep can take a while against the chain, so a
- * second caller gets `null` (surfaced by server.js as 409) instead of two
- * sweeps racing refund() against the same questions.
+ * A sweep guarded by a store lock (so replicas sharing Redis don't each
+ * refund the same orphan — harmless on-chain, since the second refund()
+ * fails QuestionNotPending, but it burns a fee and pages someone for
+ * nothing), with metrics. Returns null when another instance holds the lock.
  */
-export async function runRecoverySweep({ deps, options = {} } = {}) {
-  if (sweepInFlight) return null;
-  sweepInFlight = true;
+export async function runRecoverySweep({ store, deps, options = {}, lockTtlMs = 10 * 60 * 1000 }) {
+  if (!options.dryRun) {
+    const acquired = await store.setNX(LOCK_KEY, instanceId, lockTtlMs);
+    if (!acquired) return null;
+  }
   try {
-    return await sweepPendingQuestions(deps, options);
+    const report = await sweepPendingQuestions(deps, options);
+    if (!report.dryRun) recordSweepMetrics(report);
+    logger.info({ summary: report.summary, onChainPending: report.onChainPending, dryRun: report.dryRun }, 'recovery sweep complete');
+    return report;
   } catch (err) {
-    recoverySweepFailuresTotal.inc({ reason: 'sweep_error' });
-    logger.error({ err }, 'disaster recovery sweep failed');
+    recoverySweepFailuresTotal.inc({ reason: 'scan_error' });
+    logger.error({ err }, 'recovery sweep could not scan the chain');
     throw err;
   } finally {
-    sweepInFlight = false;
+    if (!options.dryRun) await store.delete(LOCK_KEY);
   }
 }
 
 /**
- * Wires sweepPendingQuestions()'s deps to the real chain/store. Contract
- * reads go through stellarClient's generic simulateRead() against the
- * pending-question methods documented in arbiter-contract v0.3.0+
- * (pending_count/list_pending/get_question); refunds reuse the same
- * admin-signed refundQuestion() the fail-closed path already uses.
+ * The real dependencies, wired to stellarClient/jobs/pendingQuestions.
+ * Imported lazily so this module (and its tests) never pull in the store,
+ * the RPC client or config at import time.
  */
 export async function defaultRecoveryDeps() {
-  const { simulateRead, refundQuestion, getLatestLedgerSequence, u64Arg } = await import('./stellarClient.js');
-  const { getJob } = await import('./jobs.js');
-  const { getStashedQuestion } = await import('./pendingQuestions.js');
-  const { store } = await import('./store.js');
+  const chain = await import('./stellarClient.js');
+  const jobs = await import('./jobs.js');
+  const pending = await import('./pendingQuestions.js');
+  const { incrementStat } = await import('./stats.js');
 
   return {
-    getPendingCount: async () => Number(await simulateRead('pending_count', [])) || 0,
-    listPending: async (start, limit) =>
-      (await simulateRead('list_pending', [u64Arg(start), u64Arg(limit)])) || [],
-    getQuestion: async (questionId) => {
-      try {
-        return await simulateRead('get_question', [u64Arg(questionId)]);
-      } catch (err) {
-        logger.warn({ err, questionId }, 'disaster recovery: get_question read failed');
-        return null;
+    getPendingCount: chain.getPendingCountOnChain,
+    listPending: chain.listPendingOnChain,
+    getQuestion: chain.getQuestionOnChain,
+    getLatestLedger: chain.getLatestLedgerSequence,
+    getJob: jobs.getJob,
+    getStash: pending.getStashedQuestion,
+    refund: chain.refundQuestion,
+    async recordRefund(questionId, { reason, hash, question, job }) {
+      const fields = {
+        status: 'settled',
+        outcome: 'refunded',
+        refundTx: hash,
+        recovered: true,
+        recoveryReason: reason,
+        reason: RECOVERY_REASON_TEXT[reason],
+        settledAt: Date.now(),
+      };
+      if (job) {
+        await jobs.updateJob(questionId, fields);
+      } else {
+        // Nothing survived locally: rebuild enough of the record that the
+        // payer's GET /oracle/:jobId poll ends in a settled refund instead
+        // of a 404, from what the chain still knows.
+        await jobs.createJob(questionId, {
+          questionId,
+          payer: question.payer,
+          amountStroops: String(question.amount),
+          ...fields,
+        });
       }
+      await pending.dropStashedQuestion(questionId);
+      await incrementStat('refunded');
     },
-    getJob: (questionId) => getJob(String(questionId)),
-    getStash: (questionId) => getStashedQuestion(String(questionId)),
-    getLatestLedger: getLatestLedgerSequence,
-    refund: (questionId) => refundQuestion(questionId),
-    recordRefund: (questionId, record) => store.set(`disaster-recovery:refund:${questionId}`, record),
   };
 }
 
-/** Background scheduler: runs the sweep on an interval so stranded payers
- * are refunded without an operator having to hit the admin endpoint. Never
- * throws — a failed sweep is logged and retried on the next tick. */
-export function startRecoverySweeper(options = {}) {
-  const intervalMs = options.intervalMs ?? 15 * 60 * 1000;
-  const timer = setInterval(async () => {
+const RECOVERY_REASON_TEXT = {
+  orphaned: 'refunded by disaster recovery: the backend no longer had any record of this paid question',
+  stale_inflight: 'refunded by disaster recovery: the backend stopped processing this question mid-flight',
+  failed_settlement: 'refunded by disaster recovery: the original on-chain settlement failed',
+};
+
+/** Periodic sweep. The first run happens immediately, so a backend that just
+ * came up on an empty store starts refunding stranded payers at once. */
+export function startRecoverySweeper({ store, intervalMs, options = {} }) {
+  let depsPromise = null;
+  const run = async () => {
+    depsPromise ??= defaultRecoveryDeps();
     try {
-      const deps = await defaultRecoveryDeps();
-      await runRecoverySweep({ deps, options });
-    } catch (err) {
-      logger.error({ err }, 'disaster recovery: scheduled sweep failed');
+      await runRecoverySweep({ store, deps: await depsPromise, options });
+    } catch {
+      // Already logged and counted in runRecoverySweep.
     }
-  }, intervalMs);
-  if (typeof timer.unref === 'function') timer.unref();
-  return timer;
+  };
+  run();
+  const timer = setInterval(run, intervalMs);
+  timer.unref();
+  return () => clearInterval(timer);
 }

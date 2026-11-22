@@ -98,7 +98,7 @@ export async function getAnchorConfig() {
  * matching the same shape `getAnchorConfig()` returns. Kept in sync with the
  * cache so callers get a cheap synchronous check without re-fetching.
  */
-export function isAnchorConfigured(config) {
+export function isAnchorConfigured() {
   const value = cache.value;
   if (!value) {
     return Boolean(config?.anchor?.homeDomain);
