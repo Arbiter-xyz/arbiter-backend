@@ -33,7 +33,7 @@ const HOSTING_PLATFORM_MARKERS = [
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]', '0.0.0.0']);
 
-function isLoopbackHost(hostname) {
+export function isLoopbackHost(hostname) {
   return LOOPBACK_HOSTS.has(hostname) || hostname.startsWith('127.') || hostname.endsWith('.localhost');
 }
 
