@@ -255,6 +255,23 @@ async function readPresence() {
       // Ignore malformed entries rather than failing the whole read.
     }
   }
+  // Per-worker keys are the fallback for Redis versions without HEXPIRE (see
+  // writePresence); they expire natively, so a crashed worker's entry drops
+  // out here without any explicit cleanup.
+  if (client.keys) {
+    const keys = await client.keys(PRESENCE_PREFIX + '*');
+    for (const key of keys || []) {
+      const workerId = key.slice(PRESENCE_PREFIX.length);
+      if (!workerId || workerId === 'workers') continue;
+      const json = await client.get(key);
+      if (!json) continue;
+      try {
+        presence.set(workerId, JSON.parse(json));
+      } catch {
+        // Ignore malformed entries rather than failing the whole read.
+      }
+    }
+  }
   return presence;
 }
 
@@ -290,8 +307,18 @@ export async function writePresence(workerId, categories) {
   const client = store.getClient && store.getClient();
   if (!client) return;
   const record = JSON.stringify({ categories, connectedAt: Date.now() });
-  await client.hset(PRESENCE_PREFIX + 'workers', workerId, record);
-  if (client.expire) await client.expire(presenceKey(workerId), PRESENCE_TTL_SECONDS);
+  // The presence entry lives in a hash *field*, so the TTL has to be set on
+  // that field (HEXPIRE, Redis >= 7.4) — expiring a per-worker key that is
+  // never written would leave the field in the hash forever, so a crashed
+  // worker would never drop out of readPresence()/onlineWorkerCount().
+  if (client.hexpire) {
+    await client.hset(PRESENCE_PREFIX + 'workers', workerId, record);
+    await client.hexpire(PRESENCE_PREFIX + 'workers', PRESENCE_TTL_SECONDS, 'FIELDS', 1, workerId);
+    return;
+  }
+  // Older Redis without HEXPIRE: fall back to a per-worker key carrying the
+  // same record, which readPresence() merges in and which expires natively.
+  await client.set(presenceKey(workerId), record, 'EX', PRESENCE_TTL_SECONDS);
 }
 
 /**
@@ -403,7 +430,7 @@ export async function isEstablishedWorker(workerId) {
  * Pure heuristic deciding whether a known workerId is worth a `touch()` call
  * during the daily TTL sweep. `touch()` is permissionless (see lib.rs) but
  * every call still round-trips through the SAME admin-signed serial queue as
- * real resolve()/refund()/charge() settlement calls (see serializeAdminCall
+ * real resolve()/refund()/charge() settlement calls (see enqueueAdminCall
  * in stellarClient.js) — so touching a worker that has never staked or been
  * credited is pure queue-time waste that can delay a payer or worker's
  * money. A worker is only worth touching when there is off-chain evidence

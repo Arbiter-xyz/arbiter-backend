@@ -6,6 +6,7 @@ import { hashApiKey } from './apiKeyAuth.js';
 import { logger } from './logger.js';
 import { recordPaymentReversal } from './paymentReversals.js';
 import { billingReservationCount, billingSettlementCount, fiatPoolBalanceStroops } from './metrics.js';
+import { isLoopbackHost } from './securityPosture.js';
 
 /**
  * The non-crypto onramp: a fiat customer pays via Stripe and is issued an
@@ -174,12 +175,18 @@ export async function restoreCredit(accountId, stroops) {
 }
 
 export function isAllowedRedirectUrl(url) {
-  if (config.allowedOrigins.includes('*')) return true; // wide-open dev mode, same default as CORS
+  let parsed;
   try {
-    return config.allowedOrigins.includes(new URL(url).origin);
+    parsed = new URL(url);
   } catch {
     return false;
   }
+  // A wildcard CORS allowlist must NOT disable redirect validation: the raw
+  // API key is appended to successUrl, so any origin would receive it. With
+  // '*' we fall back to loopback-only redirects (local dev), never arbitrary
+  // hosts. Set ALLOWED_ORIGINS to an explicit list to allow real frontends.
+  if (config.allowedOrigins.includes('*')) return isLoopbackHost(parsed.hostname);
+  return config.allowedOrigins.includes(parsed.origin);
 }
 
 /**
@@ -262,6 +269,18 @@ function fiatToStroops(amount, currency) {
 }
 
 /**
+ * Reads the minor-unit multiplier snapshotted at checkout creation. Orders
+ * created before the snapshot existed fall back to the currency's current
+ * minorUnits (USD-only today, so 100 — the value the old hardcoded `* 100`
+ * assumed), never to a bare literal.
+ */
+function snapshotMinorUnits(snapshot) {
+  const snapshotted = Number(snapshot?.minorUnits);
+  if (Number.isFinite(snapshotted) && snapshotted > 0) return snapshotted;
+  return resolveCurrency(snapshot?.currency || 'usd').minorUnits;
+}
+
+/**
  * Stripe processor — the original concrete implementation of the
  * processor-agnostic interface. Behavior is unchanged from before the
  * abstraction: same account creation, same session metadata snapshot, same
@@ -277,6 +296,18 @@ const stripeProcessor = {
     }
     if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
       throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
+    }
+
+    // Apple Pay / Google Pay (issue #105) require the redirect domain to be
+    // registered with Stripe for Apple Pay domain association. Resolve and
+    // log the origin Stripe will associate with this session so an operator
+    // can confirm it's registered; isAllowedRedirectUrl() above already
+    // guarantees this resolves to a real origin, never null, for both URLs.
+    const applePayOrigin = getApplePayVerificationOrigin(successUrl);
+    if (applePayOrigin) {
+      logger.info({ applePayOrigin }, 'createCheckoutSession: Apple Pay/Google Pay domain for this session');
+    } else {
+      logger.warn({ successUrl }, 'createCheckoutSession: could not resolve Apple Pay verification origin for successUrl');
     }
 
     // Reject unsupported/malformed currencies before creating any account or
@@ -352,7 +383,7 @@ const paypalProcessor = {
     if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
       throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
     }
-    const { code, usdPerUnit } = resolveCurrency(currency);
+    const { code, minorUnits, usdPerUnit } = resolveCurrency(currency);
     const { accountId, rawKey } = await createAccount();
 
     const auth = Buffer.from(
@@ -379,11 +410,14 @@ const paypalProcessor = {
     const order = await res.json();
     const approve = (order.links || []).find((l) => l.rel === 'approve');
     if (!approve) throw new Error('paypal order missing approve link');
-    // Snapshot the FX rate so the webhook credits at the rate the customer saw.
+    // Snapshot the FX rate and minor-unit multiplier so the webhook credits
+    // at the rate the customer saw, in the currency they actually paid in.
     await store.set(`paypal-order:${order.id}`, {
       accountId,
       stroopsPerUnit: String(fiatToStroops(1, code)),
       usdPerUnit: String(usdPerUnit),
+      minorUnits,
+      currency: code,
     });
     return { checkoutUrl: approve.href };
   },
@@ -422,7 +456,8 @@ const paypalProcessor = {
     if (!accountId || !orderId) return null;
     const snapshot = await store.get(`paypal-order:${orderId}`);
     if (!snapshot) return null;
-    const stroops = BigInt(snapshot.stroopsPerUnit) * BigInt(Math.round(Number(resource.amount?.value || 0) * 100));
+    const minorUnits = snapshotMinorUnits(snapshot);
+    const stroops = BigInt(snapshot.stroopsPerUnit) * BigInt(Math.round(Number(resource.amount?.value || 0) * minorUnits));
     return { id: event.id, type: event.event_type, accountId, stroops };
   },
 };
@@ -444,7 +479,7 @@ const coinbaseProcessor = {
     if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
       throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
     }
-    const { code, usdPerUnit } = resolveCurrency(currency);
+    const { code, minorUnits, usdPerUnit } = resolveCurrency(currency);
     const { accountId, rawKey } = await createAccount();
 
     const res = await fetch('https://api.commerce.coinbase.com/charges', {
@@ -469,6 +504,8 @@ const coinbaseProcessor = {
       accountId,
       stroopsPerUnit: String(fiatToStroops(1, code)),
       usdPerUnit: String(usdPerUnit),
+      minorUnits,
+      currency: code,
     });
     return { checkoutUrl: data.hosted_url };
   },
@@ -497,7 +534,8 @@ const coinbaseProcessor = {
     if (!accountId) return null;
     const snapshot = await store.get(`coinbase-charge:${charge.id}`);
     if (!snapshot) return null;
-    const stroops = BigInt(snapshot.stroopsPerUnit) * BigInt(Math.round(Number(charge.pricing?.local?.amount || 0) * 100));
+    const minorUnits = snapshotMinorUnits(snapshot);
+    const stroops = BigInt(snapshot.stroopsPerUnit) * BigInt(Math.round(Number(charge.pricing?.local?.amount || 0) * minorUnits));
     return { id: event.id, type: event.event.type, accountId, stroops };
   },
 };
@@ -585,14 +623,32 @@ async function reverseCharge(event) {
   // charge.refunded carries the cumulative amount_refunded on the charge;
   // charge.dispute.created carries the disputed amount.
   const amountCents = event.type === 'charge.refunded' ? obj.amount_refunded : obj.amount;
-  const requestedStroops = centsToStroops(amountCents || 0);
+  const cumulativeCents = amountCents || 0;
+
+  // amount_refunded is cumulative across every refund on the charge, so a
+  // second partial refund reports the total of both. Track what we have
+  // already reversed per payment_intent and debit only the delta, otherwise
+  // each partial refund would re-debit the whole cumulative amount.
+  const reversedKey = obj.payment_intent ? `stripe-reversed:${obj.payment_intent}` : null;
+  const alreadyReversedCents = reversedKey ? Number((await store.get(reversedKey)) || 0) : 0;
+  const deltaCents = cumulativeCents - alreadyReversedCents;
+  if (deltaCents <= 0) {
+    logger.info({ accountId, eventId: event.id, type: event.type, cumulativeCents, alreadyReversedCents }, 'stripe reversal already accounted for — no debit');
+    return;
+  }
+
+  const requestedStroops = centsToStroops(deltaCents);
   const debitedStroops = await debitCreditFloored(accountId, requestedStroops);
+
+  // Persist the new cumulative total only after the debit attempt, so a
+  // failed debit is retried by the next delivery rather than silently lost.
+  if (reversedKey) await store.set(reversedKey, cumulativeCents);
 
   await recordPaymentReversal(accountId, {
     eventId: event.id,
     type: event.type,
     paymentIntent: obj.payment_intent || null,
-    amountCents: amountCents || 0,
+    amountCents: deltaCents,
     requestedStroops: String(requestedStroops),
     debitedStroops: String(debitedStroops),
     shortfallStroops: String(requestedStroops - debitedStroops),

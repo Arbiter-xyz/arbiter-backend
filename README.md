@@ -16,61 +16,47 @@ lockstep by hand (see #163). Pre-split history and the round-by-round
 build narrative live in the archived
 [`arbiter`](https://github.com/rudeus112266/arbiter) repo.
 
-## Try it live
+## Try it locally
 
-Two public deployments exist, and they are deliberately different things:
+There is **no public hosted deployment yet**. Earlier revisions of this
+README advertised `https://sandbox.arbiter.xyz` and
+`https://demo.arbiter.xyz`; neither host is currently reachable, so they
+are no longer documented as live targets. Do not point an integration at
+them.
 
-| Environment | URL | Lifetime | Chain calls |
-| --- | --- | --- | --- |
-| **Developer sandbox** | `https://sandbox.arbiter.xyz` | Long-lived; kept up for integrators | Real Soroban testnet `submit()`/`resolve()`/`withdraw()` round trips |
-| **Demo deployment** | `https://demo.arbiter.xyz` | Disposable; may be redeployed or torn down after the SCF submission window | Real Soroban testnet, but not a stable target |
+To try the backend, run it yourself (see
+[`docs/local-full-stack.md`](docs/local-full-stack.md)):
 
-### Developer sandbox (`https://sandbox.arbiter.xyz`)
+```sh
+npm install
+npm start
+```
 
-This is the environment to point a real integration at. It runs its own
-Soroban testnet contract deployment with its own `contractId` and
-`PLATFORM_SECRET`, kept distinct from whatever gets redeployed for demo
-purposes, and its own backend service and `config.js` env block. It is
-committed to staying up rather than being torn down after a submission
-window, and it reuses the existing `rateLimit.js` / `config.rateLimits`
-machinery at a more generous ceiling than the demo deployment, since it
-absorbs sustained integrator traffic rather than one-off demo hits.
-
-`GET /health` and a real `/oracle` submit→resolve round trip are expected
-to succeed against it in checks run at least a week apart. "Long-lived"
-means "not torn down after a specific date" — it is not an uptime SLA.
-
-### Demo deployment (`https://demo.arbiter.xyz`)
-
-The public Railway/Vercel deployment referenced in earlier revisions of
-this README. It is a disposable testnet deployment on free-tier hosting:
-expect it to be redeployed or torn down after the SCF submission window,
-not a permanent production environment. Use it to look around, not to
-build against.
+That gives you a local instance on the port from `config.js` (default
+`3000`), serving the app from `app/dist` unless `SERVE_STATIC_APP=false`.
 
 ### Zero-chain mode (`POST /oracle/sandbox`)
 
-Distinct from both of the above: `/oracle/sandbox` (`backend/src/sandbox.js`)
-is a purely local simulation. Its own docstring says it "Never touches
-stellarClient.js — no chain calls," which is exactly why it's zero-setup,
-but also why it can't prove anything about real Soroban RPC latency, real
-surge pricing, or a real `submit()`/`resolve()`/`withdraw()` round trip.
-It returns canned response shapes with no payment and no chain. Use it to
-see a response shape before setting up a wallet; use the developer
-sandbox when you need the real round trip.
+`/oracle/sandbox` (`backend/src/sandbox.js`) is a purely local simulation.
+Its own docstring says it "Never touches stellarClient.js — no chain
+calls," which is exactly why it's zero-setup, but also why it can't prove
+anything about real Soroban RPC latency, real surge pricing, or a real
+`submit()`/`resolve()`/`withdraw()` round trip. It returns canned response
+shapes with no payment and no chain. Use it to see a response shape before
+setting up a wallet.
 
 ### Funding a testnet USDC path
 
 You do not need Arbiter's own platform key to get test funds. To fund your
-own integration against the developer sandbox:
+own integration against a locally run instance:
 
 1. Create and fund a testnet Stellar account with Friendbot:
    `curl "https://friendbot.stellar.org?addr=<YOUR_TESTNET_ADDRESS>"`.
-2. Add a trustline for the testnet USDC asset issued by the sandbox's
-   documented testnet issuer (see the sandbox's `/health` response and the
+2. Add a trustline for the testnet USDC asset issued by the deployment you
+   are running (see its `/health` response and the
    `arbiter-contract` testnet deployment notes for the current issuer and
    asset code).
-3. Acquire testnet USDC from the sandbox's documented testnet faucet, or
+3. Acquire testnet USDC from a documented testnet faucet, or
    from any testnet DEX path against that issuer, and pay for questions
    from your own key.
 
@@ -98,9 +84,8 @@ By default the backend also serves the built worker-console/dashboard/
 leaderboard SPA from `app/dist` via `express.static`, which is what makes
 `npm start`-style local and single-process demo runs work out of the box.
 
-In production the app build is deployed separately and fronted by Vercel
-(see the "Try it live" URLs above), so the backend does not need to serve
-those assets at all. Set `SERVE_STATIC_APP=false` to skip mounting the
+In production the app build is deployed separately and fronted by a static
+host, so the backend does not need to serve those assets at all. Set `SERVE_STATIC_APP=false` to skip mounting the
 `express.static` middleware entirely — static-asset requests then fall
 through to the normal 404 handler instead of being served by the same
 process that handles latency-sensitive settlement traffic. Leave it unset

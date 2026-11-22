@@ -15,6 +15,7 @@ import {
   getProcessor,
 } from '../src/billing.js';
 import { config } from '../src/config.js';
+import { store } from '../src/store.js';
 
 /** config.allowedOrigins is an array nested inside a frozen config object
  * — Object.freeze is shallow, so the array's own contents are still
@@ -142,6 +143,58 @@ test('handleStripeWebhook is idempotent per Stripe event id (a retried delivery 
   assert.equal(await getCreditBalanceStroops(accountId), 100_000_000); // credited once, not twice
 });
 
+function chargeRefundedEvent({ eventId, paymentIntent, amountRefundedCents }) {
+  return {
+    id: eventId,
+    type: 'charge.refunded',
+    data: { object: { id: 'ch_test_1', payment_intent: paymentIntent, amount_refunded: amountRefundedCents } },
+  };
+}
+
+test('sequential partial refunds debit only the delta, not the cumulative amount_refunded', async () => {
+  const accountId = uniqueId('acct');
+  const paymentIntent = uniqueId('pi');
+  const checkoutPayload = JSON.stringify({
+    ...checkoutCompletedEvent({ eventId: uniqueId('evt'), accountId, amountCents: 1000 }),
+    data: { object: { id: 'cs_test_1', amount_total: 1000, payment_intent: paymentIntent, metadata: { accountId } } },
+  });
+  const checkoutHeader = Stripe.webhooks.generateTestHeaderString({
+    payload: checkoutPayload,
+    secret: config.billing.stripeWebhookSecret,
+  });
+  await handleStripeWebhook(checkoutPayload, checkoutHeader); // credits 100_000_000 stroops
+
+  const first = signedEvent(chargeRefundedEvent({ eventId: uniqueId('evt'), paymentIntent, amountRefundedCents: 300 }));
+  await handleStripeWebhook(first.payload, first.header);
+  assert.equal(await getCreditBalanceStroops(accountId), 70_000_000);
+
+  // Second partial refund: Stripe reports the cumulative 600 cents, but only
+  // the 300-cent delta is new — the account must not be debited 600 again.
+  const second = signedEvent(chargeRefundedEvent({ eventId: uniqueId('evt'), paymentIntent, amountRefundedCents: 600 }));
+  await handleStripeWebhook(second.payload, second.header);
+  assert.equal(await getCreditBalanceStroops(accountId), 40_000_000);
+
+  // An out-of-order/duplicate cumulative value yields a zero delta: no debit.
+  const stale = signedEvent(chargeRefundedEvent({ eventId: uniqueId('evt'), paymentIntent, amountRefundedCents: 600 }));
+  await handleStripeWebhook(stale.payload, stale.header);
+  assert.equal(await getCreditBalanceStroops(accountId), 40_000_000);
+});
+
+test('a single full refund still debits the whole charge', async () => {
+  const accountId = uniqueId('acct');
+  const paymentIntent = uniqueId('pi');
+  const payload = JSON.stringify({
+    ...checkoutCompletedEvent({ eventId: uniqueId('evt'), accountId, amountCents: 1000 }),
+    data: { object: { id: 'cs_test_1', amount_total: 1000, payment_intent: paymentIntent, metadata: { accountId } } },
+  });
+  const header = Stripe.webhooks.generateTestHeaderString({ payload, secret: config.billing.stripeWebhookSecret });
+  await handleStripeWebhook(payload, header);
+
+  const refund = signedEvent(chargeRefundedEvent({ eventId: uniqueId('evt'), paymentIntent, amountRefundedCents: 1000 }));
+  await handleStripeWebhook(refund.payload, refund.header);
+  assert.equal(await getCreditBalanceStroops(accountId), 0);
+});
+
 test('handleStripeWebhook ignores event types other than checkout.session.completed', async () => {
   const accountId = uniqueId('acct');
   const { payload, header } = signedEvent({
@@ -160,9 +213,10 @@ test('handleStripeWebhook ignores event types other than checkout.session.comple
 // could point successUrl at a domain they control and have Stripe hand
 // the key straight to them once a real payer completed checkout.
 
-test('isAllowedRedirectUrl allows any origin when ALLOWED_ORIGINS is wide open (the default)', () =>
+test('isAllowedRedirectUrl with a wildcard ALLOWED_ORIGINS allows only loopback redirects (the API key rides on successUrl)', () =>
   withAllowedOrigins(['*'], () => {
-    assert.equal(isAllowedRedirectUrl('https://anything.example.com/success'), true);
+    assert.equal(isAllowedRedirectUrl('https://anything.example.com/success'), false);
+    assert.equal(isAllowedRedirectUrl('http://localhost:5173/success'), true);
   }));
 
 test('isAllowedRedirectUrl restricts to the configured allowlist once one is set', () =>
@@ -258,6 +312,44 @@ test('PayPal verifyAndParseWebhook rejects a tampered payload (verification_stat
   );
 });
 
+test('PayPal verifyAndParseWebhook converts using the minorUnits snapshotted at checkout', async () => {
+  const paypal = getProcessor('paypal');
+  const orderId = uniqueId('ORDER');
+  const accountId = uniqueId('acct');
+  // A hypothetical 3-decimal currency: 1.234 major units = 1234 minor units.
+  await store.set(`paypal-order:${orderId}`, {
+    accountId,
+    stroopsPerUnit: '10000000',
+    usdPerUnit: '1',
+    minorUnits: 1000,
+    currency: 'usd',
+  });
+  const payload = JSON.stringify({
+    id: uniqueId('evt'),
+    event_type: 'PAYMENT.CAPTURE.COMPLETED',
+    resource: {
+      custom_id: accountId,
+      amount: { value: '1.234', currency_code: 'USD' },
+      supplementary_data: { related_ids: { order_id: orderId } },
+    },
+  });
+  const headers = {
+    'paypal-transmission-id': 'tx-1',
+    'paypal-transmission-time': '2024-01-01T00:00:00Z',
+    'paypal-cert-url': 'https://api.paypal.com/cert.pem',
+    'paypal-auth-algo': 'SHA256withRSA',
+    'paypal-transmission-sig': 'valid-sig',
+  };
+
+  await withMockFetch(
+    () => jsonResponse({ verification_status: 'SUCCESS' }),
+    async () => {
+      const event = await paypal.verifyAndParseWebhook(payload, headers);
+      assert.equal(event.stroops, 10000000n * 1234n);
+    },
+  );
+});
+
 // --- Coinbase Commerce processor coverage --------------------------------
 
 test('Coinbase createCheckoutSession posts a charge and returns hosted_url as checkoutUrl', async () => {
@@ -292,6 +384,31 @@ test('Coinbase verifyAndParseWebhook accepts a genuinely valid HMAC signature', 
 
   const event = await coinbase.verifyAndParseWebhook(payload, headers);
   assert.equal(event.type, 'charge:confirmed');
+});
+
+test('Coinbase verifyAndParseWebhook converts using the minorUnits snapshotted at checkout', async () => {
+  const coinbase = getProcessor('coinbase');
+  const chargeId = uniqueId('charge');
+  const accountId = uniqueId('acct');
+  await store.set(`coinbase-charge:${chargeId}`, {
+    accountId,
+    stroopsPerUnit: '10000000',
+    usdPerUnit: '1',
+    minorUnits: 1000,
+    currency: 'usd',
+  });
+  const payload = JSON.stringify({
+    id: uniqueId('evt'),
+    event: {
+      type: 'charge:confirmed',
+      data: { id: chargeId, metadata: { accountId }, pricing: { local: { amount: '1.234', currency: 'USD' } } },
+    },
+  });
+  const secret = config.billing.coinbaseCommerceWebhookSecret;
+  const headers = { 'x-cc-webhook-signature': coinbaseSignature(payload, secret) };
+
+  const event = await coinbase.verifyAndParseWebhook(payload, headers);
+  assert.equal(event.stroops, 10000000n * 1234n);
 });
 
 test('Coinbase verifyAndParseWebhook rejects a tampered payload (HMAC mismatch)', async () => {
