@@ -5,7 +5,7 @@ import { assessQuorum, recordQuorumObservation } from './collusion.js';
 import { reconcile, draftAnswer } from './reconcile.js';
 import { resolveQuestion, refundQuestion, getQuestionOnChain, getContractId, computeAnswerHash } from './stellarClient.js';
 import { getDispatchPause, describePause } from './maintenanceWindows.js';
-import { resolveTier, listTiersForClient, stroopsToUsdc, priceForTier, effectiveEscalatedPriceStroops } from './pricing.js';
+import { resolveTier, listTiersForClient, stroopsToUsdc, priceForTier } from './pricing.js';
 import { incrementStat } from './stats.js';
 import { DEFAULT_CONSENSUS_MODE } from './consensus.js';
 import { recordPayerQuestion } from './payerIndex.js';
@@ -437,9 +437,6 @@ async function fulfillOracleCall(questionId, pending, tier) {
     : undefined;
 
   let submissions = [];
-  // Only set for escalating tiers (none are currently priced); the lone-answer
-  // confidence cap below reads it, so it must stay declared.
-  const escalated = null;
   try {
     submissions = await dispatchAndCollect(questionId, pending.question, {
       quorumSize: tier.quorumSize,
@@ -488,16 +485,6 @@ async function fulfillOracleCall(questionId, pending, tier) {
   }
 
   const result = await reconcile(pending.question, submissions, questionId, consensusRuleFromPending(pending));
-
-  // A lone answer has no peers to be reconciled against, so reconcile()'s
-  // "unanimous + established" fast path reports confidence 1 for it. Settling
-  // on one worker must not get to skip the confidence bar by construction:
-  // cap it at the confidence dispatch actually had in that worker, so the
-  // shouldResolve / MIN_CONFIDENCE gate below judges the real number, exactly
-  // as it does for every other path.
-  if (escalated && submissions.length === 1 && escalated.confidence !== null) {
-    result.confidence = Math.min(result.confidence, escalated.confidence);
-  }
 
   const shouldResolve =
     submissions.length > 0 && result.matchingWorkerIds.length > 0 && result.confidence >= config.minConfidence;
