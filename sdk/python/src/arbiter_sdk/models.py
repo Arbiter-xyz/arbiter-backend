@@ -41,6 +41,9 @@ class Tier:
     amount_stroops: str
     quorum_size: int
     timeout_ms: int
+    escalating: bool = False
+    initial_quorum: Optional[int] = None
+    max_quorum: Optional[int] = None
     raw: Dict[str, Any] = field(repr=False, compare=False, default_factory=dict)
 
     @classmethod
@@ -52,6 +55,9 @@ class Tier:
             amount_stroops=d.get("amountStroops", ""),
             quorum_size=d.get("quorumSize", 0),
             timeout_ms=d.get("timeoutMs", 0),
+            escalating=bool(d.get("escalating", False)),
+            initial_quorum=d.get("initialQuorum"),
+            max_quorum=d.get("maxQuorum"),
             raw=d,
         )
 

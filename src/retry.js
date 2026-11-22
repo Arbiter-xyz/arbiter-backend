@@ -126,6 +126,10 @@ export async function withRetry(fn, options = {}) {
  * The default (unset) policy mirrors the baseline #56 ships with, so an
  * account that never configures anything behaves exactly as before.
  */
+// NOTE (#321): config.js defines its own DEFAULT_WEBHOOK_RETRY_POLICY /
+// validateWebhookRetryPolicy with different values (default 2 attempts /
+// 1000ms; minBaseDelayMs 100 vs 0 here). Neither is imported outside its own
+// module today; reconcile the two before wiring either into delivery.
 export const DEFAULT_WEBHOOK_RETRY_POLICY = Object.freeze({
   attempts: 3,
   baseDelayMs: 200,

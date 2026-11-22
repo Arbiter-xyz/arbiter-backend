@@ -1,52 +1,39 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { collectReferences, parseEnvExample, diffEnv } from '../scripts/check-env-example.js';
 
-const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const PROCESS_ENV_RE = /process\.env(?:\.([A-Z][A-Z0-9_]*)|\[\s*['"`]([A-Z][A-Z0-9_]*)['"`]\s*\])/g;
 
-test('every process.env.X variable referenced in src/*.js is documented in .env.example (#224)', () => {
-  const envExample = fs.readFileSync(path.join(ROOT_DIR, '.env.example'), 'utf8');
-  const documentedVars = new Set(
-    [...envExample.matchAll(/^([A-Z][A-Z0-9_]*)=/gm)].map((m) => m[1]),
-  );
+test('the repo’s .env.example documents every process.env reference in src/', () => {
+  const result = spawnSync(process.execPath, ['--no-warnings', path.join(ROOT, 'scripts/check-env-example.js')], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+});
 
-  const srcDir = path.join(ROOT_DIR, 'src');
-  const referencedVars = new Set();
-  for (const entry of fs.readdirSync(srcDir)) {
-    if (!entry.endsWith('.js')) continue;
-    const source = fs.readFileSync(path.join(srcDir, entry), 'utf8');
-    for (const match of source.matchAll(/process\.env\.([A-Z][A-Z0-9_]*)/g)) {
-      referencedVars.add(match[1]);
-    }
-  }
+test('collectReferences finds dotted and bracketed process.env reads', () => {
+  const files = { 'a.js': "const x = process.env.FOO_BAR; const y = process.env['BAZ']; process.env.npm_package_version;" };
+  const refs = collectReferences(Object.keys(files), PROCESS_ENV_RE, (f) => files[f]);
+  assert.deepEqual([...refs.keys()].sort(), ['BAZ', 'FOO_BAR']);
+});
 
-  const missing = [...referencedVars].filter((name) => !documentedVars.has(name)).sort();
-  assert.deepEqual(
-    missing,
-    [],
-    `Environment variables referenced in src/*.js but missing from .env.example: ${missing.join(', ')}`,
-  );
+test('parseEnvExample counts commented examples as documented but not active', () => {
+  const { documented, active } = parseEnvExample('# comment\nFOO=1\n# ARBITER_ENV=\nBAR=\n#not an entry\n');
+  assert.deepEqual([...documented].sort(), ['ARBITER_ENV', 'BAR', 'FOO']);
+  assert.deepEqual([...active].sort(), ['BAR', 'FOO']);
+});
 
-  // Also ensure the PayPal, Coinbase Commerce, auto-withdraw, and tax-reporting
-  // variables highlighted in #224 remain documented in .env.example.
-  const requiredExtraVars = [
-    'PAYPAL_CLIENT_ID',
-    'PAYPAL_CLIENT_SECRET',
-    'PAYPAL_WEBHOOK_ID',
-    'PAYPAL_API_BASE',
-    'COINBASE_COMMERCE_API_KEY',
-    'COINBASE_COMMERCE_WEBHOOK_SECRET',
-    'AUTO_WITHDRAW_MIN_THRESHOLD_STROOPS',
-    'AUTO_WITHDRAW_SWEEP_INTERVAL_MS',
-    'AUTO_WITHDRAW_PENDING_TTL_MS',
-    'TAX_REPORTING_THRESHOLD_USD',
-    'TAX_PAYER_NAME',
-    'TAX_PAYER_TIN',
-    'TAX_PAYER_ADDRESS',
-  ];
-  for (const name of requiredExtraVars) {
-    assert.ok(documentedVars.has(name), `Expected ${name} to be documented in .env.example`);
-  }
+test('diffEnv reports missing and stale variables', () => {
+  const referenced = new Map([
+    ['REDIS_URL', new Set(['src/config.js'])],
+    ['ORACLE_CONTRACT_ID', new Set(['src/config.js'])],
+  ]);
+  const alsoRead = new Map([['NODE_ENV', new Set(['src/securityPosture.js'])]]);
+  const { documented, active } = parseEnvExample('REDIS_URL=\nNODE_ENV=\nSTELLAR_NETWORK=testnet\n');
+  assert.deepEqual(diffEnv({ referenced, alsoRead, documented, active }), {
+    missing: ['ORACLE_CONTRACT_ID'],
+    stale: ['STELLAR_NETWORK'],
+  });
 });

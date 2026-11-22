@@ -16,66 +16,81 @@ lockstep by hand (see #163). Pre-split history and the round-by-round
 build narrative live in the archived
 [`arbiter`](https://github.com/rudeus112266/arbiter) repo.
 
-## Try it live
+## Try it locally
 
-Two public deployments exist, and they are deliberately different things:
+There is **no public hosted deployment yet**. Earlier revisions of this
+README advertised `https://sandbox.arbiter.xyz` and
+`https://demo.arbiter.xyz`; neither host is currently reachable, so they
+are no longer documented as live targets. Do not point an integration at
+them.
 
-| Environment | URL | Lifetime | Chain calls |
-| --- | --- | --- | --- |
-| **Developer sandbox** | `https://sandbox.arbiter.xyz` | Long-lived; kept up for integrators | Real Soroban testnet `submit()`/`resolve()`/`withdraw()` round trips |
-| **Demo deployment** | `https://demo.arbiter.xyz` | Disposable; may be redeployed or torn down after the SCF submission window | Real Soroban testnet, but not a stable target |
+To try the backend, run it yourself (see
+[`docs/local-full-stack.md`](docs/local-full-stack.md)):
 
-### Developer sandbox (`https://sandbox.arbiter.xyz`)
+```sh
+npm install
+npm start
+```
 
-This is the environment to point a real integration at. It runs its own
-Soroban testnet contract deployment with its own `contractId` and
-`PLATFORM_SECRET`, kept distinct from whatever gets redeployed for demo
-purposes, and its own backend service and `config.js` env block. It is
-committed to staying up rather than being torn down after a submission
-window, and it reuses the existing `rateLimit.js` / `config.rateLimits`
-machinery at a more generous ceiling than the demo deployment, since it
-absorbs sustained integrator traffic rather than one-off demo hits.
-
-`GET /health` and a real `/oracle` submit→resolve round trip are expected
-to succeed against it in checks run at least a week apart. "Long-lived"
-means "not torn down after a specific date" — it is not an uptime SLA.
-
-### Demo deployment (`https://demo.arbiter.xyz`)
-
-The public Railway/Vercel deployment referenced in earlier revisions of
-this README. It is a disposable testnet deployment on free-tier hosting:
-expect it to be redeployed or torn down after the SCF submission window,
-not a permanent production environment. Use it to look around, not to
-build against.
+That gives you a local instance on the port from `config.js` (default
+`3000`), serving the app from `app/dist` unless `SERVE_STATIC_APP=false`.
 
 ### Zero-chain mode (`POST /oracle/sandbox`)
 
-Distinct from both of the above: `/oracle/sandbox` (`backend/src/sandbox.js`)
-is a purely local simulation. Its own docstring says it "Never touches
-stellarClient.js — no chain calls," which is exactly why it's zero-setup,
-but also why it can't prove anything about real Soroban RPC latency, real
-surge pricing, or a real `submit()`/`resolve()`/`withdraw()` round trip.
-It returns canned response shapes with no payment and no chain. Use it to
-see a response shape before setting up a wallet; use the developer
-sandbox when you need the real round trip.
+`/oracle/sandbox` (`backend/src/sandbox.js`) is a purely local simulation.
+Its own docstring says it "Never touches stellarClient.js — no chain
+calls," which is exactly why it's zero-setup, but also why it can't prove
+anything about real Soroban RPC latency, real surge pricing, or a real
+`submit()`/`resolve()`/`withdraw()` round trip. It returns canned response
+shapes with no payment and no chain. Use it to see a response shape before
+setting up a wallet.
 
 ### Funding a testnet USDC path
 
 You do not need Arbiter's own platform key to get test funds. To fund your
-own integration against the developer sandbox:
+own integration against a locally run instance:
 
 1. Create and fund a testnet Stellar account with Friendbot:
    `curl "https://friendbot.stellar.org?addr=<YOUR_TESTNET_ADDRESS>"`.
-2. Add a trustline for the testnet USDC asset issued by the sandbox's
-documented testnet issuer (see the sandbox's `/health` response and the
-`arbiter-contract` testnet deployment notes for the current issuer and
-asset code).
-3. Acquire testnet USDC from the sandbox's documented testnet faucet, or
+2. Add a trustline for the testnet USDC asset issued by the deployment you
+   are running (see its `/health` response and the
+   `arbiter-contract` testnet deployment notes for the current issuer and
+   asset code).
+3. Acquire testnet USDC from a documented testnet faucet, or
    from any testnet DEX path against that issuer, and pay for questions
    from your own key.
 
 This keeps your integration independent of Arbiter's platform key and of
 any single hot key's funding.
+
+## Teams and member roles
+
+Team/organization accounts (`teams.js`) are a named group of Stellar
+addresses that can see each other's question history and spend in one
+place. A team adds no new credential: it is a membership list over
+existing identities, so every member keeps paying from, and owning, their
+own address. Roles, strongest first:
+
+- **owner** — exactly one per team. Everything an admin can do, plus
+  promoting/demoting admins, transferring ownership, and deleting the
+  team. Can't leave or be removed without first transferring ownership, so
+  a team is never ownerless.
+- **admin** — add and remove plain members, rename the team.
+- **member** — read the team and its combined question history; leave.
+
+## Static frontend hosting (`SERVE_STATIC_APP`)
+
+By default the backend also serves the built worker-console/dashboard/
+leaderboard SPA from `app/dist` via `express.static`, which is what makes
+`npm start`-style local and single-process demo runs work out of the box.
+
+In production the app build is deployed separately and fronted by a static
+host, so the backend does not need to serve those assets at all. Set `SERVE_STATIC_APP=false` to skip mounting the
+`express.static` middleware entirely — static-asset requests then fall
+through to the normal 404 handler instead of being served by the same
+process that handles latency-sensitive settlement traffic. Leave it unset
+(or `true`) for local dev and small single-process deployments where the
+backend is the only thing serving the app.
 
 ## What it does
 
@@ -110,7 +125,24 @@ any single hot key's funding.
   `workerId` must prove control of that key before submitting an answer.
 - A read-only admin/ops console (`/admin/*`, bearer-token gated) —
   transactions, workers, payers, live on-chain treasury balance, fee
-  revenue, and fraud/trust monitoring.
+  revenue, and fraud/trust monitoring. Its list/summary reads can go to a
+  Redis read replica (`REDIS_REPLICA_URL`, `replicaStore.js`) so an operator
+  browsing the console never competes with settlement for the primary; a
+  failing replica falls back to the primary, and `GET /admin/read-replica`
+  reports which one is in use and the replica's lag.
+- **Payer referrals (`payerReferrals.js`)** — a payer who passes a worker's
+  referral code (`body.referralCode` on `POST /oracle`) on their first
+  verified payment is attributed to that worker, once and permanently, with
+  an informational credit (`PAYER_REFERRAL_REWARD_BPS` of that payment)
+  listed at `GET /admin/referral-earnings`. Bookkeeping only: nothing is
+  paid out.
+- **Canary deployments ([docs/runbooks/canary-deployment.md](docs/runbooks/canary-deployment.md))** —
+  `INSTANCE_ROLE=canary` serves read-only traffic and never signs as the
+  platform key; a fleet-wide signer lock stops two instances racing the
+  platform account's sequence number; SIGTERM drains in-flight questions
+  before exit; `npm run canary:preflight` checks a canary matches the primary.
+- Every environment variable the code reads is documented in
+  [`.env.example`](.env.example); `npm run check:env` (run in CI) fails on drift.
 - A SEP-24/SEP-12 fiat anchor client (`anchorClient.js`) — Arbiter never
   holds PII or bank details itself, only resolves and caches the
   configured anchor's public `stellar.toml` for the frontend.
@@ -146,19 +178,19 @@ and against the developer sandbox for a real round trip.
 
 ## Webhooks
 
-Instead of polling `GET /oracle/:jobId`, a payer or API-key customer can
-register a URL that receives a signed `POST` whenever one of their
-questions settles, whether it's resolved or refunded.
+Instead of polling `GET /oracle/:jobId`, a payer can register a webhook
+endpoint and receive a signed delivery when a question settles. Deliveries
+are retried with bounded backoff and are idempotent per job id, so a
+receiver can safely treat a repeated delivery as the same event.
 
-**Register, list, delete.** Authenticate as either:
-- an API-key customer: `Authorization: Bearer ak_live_...`, or
-- a wallet payer: `address` plus a session `token` from
-  `POST /payers/:address/session`, sent in the JSON body or the query string.
+## Running it locally
 
-```http
-POST   /webhooks        {"url": "https://example.com/arbiter", "description": "prod"}
-GET    /webhooks
-DELETE /webhooks/:id
+Install dependencies, copy `.env.example` to `.env`, and start the server:
+
+```sh
+npm install
+cp .env.example .env
+npm start
 ```
 
 The `201` response to `POST /webhooks` includes the registration's signing
@@ -315,6 +347,18 @@ bottleneck (serialized on-chain settlement) are in
 [docs/capacity/README.md](docs/capacity/README.md).
 
 ## Handsoff notes
+`GET /health` should then answer, and `POST /oracle/sandbox` gives a
+zero-payment, zero-chain response shape without any wallet or chain setup.
+See [docs/local-full-stack.md](docs/local-full-stack.md) for the full
+local stack (Redis, worker console, and the app build).
 
 <!-- handsoff-issue-108 -->
 - #108: A public status page reporting real uptime/incident history
+
+<!-- handsoff-issue-84 -->
+- #84: Multi-tenant white-label backend
+
+## Handsoff notes
+
+<!-- handsoff-issue-241 -->
+- #241: All three billing processors call an undefined resolveCurrency()/SUPPORTED_CURRENCIES

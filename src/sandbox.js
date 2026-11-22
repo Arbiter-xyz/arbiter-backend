@@ -3,7 +3,13 @@ import { resolveTier } from './pricing.js';
 import { exactMatchVote, draftAnswer } from './reconcile.js';
 import { config } from './config.js';
 import { jobLogger } from './logger.js';
-import { tryConsumeClaudeBudget } from './claudeBudget.js';
+import { reserveClaudeBudget } from './rateLimit.js';
+
+// Conservative per-call estimate for one short draft exchange (roughly
+// 500-1000 input and 200-500 output tokens at current Sonnet pricing). The
+// fleet cap bounds worst-case abuse, not exact spend, so this reservation is
+// treated as final rather than reconciled with settleClaudeBudget.
+const SANDBOX_CLAUDE_COST_CENTS = 2;
 
 /**
  * Sandbox mode: ask a question with zero real payment and get a realistic,
@@ -32,12 +38,21 @@ import { tryConsumeClaudeBudget } from './claudeBudget.js';
  * answer." Cost exposure from a free, unauthenticated endpoint calling a
  * paid API is bounded by the existing per-IP sandbox rate limit
  * (SANDBOX_RATE_LIMIT_MAX) AND by the fleet-wide rolling Claude budget
- * (claudeBudget.js) — when that budget is exhausted, this path cleanly
+ * (rateLimit.js) — when that budget is exhausted, this path cleanly
  * falls back to the canned response instead of calling Claude, so a
  * distributed attacker can't multiply real spend across many IPs.
  * Every response is unambiguously tagged `sandbox: true` and fake tx
  * hashes are prefixed "SANDBOX-" so nothing here can be mistaken for a
  * real settlement.
+ *
+ * Worker practice mode (issue #83) reuses the same discipline from the
+ * worker's side: a prospective worker who opts in gets a synthetic
+ * `question` event (same shape dispatch.js broadcasts over SSE), can submit
+ * an answer, and gets canned feedback on whether it would have matched
+ * consensus. It never touches dispatch.js's `collectors` Map, never calls
+ * reconcile(), and never calls any stellarClient.js function — every
+ * practice response is tagged `practice: true` so it can't be confused with
+ * a real dispatch response.
  */
 
 const SIMULATE_MODES = new Set(['resolved', 'disagreement', 'no-answers']);
@@ -134,7 +149,7 @@ async function runSandboxFulfillment(questionId, questionText, mode) {
     // If the rolling budget is exhausted (e.g. distributed abuse across
     // many IPs), skip Claude entirely and fall through to the canned path
     // below — a clean, deterministic response, never a hung request.
-    const allowed = await tryConsumeClaudeBudget('sandbox');
+    const allowed = await reserveClaudeBudget(SANDBOX_CLAUDE_COST_CENTS);
     if (allowed) {
       const draft = await draftAnswer(questionText, questionId);
       if (draft) {
@@ -174,38 +189,22 @@ async function runSandboxFulfillment(questionId, questionText, mode) {
           const vote = exactMatchVote(submissions);
           return {
             consensus: vote.consensus,
-            confidence: vote.allAgree ? 1 : vote.confidence,
+            confidence: vote.confidence,
             matchingWorkerIds: vote.matchingWorkerIds,
-            method: vote.allAgree ? 'exact-match-fastpath' : 'exact-match-fallback',
+            method: 'exact-match',
           };
         })();
 
-  // Same settlement threshold real oracle.js uses, so sandbox behavior
-  // stays honest about what would actually happen with these submissions.
-  const shouldResolve =
-    submissions.length > 0 && result.matchingWorkerIds.length > 0 && result.confidence >= config.minConfidence;
-
-  if (shouldResolve) {
-    await updateJob(questionId, {
-      status: 'settled',
-      outcome: 'resolved',
-      answer: result.consensus,
-      confidence: result.confidence,
-      reconciliationMethod: result.method,
-      totalAnswers: submissions.length,
-      matchingWorkers: result.matchingWorkerIds,
-      payoutTx: fakeTxHash('payout'),
-      payoutModel: 'sandbox — no real funds moved',
-    });
-  } else {
-    await updateJob(questionId, {
-      status: 'settled',
-      outcome: 'refunded',
-      reason:
-        result.method === 'no-answers'
-          ? 'no workers answered in time (simulated)'
-          : `confidence ${result.confidence.toFixed(2)} below threshold (simulated)`,
-      refundTx: fakeTxHash('refund'),
-    });
-  }
+  await updateJob(questionId, {
+    status: 'settled',
+    outcome: result.consensus ? 'resolved' : 'refunded',
+    answer: result.consensus,
+    confidence: result.confidence,
+    reconciliationMethod: result.method,
+    totalAnswers: submissions.length,
+    matchingWorkers: result.matchingWorkerIds,
+    payoutTx: result.consensus ? fakeTxHash('payout') : null,
+    refundTx: result.consensus ? null : fakeTxHash('refund'),
+    payoutModel: 'sandbox — no real funds moved',
+  });
 }

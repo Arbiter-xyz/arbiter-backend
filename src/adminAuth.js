@@ -1,6 +1,9 @@
 import { timingSafeEqual, createHash } from 'node:crypto';
 import { config } from './config.js';
 import { hashApiKey } from './apiKeyAuth.js';
+import { store } from './store.js';
+import { logger, recordRequestContext } from './logger.js';
+import { verifyTotp } from './totp.js';
 
 /**
  * Constant-time string comparison so a wrong admin token can't leak
@@ -39,6 +42,35 @@ function sessionIdForHash(hash) {
   return createHash('sha256').update(`admin-session:${hash}`).digest('hex').slice(0, 32);
 }
 
+// #132: session recording/replay. Every authenticated admin request is
+// appended (redacted, via logger.js's recordRequestContext) to a durable,
+// capped list keyed by the caller's session id, so a ticket can be debugged
+// by replaying the ordered sequence of admin calls that session made.
+const SESSION_RECORDING_PREFIX = 'admin-session-recording:';
+const MAX_RECORDED_ACTIONS_PER_SESSION = 500;
+const SESSION_RECORDING_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Appends one redacted request context to the recording for `sessionId`.
+ * Best-effort and never throws into the request path: a store hiccup must
+ * never fail or delay the admin call it's merely recording. */
+async function recordAdminSessionAction(sessionId, req) {
+  try {
+    const key = `${SESSION_RECORDING_PREFIX}${sessionId}`;
+    const existing = (await store.get(key)) || [];
+    const entry = { ...recordRequestContext(req), at: Date.now() };
+    const next = [...existing, entry].slice(-MAX_RECORDED_ACTIONS_PER_SESSION);
+    await store.set(key, next, SESSION_RECORDING_TTL_MS);
+  } catch (err) {
+    logger.warn({ err }, 'admin session recording failed');
+  }
+}
+
+/** Replays the recorded sequence of admin calls for one session, soonest
+ * first — the actual "replay" half of #132's session recording/replay. */
+export async function getAdminSessionRecording(sessionId) {
+  return (await store.get(`${SESSION_RECORDING_PREFIX}${sessionId}`)) || [];
+}
+
 /**
  * Resolve a presented bearer token against the one configured admin
  * secret. There's only one shared token (see the module doc comment above
@@ -47,8 +79,23 @@ function sessionIdForHash(hash) {
  * tier of secrets.
  */
 function resolveAdminCredential(token) {
-  if (!token || !safeEqual(token, config.admin.token)) return null;
+  if (!token) return null;
+  // Compare against every configured token (no early exit) so the number
+  // of tokens checked doesn't depend on which one matched.
+  let matched = false;
+  for (const candidate of config.admin.tokens) {
+    if (safeEqual(token, candidate)) matched = true;
+  }
+  if (!matched) return null;
   return { role: ROLE_FULL, sessionId: sessionIdForHash(token) };
+}
+
+/** Bearer token from an Express request (req.get) or a bare `{ headers }`
+ * object, so the REST middleware and GraphQL resolver guard read it the
+ * same way. */
+function bearerToken(req) {
+  const header = (typeof req?.get === 'function' ? req.get('authorization') : req?.headers?.authorization) || '';
+  return header.startsWith('Bearer ') ? header.slice(7) : null;
 }
 
 /** Resolve the role granted by a presented token, or null if it matches no
@@ -66,20 +113,22 @@ function roleSatisfies(role, required) {
 }
 
 /**
- * Express middleware factory. `requireAdmin()` (or `requireAdmin('full')`)
- * requires a full-admin credential; `requireAdmin('readonly')` accepts either
- * a read-only or a full credential. Rejects with 401 when no credential is
- * presented/matched, and 403 when a valid credential lacks the required role.
+ * Express middleware factory. `requireAdminRole('full')` requires a
+ * full-admin credential; `requireAdminRole('readonly')` accepts either a
+ * read-only or a full credential. Fails closed with 503 when no admin
+ * token is configured at all, 401 when no credential is presented/matched,
+ * and 403 when a valid credential lacks the required role.
  *
  * On success the resolved role and session id are attached to the request so
  * downstream audit/recording middleware can attribute the call to a caller
  * session (#132).
  */
-export function requireAdmin(required = ROLE_FULL) {
+export function requireAdminRole(required = ROLE_FULL) {
   return (req, res, next) => {
-    const header = req.headers.authorization || '';
-    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-    const cred = resolveAdminCredential(token);
+    if (config.admin.tokens.length === 0) {
+      return res.status(503).json({ error: 'admin console not configured (ADMIN_TOKEN/ADMIN_TOKENS unset)' });
+    }
+    const cred = resolveAdminCredential(bearerToken(req));
 
     if (!cred) {
       return res.status(401).json({ error: 'unauthorized' });
@@ -88,10 +137,57 @@ export function requireAdmin(required = ROLE_FULL) {
       return res.status(403).json({ error: 'forbidden', requiredRole: required });
     }
 
+    // #130: admin 2FA. Only enforced once an operator has provisioned
+    // ADMIN_TOTP_SECRET; see config.js's admin.totpSecret doc comment.
+    if (config.admin.totpSecret) {
+      const code = req.get('x-admin-totp');
+      if (!verifyTotp(config.admin.totpSecret, code)) {
+        return res.status(401).json({ error: 'missing or invalid X-Admin-TOTP code' });
+      }
+    }
+
     req.adminRole = cred.role;
     req.adminSessionId = cred.sessionId;
+
+    // #132: session recording. Fire-and-forget — recording a call must
+    // never slow down or fail the call itself.
+    recordAdminSessionAction(cred.sessionId, req);
+
     return next();
   };
+}
+
+/** The gate every /admin/* route mounts directly (`app.get(path,
+ * requireAdmin, handler)`): a full-admin credential is required. */
+export const requireAdmin = requireAdminRole(ROLE_FULL);
+
+/**
+ * Resolver-level admin guard for GraphQL (#74). GraphQL doesn't route
+ * through Express middleware per-field the way REST routes do, so admin
+ * fields call this directly from their resolvers. It reuses the exact same
+ * credential check as `requireAdmin` (via `resolveAdminCredential`) so the
+ * two surfaces can never drift apart, and throws a GraphQLError carrying
+ * the same 401/403 status the REST middleware would return — an
+ * unauthenticated admin query is rejected, never silently resolved to null.
+ *
+ * `context` is the per-request GraphQL context; the bearer token is read
+ * from `context.req.headers.authorization`, mirroring the REST middleware.
+ */
+export function requireAdminResolver(context, required = ROLE_FULL) {
+  const cred = resolveAdminCredential(bearerToken(context?.req));
+
+  if (!cred) {
+    const err = new Error('unauthorized');
+    err.extensions = { code: 'UNAUTHENTICATED', http: { status: 401 } };
+    throw err;
+  }
+  if (!roleSatisfies(cred.role, required)) {
+    const err = new Error('forbidden');
+    err.extensions = { code: 'FORBIDDEN', http: { status: 403 }, requiredRole: required };
+    throw err;
+  }
+
+  return cred;
 }
 
 /**
@@ -178,11 +274,3 @@ export function createInvoiceBilledAccount({ createAccount, store }) {
   };
 }
 
-/**
- * Gate for GET /metrics. Reuses the exact same bearer-token check as
- * /admin/* (requireAdmin) so the Prometheus scrape endpoint is protected
- * by the same ADMIN_TOKEN and the same fail-closed behavior when it is
- * unset. Kept as a named alias rather than a second implementation so the
- * two surfaces can never drift apart.
- */
-export const requireMetricsAuth = requireAdmin;
