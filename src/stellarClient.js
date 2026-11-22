@@ -231,16 +231,15 @@ const signerLock = createSignerLock({
   waitMs: config.canary.signerLockWaitMs,
 });
 
-function invokeAsAdmin(method, scValArgs) {
-  return serializeAdminCall(() => signerLock.run(() => runInvokeAsAdmin(method, scValArgs))).then(
-    (result) => {
-      recordAdminInvocation(method, true);
-      return result;
-    } catch (err) {
-      recordAdminInvocation(method, 'failure', Date.now() - startedAt);
-      throw err;
-    }
-  });
+async function invokeAsAdmin(method, scValArgs) {
+  try {
+    const result = await serializeAdminCall(() => signerLock.run(() => runInvokeAsAdmin(method, scValArgs)));
+    recordAdminInvocation(method, true);
+    return result;
+  } catch (err) {
+    recordAdminInvocation(method, false);
+    throw err;
+  }
 }
 
 /** Reads a contract method via simulation (no submission, no signing). */

@@ -7,6 +7,7 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "check": "node --check src/*.js scripts/*.js",
+    "boot-smoke-test": "node scripts/boot-smoke-test.js",
     "test": "node --test --test-timeout=30000"
   },
   "keywords": [],

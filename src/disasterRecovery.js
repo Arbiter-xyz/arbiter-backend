@@ -208,4 +208,97 @@ export async function sweepPendingQuestions(deps, options = {}) {
       const { hash } = await deps.refund(questionId);
       item.result = 'ok';
       item.refundTx = hash;
-      await deps.recordRefund(questionId, { reason, hash,
+      recoveryRefundsTotal.inc({ reason });
+      await deps.recordRefund(questionId, { reason, hash, at: Date.now() });
+    } catch (err) {
+      item.result = 'error';
+      item.error = err.message;
+      logger.error({ err, questionId }, 'disaster recovery: failed to process pending question');
+    }
+  }
+
+  recoveryActionable.set(items.filter((i) => i.action === 'refund').length);
+  onchainPendingQuestions.set(snapshot.ids.length);
+  recoverySweepLastSuccess.set(Date.now());
+
+  return {
+    startedAt,
+    finishedAt: Date.now(),
+    consistent: true,
+    scanned: snapshot.ids.length,
+    items,
+    refundsAttempted,
+  };
+}
+
+let sweepInFlight = false;
+
+/**
+ * Serializes sweeps: `/admin/recovery/sweep` and the background scheduler
+ * both call this, and a sweep can take a while against the chain, so a
+ * second caller gets `null` (surfaced by server.js as 409) instead of two
+ * sweeps racing refund() against the same questions.
+ */
+export async function runRecoverySweep({ deps, options = {} } = {}) {
+  if (sweepInFlight) return null;
+  sweepInFlight = true;
+  try {
+    return await sweepPendingQuestions(deps, options);
+  } catch (err) {
+    recoverySweepFailuresTotal.inc({ reason: 'sweep_error' });
+    logger.error({ err }, 'disaster recovery sweep failed');
+    throw err;
+  } finally {
+    sweepInFlight = false;
+  }
+}
+
+/**
+ * Wires sweepPendingQuestions()'s deps to the real chain/store. Contract
+ * reads go through stellarClient's generic simulateRead() against the
+ * pending-question methods documented in arbiter-contract v0.3.0+
+ * (pending_count/list_pending/get_question); refunds reuse the same
+ * admin-signed refundQuestion() the fail-closed path already uses.
+ */
+export async function defaultRecoveryDeps() {
+  const { simulateRead, refundQuestion, getLatestLedgerSequence, u64Arg } = await import('./stellarClient.js');
+  const { getJob } = await import('./jobs.js');
+  const { getStashedQuestion } = await import('./pendingQuestions.js');
+  const { store } = await import('./store.js');
+
+  return {
+    getPendingCount: async () => Number(await simulateRead('pending_count', [])) || 0,
+    listPending: async (start, limit) =>
+      (await simulateRead('list_pending', [u64Arg(start), u64Arg(limit)])) || [],
+    getQuestion: async (questionId) => {
+      try {
+        return await simulateRead('get_question', [u64Arg(questionId)]);
+      } catch (err) {
+        logger.warn({ err, questionId }, 'disaster recovery: get_question read failed');
+        return null;
+      }
+    },
+    getJob: (questionId) => getJob(String(questionId)),
+    getStash: (questionId) => getStashedQuestion(String(questionId)),
+    getLatestLedger: getLatestLedgerSequence,
+    refund: (questionId) => refundQuestion(questionId),
+    recordRefund: (questionId, record) => store.set(`disaster-recovery:refund:${questionId}`, record),
+  };
+}
+
+/** Background scheduler: runs the sweep on an interval so stranded payers
+ * are refunded without an operator having to hit the admin endpoint. Never
+ * throws — a failed sweep is logged and retried on the next tick. */
+export function startRecoverySweeper(options = {}) {
+  const intervalMs = options.intervalMs ?? 15 * 60 * 1000;
+  const timer = setInterval(async () => {
+    try {
+      const deps = await defaultRecoveryDeps();
+      await runRecoverySweep({ deps, options });
+    } catch (err) {
+      logger.error({ err }, 'disaster recovery: scheduled sweep failed');
+    }
+  }, intervalMs);
+  if (typeof timer.unref === 'function') timer.unref();
+  return timer;
+}

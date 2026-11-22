@@ -3,7 +3,7 @@ import { logger } from './logger.js';
 import { numericToleranceVote } from './consensus.js';
 import { llmProvider, buildReconcileRequest, buildDraftRequest } from './llmProvider.js';
 
-export { buildReconcileRequest, buildDraftRequest, getClient } from './llmProvider.js';
+export { buildReconcileRequest, buildDraftRequest } from './llmProvider.js';
 
 // Worker-submitted answer text is untrusted input. It is interpolated into
 // the reconciliation prompt, so it must be clearly delimited and the model

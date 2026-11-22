@@ -212,9 +212,9 @@ export function pairSignals(counters = {}, context = {}) {
  * fast path and surfaces the pair to operators; `suspend` additionally drops
  * them from routing. Thresholds come from config.collusion.
  */
-export function assessQuorum(score) {
-  if (score >= config.collusion.suspendThreshold) return 'suspend';
-  if (score >= config.collusion.flagThreshold) return 'flag';
+function pairDisposition(score) {
+  if (score >= config.collusion.suspendScore) return 'suspend';
+  if (score >= config.collusion.flagScore) return 'flag';
   return 'ok';
 }
 
@@ -262,22 +262,62 @@ export async function rescorePair(key, { getReputation } = {}) {
     const sharedIp = ipsA.some((ip) => ipsB.includes(ip));
     const signals = pairSignals(counters, { referral, sharedIp });
     const score = scorePair(signals);
-    const disposition = assessQuorum(score);
+    const disposition = pairDisposition(score);
 
     await store.set(PAIR_PREFIX + key, { ...counters, score, disposition });
 
     if (disposition === 'ok') return { key, score, disposition };
 
+    // Surface via the same FLAG_PREFIX/SUSPENDED_PREFIX records the
+    // operator surface (listFlaggedPairs/isCollusionSuspended) reads, so
+    // this pipeline's findings are actually visible there instead of only
+    // sitting unread in PAIR_PREFIX.
+    const flagKey = FLAG_PREFIX + key;
+    const previous = await store.get(flagKey);
+    const now = Date.now();
+    const flag = {
+      ...(previous || { flaggedAt: now }),
+      pair: key,
+      workers: [a, b],
+      score,
+      signals,
+      counters,
+      updatedAt: now,
+    };
+    await store.set(flagKey, flag);
+    await pushBounded(FLAGGED_INDEX_KEY, key, MAX_FLAGGED_TRACKED);
+    if (!previous) logger.warn({ pair: key, score, signals }, 'collusion heuristic flagged a worker pair');
+
+    const reviewedScore = typeof flag.reviewedScore === 'number' ? flag.reviewedScore : -1;
+    if (disposition === 'suspend' && score > reviewedScore) {
+      await store.set(SUSPENDED_PREFIX + a, { partner: b, pair: key, score, since: now });
+      await store.set(SUSPENDED_PREFIX + b, { partner: a, pair: key, score, since: now });
+    }
+    return { key, score, disposition };
+  } catch (err) {
+    logger.warn({ err, key }, 'failed to rescore collusion pair');
+    return { key, score: 0, disposition: 'ok' };
+  }
+}
+
 function matchRatio(rep) {
   return rep && rep.total > 0 ? rep.matched / rep.total : null;
 }
 
+async function sharesIp(a, b) {
+  const [ipsA, ipsB] = await Promise.all([
+    store.get(WORKER_IPS_PREFIX + a).then((v) => v || []),
+    store.get(WORKER_IPS_PREFIX + b).then((v) => v || []),
+  ]);
+  return ipsA.some((ip) => ipsB.includes(ip));
+}
+
 /**
- * Pure scoring over already-loaded inputs. Returns { score, signals } where
- * each signal is 0..1 before weighting.
+ * Pure scoring over already-loaded inputs for evaluatePair(). Returns
+ * { score, signals } where each signal is 0..1 before weighting.
  */
-export function scorePair({ counters, ratioA, ratioB, referral, sharedIp }, minShared = config.collusion.minSharedQuestions) {
-  const { shared, sameAnswer, sameWrong, synced } = counters;
+function scorePairFromContext({ counters, ratioA, ratioB, referral, sharedIp }, minShared = config.collusion.minSharedQuestions) {
+  const { shared = 0, sameAnswer = 0, sameWrong = 0, synced = 0 } = counters;
   const signals = { sameWrong: 0, lift: 0, sync: 0, referral: referral ? 1 : 0, sharedIp: sharedIp ? 1 : 0 };
 
   // Once is a coincidence; twice in identical words is a pattern. Scales
@@ -305,13 +345,13 @@ export function scorePair({ counters, ratioA, ratioB, referral, sharedIp }, minS
 export async function evaluatePair(a, b, getReputation) {
   const key = pairKey(a, b);
   const [counters, repA, repB, link, sharedIp] = await Promise.all([
-    getPairCounters(key),
+    store.get(PAIR_PREFIX + key).then((c) => c || {}),
     getReputation(a),
     getReputation(b),
     store.get(LINK_PREFIX + key),
     sharesIp(a, b),
   ]);
-  const result = scorePair({
+  const result = scorePairFromContext({
     counters,
     ratioA: matchRatio(repA),
     ratioB: matchRatio(repB),
@@ -319,41 +359,6 @@ export async function evaluatePair(a, b, getReputation) {
     sharedIp,
   });
   return { pair: key, workers: splitPair(key), counters, referral: link || null, ...result };
-}
-
-async function rescorePair(a, b, getReputation) {
-  const evaluation = await evaluatePair(a, b, getReputation);
-  const { score } = evaluation;
-  const flagKey = FLAG_PREFIX + evaluation.pair;
-  const previous = await store.get(flagKey);
-  // An already-flagged pair is always re-written, even below threshold, so
-  // assessQuorum() sees the score fall rather than a stale high one.
-  if (score < config.collusion.flagScore && !previous) return evaluation;
-
-  const now = Date.now();
-  const flag = {
-    ...(previous || { flaggedAt: now }),
-    pair: evaluation.pair,
-    workers: evaluation.workers,
-    score,
-    signals: evaluation.signals,
-    counters: evaluation.counters,
-    updatedAt: now,
-  };
-  await store.set(flagKey, flag);
-  await pushBounded(FLAGGED_INDEX_KEY, evaluation.pair, MAX_FLAGGED_TRACKED);
-  if (!previous && score >= config.collusion.flagScore) logger.warn({ pair: evaluation.pair, score, signals: evaluation.signals }, 'collusion heuristic flagged a worker pair');
-
-  // An operator clearing a pair records the score they accepted; only a
-  // strictly worse score after that re-suspends, so review isn't undone by
-  // the very next quorum they share.
-  const reviewedScore = typeof flag.reviewedScore === 'number' ? flag.reviewedScore : -1;
-  if (score >= config.collusion.suspendScore && score > reviewedScore) {
-    for (const [worker, partner] of [evaluation.workers, [...evaluation.workers].reverse()]) {
-      await store.set(SUSPENDED_PREFIX + worker, { partner, pair: evaluation.pair, score, since: now });
-    }
-  }
-  return evaluation;
 }
 
 /**

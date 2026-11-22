@@ -201,6 +201,46 @@ export async function deliverWithRetry(target, event, options = {}) {
       return { ok: true, attempts: attempt, status: lastStatus };
     }
     if (lastStatus === 410) {
-      log.warn
+      log.warn({ attempt }, 'webhook endpoint gone (410); deactivating registration');
+      await deactivateWebhook(target.id, 'endpoint returned 410 Gone').catch(() => {});
+      await recordDelivery(target.id, { lastAttemptAt: at, lastStatus, lastError: null, lastEventId: event.id, outcome: 'failed' }).catch(() => {});
+      return { ok: false, attempts: attempt, status: lastStatus };
+    }
+
+    await recordDelivery(target.id, { lastAttemptAt: at, lastStatus, lastError, lastEventId: event.id, outcome: attempt === maxAttempts ? 'failed' : undefined }).catch(() => {});
+
+    if (attempt < maxAttempts) {
+      const delay = backoffDelayMs(attempt, baseDelayMs);
+      log.warn({ attempt, status: lastStatus, error: lastError, delay }, 'webhook delivery failed, retrying');
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    } else {
+      log.error({ attempt, status: lastStatus, error: lastError }, 'webhook delivery failed, giving up');
+    }
+  }
+
+  return { ok: false, attempts: maxAttempts, status: lastStatus, error: lastError };
+}
+
+/**
+ * Fire-and-forget: builds the settlement event and delivers it to every
+ * active webhook registered by the question's owner (payer or API-key
+ * customer; see webhooks.js's resolveJobOwner()). Never throws and never
+ * awaited by the caller (oracle.js) — a slow or dead receiver must not
+ * delay or fail settlement.
+ */
+export function enqueueSettlementWebhooks(questionId, job) {
+  (async () => {
+    try {
+      const owner = await resolveJobOwner(questionId, job);
+      if (!owner) return;
+      const targets = await getDeliveryTargets(owner);
+      if (!targets.length) return;
+      const event = buildSettlementEvent(questionId, job);
+      await Promise.all(targets.map((target) => deliverWithRetry(target, event)));
+    } catch (err) {
+      logger.error({ err, questionId }, 'failed to deliver settlement webhooks');
+    }
+  })();
+}
 
 /* … truncated 2029 chars — edit only what you need near the top … */
