@@ -63,9 +63,19 @@ export function parseTaxYear(value, now = new Date()) {
   return year;
 }
 
-/** USD with 2 decimals, rounded half-up to the cent, from USDC stroops. */
+/** USD with 2 decimals, rounded half-up to the cent, from USDC stroops.
+ *
+ * Reviewed for 1099 filing purposes (issue #276): adding half a cent then
+ * truncating on BigInt is exact round-half-up at the .005-cent boundary
+ * (e.g. 1_005_000n stroops -> 0.01, 1_004_999n -> 0.00), with no float
+ * error. Every call site passes a non-negative stroop total (credits,
+ * withdrawals, monthly sums), so the negative-input caveat of
+ * add-half-then-truncate does not apply. Negative input is rejected rather
+ * than silently rounded the wrong way. */
 export function stroopsToUsd(stroops) {
-  const cents = (BigInt(stroops) + STROOPS_PER_CENT / 2n) / STROOPS_PER_CENT;
+  const value = BigInt(stroops);
+  if (value < 0n) throw new TaxReportError('stroops must be non-negative');
+  const cents = (value + STROOPS_PER_CENT / 2n) / STROOPS_PER_CENT;
   return `${cents / 100n}.${(cents % 100n).toString().padStart(2, '0')}`;
 }
 
@@ -165,6 +175,8 @@ export async function buildTaxSummary(workerAddress, year, { includeLines = fals
   const withdrawnStroops = withdrawals.reduce((sum, w) => sum + BigInt(w.amountStroops), 0n);
 
   const thresholdCents = BigInt(Math.round(config.tax.reportingThresholdUsd * 100));
+  // Same half-up-to-the-cent rule as stroopsToUsd, so the threshold flag
+  // always agrees with the Box 1 figure it is derived from.
   const grossCents = (grossStroops + STROOPS_PER_CENT / 2n) / STROOPS_PER_CENT;
 
   const summary = {

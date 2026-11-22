@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { store } from './store.js';
 import { config } from './config.js';
+import { getContractId } from './stellarClient.js';
 
 const PREFIX = 'pending:';
 
@@ -43,7 +44,7 @@ export function getContractInstances() {
   if (Array.isArray(config.contracts) && config.contracts.length > 0) {
     return config.contracts;
   }
-  return [{ id: config.contractId }];
+  return [{ id: getContractId() }];
 }
 
 /**

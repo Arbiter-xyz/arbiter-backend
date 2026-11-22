@@ -1,6 +1,6 @@
 import { Horizon, TransactionBuilder, Operation, Asset, BASE_FEE, Address, xdr, nativeToScVal } from '@stellar/stellar-sdk';
 import { config } from './config.js';
-import { getAdminKeypair, u64Arg, addressArg } from './stellarClient.js';
+import { getAdminKeypair, u64Arg, addressArg, getContractId } from './stellarClient.js';
 import { withRetry } from './retry.js';
 
 // Horizon submission is safe to retry as a whole: a resubmission of the
@@ -108,7 +108,7 @@ export async function finalizeSponsoredOnboardTx(workerSignedXdr) {
 
 function expectedHostFunctionBytes(functionName, args) {
   const invokeArgs = new xdr.InvokeContractArgs({
-    contractAddress: new Address(config.contractId).toScAddress(),
+    contractAddress: new Address(getContractId()).toScAddress(),
     functionName,
     args,
   });
@@ -181,6 +181,19 @@ export async function feeBumpWithdrawTo(signedInnerXdr, workerAddress, beneficia
   return relayFeeBump(signedInnerXdr, 'sponsor/withdraw', 'withdraw_to', [
     addressArg(workerAddress),
     addressArg(beneficiaryAddress),
+    nativeToScVal(BigInt(amountStroops), { type: 'i128' }),
+  ]);
+}
+
+/** Relays a payer's own withdraw_balance(payer, amountStroops) call —
+ * reclaiming unused prepaid/metered balance (see metered.js's
+ * depositInstructions()). Without this, a metered payer who deposited via
+ * their own signature (never touching platform funds) would still need to
+ * hold XLM for this one reclaim call, the last gap in this backend's
+ * otherwise-consistent zero-XLM promise (#470). */
+export async function feeBumpWithdrawBalance(signedInnerXdr, payerAddress, amountStroops) {
+  return relayFeeBump(signedInnerXdr, 'sponsor/withdraw-balance', 'withdraw_balance', [
+    addressArg(payerAddress),
     nativeToScVal(BigInt(amountStroops), { type: 'i128' }),
   ]);
 }
