@@ -1,5 +1,5 @@
 {
-  "name": "backend",
+  "name": "arbiter-backend",
   "version": "1.0.0",
   "description": "Dispatch, settlement, and billing backend",
   "main": "src/server.js",
@@ -7,7 +7,9 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "check": "find src scripts -name '*.js' -print0 | xargs -0 -n1 node --check",
-    "test": "node --test --test-timeout=30000"
+    "test": "node --test --test-timeout=30000",
+    "lint": "find src scripts -name '*.js' -print0 | xargs -0 -n1 node --check",
+    "verify-provenance": "node scripts/verify-provenance.js"
   },
   "keywords": [],
   "author": "",
