@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import express from 'express';
 import { registry, metricsMiddleware, metricsHandler, recordJobScan } from '../src/metrics.js';
 import { probeStore, probeChain, probeJobs } from '../src/healthProbes.js';
-import { createFaultInjector, mountFaultRoutes, validateFault } from '../src/faultInjection.js';
+import { createFaultInjector, mountFaultRoutes, validateFault, isProtectedPath } from '../src/faultInjection.js';
 import { evaluateSecurityPosture } from '../src/securityPosture.js';
 
 async function value(name, labels = {}) {
@@ -79,6 +79,22 @@ describe('HTTP metrics and fault injection through a real Express app', () => {
     injector.clear();
   });
 
+  test('a catch-all fault never touches /metrics or the fault routes themselves (#282)', async () => {
+    injector.add({ type: 'http_error', pathPrefix: '/', status: 503 });
+    try {
+      assert.equal((await fetch(`${base}/oracle/1`)).status, 503);
+      const scrape = await fetch(`${base}/metrics`, { headers: { authorization: 'Bearer scrape-secret' } });
+      assert.equal(scrape.status, 200);
+      // Express matches routes case-insensitively, so the upper-case path must be exempt too.
+      assert.equal((await fetch(`${base}/ADMIN/faults`, { headers: { authorization: 'Bearer admin' } })).status, 200);
+      const cleared = await fetch(`${base}/admin/faults`, { method: 'DELETE', headers: { authorization: 'Bearer admin' } });
+      assert.equal(cleared.status, 204);
+      assert.equal((await fetch(`${base}/oracle/1`)).status, 200);
+    } finally {
+      injector.clear();
+    }
+  });
+
   test('fault routes are admin-gated', async () => {
     assert.equal((await fetch(`${base}/admin/faults`)).status, 401);
   });
@@ -88,6 +104,17 @@ describe('validateFault', () => {
   test('refuses faults that could blind the drill or lock it out', () => {
     assert.throws(() => validateFault({ type: 'http_error', pathPrefix: '/admin/faults' }));
     assert.throws(() => validateFault({ type: 'http_error', pathPrefix: '/metrics' }));
+    assert.throws(() => validateFault({ type: 'http_error', pathPrefix: '/ADMIN' }));
+    assert.throws(() => validateFault({ type: 'http_error', pathPrefix: '/Metrics/x' }));
+  });
+
+  test('isProtectedPath is segment-aware and case-insensitive', () => {
+    for (const p of ['/admin', '/admin/', '/admin/faults', '/ADMIN/faults', '/metrics', '/Metrics/']) {
+      assert.equal(isProtectedPath(p), true, p);
+    }
+    for (const p of ['/', '/administrators', '/metricsfoo', '/oracle/1', '/%61dmin/faults']) {
+      assert.equal(isProtectedPath(p), false, p);
+    }
   });
 
   test('rejects non-5xx statuses and unbounded delays', () => {

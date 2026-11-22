@@ -41,7 +41,7 @@ export function hashRecord(record) {
   return createHash('sha256').update(canonicalJson(record), 'utf8').digest('hex');
 }
 
-const INSTANT_METHODS = new Set(['llm-draft', 'llm-draft-unavailable']);
+const INSTANT_METHODS = new Set(['llm-draft', 'llm-draft-openai', 'llm-draft-unavailable']);
 
 /** The same resolve-or-refund rule oracle.js applies, restated as a pure
  * function of committed values so a verifier can re-apply it. */
@@ -91,23 +91,22 @@ function rederive(record) {
       break;
     }
 
-    case 'claude': {
+    case 'claude':
+    case 'openai': {
       const vote = exactMatchVote(submissions);
       check('fast path correctly not taken', !(vote.allAgree && submissions.every((s) => s.established)));
       const request = reconciliation.llm?.request;
       const prompt = request?.messages?.[0]?.content || '';
-      const rawBlock = submissions.map((s) => `Worker ${s.workerId}: "${s.answer}"`).join('\n');
-      const wrappedBlock = submissions
-        .map(
-          (s) =>
-            `Worker ${s.workerId}: "<untrusted_worker_answer>${String(s.answer).replace(/<\/?untrusted_worker_answer>/gi, '')}</untrusted_worker_answer>"`,
-        )
-        .join('\n');
+      // Two prompt formats exist: the current <worker_answer>-wrapped one
+      // (prompt-injection hardening) and the older quoted one, which records
+      // committed before that change still carry. Either must verify.
+      const wrapped = (a) => `<worker_answer>${String(a).replace(/<\/?worker_answer>/gi, '[worker_answer]')}</worker_answer>`;
+      const blocks = [
+        submissions.map((s) => `Worker ${s.workerId}: ${wrapped(s.answer)}`).join('\n'),
+        submissions.map((s) => `Worker ${s.workerId}: "${s.answer}"`).join('\n'),
+      ];
       check('LLM prompt contains the committed question', prompt.includes(`Question: "${question}"`));
-      check(
-        'LLM prompt contains exactly the committed submissions',
-        prompt.includes(`Worker answers:\n${wrappedBlock}\n\n`) || prompt.includes(`Worker answers:\n${rawBlock}\n\n`),
-      );
+      check('LLM prompt contains exactly the committed submissions', blocks.some((b) => prompt.includes(`Worker answers:\n${b}\n\n`)));
       const input = toolInput(reconciliation.llm?.response, 'report_consensus');
       check('LLM response contains a report_consensus tool call', input !== null);
       if (input) {
@@ -122,7 +121,8 @@ function rederive(record) {
       break;
     }
 
-    case 'llm-draft': {
+    case 'llm-draft':
+    case 'llm-draft-openai': {
       const prompt = reconciliation.llm?.request?.messages?.[0]?.content || '';
       check('no human submissions (instant tier)', submissions.length === 0);
       check('LLM prompt contains the committed question', prompt.includes(`Question: "${question}"`));
@@ -194,7 +194,7 @@ export function verifyPayout(record, call) {
   check(`on-chain call is ${expectedFn}()`, call.functionName === expectedFn, `got ${call.functionName}()`);
   check('on-chain question id matches', call.questionId === record.questionId, `got ${call.questionId}`);
   if (call.functionName === 'resolve') {
-    if (record.reconciliation.method === 'llm-draft') {
+    if (INSTANT_METHODS.has(record.reconciliation.method)) {
       check('instant tier credits exactly one address (the platform)', call.workers.length === 1 && call.losingWorkers.length === 0);
     } else {
       const matching = record.result.matchingWorkerIds;

@@ -106,11 +106,18 @@ export function classifyPendingQuestion({ question, job, stash, currentLedger },
 /**
  * Reads the whole on-chain Pending index. list_pending uses swap-remove, so
  * a settlement between two page reads can move an id across pages; the
- * count is re-read after paging and the scan retried if it moved. An id
- * missed by an inconsistent scan is simply picked up by the next sweep.
+ * count is re-read after paging and the scan retried if it moved.
+ *
+ * If every attempt is inconsistent, the snapshot is NOT a complete view of
+ * the Pending set: it may be missing ids that churned across pages. Callers
+ * must treat `consistent: false` as "incomplete" — the sweep skips acting on
+ * it (an incomplete snapshot could silently under-refund, or worse, misjudge
+ * a question's local state) and lets the next sweep retry. The partial ids
+ * are still returned for diagnostics.
  */
 export async function snapshotPendingIds({ getPendingCount, listPending }, { pageSize = 100, attempts = 3 } = {}) {
   let ids = new Set();
+  let lastCount = 0;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     ids = new Set();
     const before = await getPendingCount();
@@ -118,9 +125,10 @@ export async function snapshotPendingIds({ getPendingCount, listPending }, { pag
       for (const id of await listPending(start, pageSize)) ids.add(String(id));
     }
     const after = await getPendingCount();
+    lastCount = after;
     if (before === after) return { ids: [...ids], count: after, consistent: true };
   }
-  return { ids: [...ids], count: ids.size, consistent: false };
+  return { ids: [...ids], count: lastCount, consistent: false };
 }
 
 /**
@@ -139,6 +147,25 @@ export async function sweepPendingQuestions(deps, options = {}) {
   const startedAt = Date.now();
 
   const snapshot = await snapshotPendingIds(deps, { pageSize: opts.pageSize });
+  if (!snapshot.consistent) {
+    // The Pending index churned across every scan attempt, so this snapshot
+    // may be missing ids. Acting on it would silently under-refund (or skip)
+    // stranded payers; fail loudly and let the next sweep retry.
+    recoverySweepFailuresTotal.inc({ reason: 'inconsistent_snapshot' });
+    logger.warn(
+      { scanned: snapshot.ids.length, count: snapshot.count },
+      'disaster recovery: pending index inconsistent across all scan attempts; skipping sweep',
+    );
+    return {
+      startedAt,
+      finishedAt: Date.now(),
+      consistent: false,
+      scanned: snapshot.ids.length,
+      items: [],
+      refundsAttempted: 0,
+    };
+  }
+
   const currentLedger = await deps.getLatestLedger();
 
   const items = [];
@@ -254,7 +281,7 @@ export async function runRecoverySweep({ store, deps, options = {}, lockTtlMs = 
     logger.info({ summary: report.summary, onChainPending: report.onChainPending, dryRun: report.dryRun }, 'recovery sweep complete');
     return report;
   } catch (err) {
-    recoverySweepFailuresTotal.inc();
+    recoverySweepFailuresTotal.inc({ reason: 'scan_error' });
     logger.error({ err }, 'recovery sweep could not scan the chain');
     throw err;
   } finally {

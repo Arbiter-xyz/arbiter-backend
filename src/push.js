@@ -104,6 +104,25 @@ export async function rebuildSubscribedWorkers() {
   return live.length;
 }
 
+/** Boot-time entry point: replays the durable subscription index into the
+ * in-process map. Safe to call when push is unconfigured (no VAPID keys) —
+ * it's a no-op then, since no notifications could be sent anyway. Never
+ * throws: a store failure is logged and swallowed so it can't block boot. */
+export async function initPush() {
+  if (!ensureVapidConfigured()) {
+    logger.info('push disabled: VAPID keys not configured, skipping subscription rebuild');
+    return 0;
+  }
+  try {
+    const count = await rebuildSubscribedWorkers();
+    logger.info({ count }, 'rebuilt push subscription index on startup');
+    return count;
+  } catch (err) {
+    logger.error({ err }, 'failed to rebuild push subscription index on startup');
+    return 0;
+  }
+}
+
 /** Worker ids with a push subscription matching `category` (or all of
  * them, if category is falsy) — read from the in-process index, not the
  * store, so this only reflects subscriptions registered against THIS

@@ -3,23 +3,41 @@ import { createJob, updateJob, getJob, claimJob } from './jobs.js';
 import { dispatchAndCollect, recordOutcome, getReputation, getSmoothedOnlineWorkerCount, hasOnlineWhitelistedWorker } from './dispatch.js';
 import { assessQuorum, recordQuorumObservation } from './collusion.js';
 import { reconcile, draftAnswer } from './reconcile.js';
-import { resolveQuestion, refundQuestion, getQuestionOnChain } from './stellarClient.js';
-import { resolveTier, listTiersForClient, stroopsToUsdc, priceForTier, effectiveEscalatedPriceStroops } from './pricing.js';
+import { resolveQuestion, refundQuestion, getQuestionOnChain, getContractId, computeAnswerHash } from './stellarClient.js';
+import { getDispatchPause, describePause } from './maintenanceWindows.js';
+import { resolveTier, listTiersForClient, stroopsToUsdc, priceForTier } from './pricing.js';
 import { incrementStat } from './stats.js';
+import { DEFAULT_CONSENSUS_MODE } from './consensus.js';
 import { recordPayerQuestion } from './payerIndex.js';
 import { getPrivatePool } from './privatePools.js';
 import { notifyWorker } from './push.js';
 import { enqueueSettlementWebhooks } from './webhookDelivery.js';
 import { setJobWebhookOwner } from './webhooks.js';
 import { jobLogger } from './logger.js';
+import { raiseAlert } from './alerting.js';
 import { store } from './store.js';
 import { buildProvenanceRecord, saveProvenance, attachSettlement } from './provenance.js';
 import { config } from './config.js';
 import { undoWindowFor, holdThenDispatch, cancelHeld } from './undoWindow.js';
-import { verifySession } from './workerAuth.js';
+import { verifySession, requiresAuth } from './workerAuth.js';
 import { restoreCredit } from './billing.js';
 import { recordWorkerCredits } from './earnings.js';
 import { checkAutoWithdrawForWorkers } from './autoWithdraw.js';
+import { lookupReferralCode } from './referrals.js';
+import { createPayerReferralLedger } from './payerReferrals.js';
+import { createDrainController } from './canary.js';
+
+const payerReferralLedger = createPayerReferralLedger({
+  store,
+  lookupReferralCode,
+  rewardBps: config.payerReferrals.rewardBps,
+  enabled: config.payerReferrals.enabled,
+});
+
+// Every running fulfillment, so a SIGTERM (canary promotion/rollback,
+// ordinary redeploy) can wait for in-flight quorums to settle instead of
+// abandoning them in awaiting_workers. See canary.js and server.js.
+export const fulfillmentDrain = createDrainController();
 
 const IDEMPOTENCY_PREFIX = 'idempotency:';
 // Who may cancel an API-key-funded job. Kept out of the job record itself,
@@ -43,7 +61,7 @@ export function consensusRuleFromPending(pending) {
   return { mode: pending.consensusMode, tolerance: pending.consensusTolerance };
 }
 
-export async function issueChallenge(questionText, tierKey, category, consensusRule = null) {
+export async function issueChallenge(questionText, tierKey, category, consensusRule = null, { referralCode = null } = {}) {
   const questionId = (await nextQuestionId()).toString();
   // Price is snapshotted NOW, at quote time, from a SMOOTHED (trailing-
   // average) worker-supply signal rather than the instantaneous online
@@ -65,6 +83,9 @@ export async function issueChallenge(questionText, tierKey, category, consensusR
     category: category || null,
     createdAt: Date.now(),
     ...consensusStashFields(consensusRule),
+    // Carried to step 2: attribution happens once payment is verified and
+    // the payer's address is known (see attributePayerReferral below).
+    ...(referralCode ? { referralCode } : {}),
   });
 
   return {
@@ -73,7 +94,7 @@ export async function issueChallenge(questionText, tierKey, category, consensusR
     amountStroops: priced.priceStroops.toString(),
     surgeMultiplier: priced.surgeMultiplier,
     asset: { code: config.usdc.code, issuer: config.usdc.issuer, sacId: config.usdc.sacId },
-    contractId: config.contractId,
+    contractId: getContractId(),
     network: config.networkPassphrase,
     tier: priced.key,
     tiers: listTiersForClient(),
@@ -82,7 +103,7 @@ export async function issueChallenge(questionText, tierKey, category, consensusR
     ...consensusStashFields(consensusRule),
     autoRefundAfterLedgers: config.timeoutLedgers,
     instructions:
-      `Call submit(payer, ${questionId}, ${priced.priceStroops.toString()}) on contract ${config.contractId}, ` +
+      `Call submit(payer, ${questionId}, ${priced.priceStroops.toString()}) on contract ${getContractId()}, ` +
       'then retry POST /oracle with X-Payment-Tx and X-Question-Id headers. This call returns 202 immediately ' +
       `once payment is confirmed — poll GET /oracle/${questionId} for the result. If nobody settles this ` +
       `question within ${config.timeoutLedgers} ledgers of your payment landing, anyone (including you) may call ` +
@@ -101,14 +122,14 @@ export async function issueChallenge(questionText, tierKey, category, consensusR
  * questionId itself is already a natural idempotency key there (see
  * startFulfillment's claimJob() usage).
  */
-export async function issueChallengeIdempotent(questionText, tierKey, category, idempotencyKey, consensusRule = null) {
-  if (!idempotencyKey) return issueChallenge(questionText, tierKey, category, consensusRule);
+export async function issueChallengeIdempotent(questionText, tierKey, category, idempotencyKey, consensusRule = null, options = {}) {
+  if (!idempotencyKey) return issueChallenge(questionText, tierKey, category, consensusRule, options);
 
   const cacheKey = IDEMPOTENCY_PREFIX + idempotencyKey;
   const cached = await store.get(cacheKey);
   if (cached) return cached;
 
-  const challenge = await issueChallenge(questionText, tierKey, category, consensusRule);
+  const challenge = await issueChallenge(questionText, tierKey, category, consensusRule, options);
   await store.set(cacheKey, challenge, config.pendingQuestionTtlMs);
   return challenge;
 }
@@ -164,13 +185,20 @@ export async function verifyPayment(questionId) {
  * a cancelJob() claiming the job first. `apiKeyAccountId` marks a job
  * funded through the API-key path, whose `payerAddress` is the platform's
  * pooled fiat address — it's what cancelJob() authenticates against there.
+ *
+ * `referralCode` (or one stashed at step 1) attributes a payer to the worker
+ * who referred them, but only on that payer's first payment (#99).
  */
-export async function startFulfillment(questionId, pending, tier, payerAddress, { ownerAccountId } = {}) {
+export async function startFulfillment(questionId, pending, tier, payerAddress, { ownerAccountId, referralCode } = {}) {
   const claimed = await claimJob(questionId);
   if (!claimed) return { jobId: questionId };
 
   const holdMs = undoWindowFor(tier);
   const cancellableUntil = holdMs > 0 ? Date.now() + holdMs : null;
+  // A payer's private pool (privatePools.js) restricts dispatch to exactly
+  // their whitelisted workers. Empty pool = open network, as before.
+  const poolMembers = await getPrivatePool(payerAddress);
+  const dispatchable = { ...pending, whitelist: poolMembers.length > 0 ? poolMembers : null };
 
   await createJob(questionId, {
     ...(cancellableUntil ? { status: 'holding', cancellableUntil } : {}),
@@ -186,18 +214,27 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
     // of the job record: GET /oracle/:jobId, GET /payers/:address/questions
     // and GET /admin/transactions all spread the full record.
     category: pending.category || null,
+    ...(poolMembers.length > 0 ? { privatePool: true, privatePoolSize: poolMembers.length } : {}),
   });
 
   if (ownerAccountId) {
     await store.set(JOB_OWNER_PREFIX + questionId, { apiKeyAccountId: ownerAccountId }, config.jobResultTtlMs);
   }
-  if (payerAddress) await recordPayerQuestion(payerAddress, questionId);
+  if (payerAddress) {
+    // Read before recordPayerQuestion() adds this question, so "first
+    // payment" means no earlier verified payment from this address. Skipped
+    // for API-key jobs, whose payerAddress is the shared fiat pool.
+    const code = ownerAccountId ? null : referralCode || pending.referralCode;
+    const isFirstPayment = code ? (await getPayerQuestionIds(payerAddress)).length === 0 : false;
+    await recordPayerQuestion(payerAddress, questionId);
+    if (code) await attributePayerReferral(questionId, payerAddress, code, tier, isFirstPayment);
+  }
   // API-key customers are charged from the shared fiat pool, so `payer`
   // can't identify them; record who to send settlement webhooks to instead.
   if (ownerAccountId) await setJobWebhookOwner(questionId, `account:${ownerAccountId}`);
 
   if (!cancellableUntil) {
-    dispatchUnlessPaused(questionId, pending, tier).catch((err) =>
+    dispatchUnlessPaused(questionId, dispatchable, tier).catch((err) =>
       jobLogger(questionId).error({ err }, 'failed to start dispatch'),
     );
     return { jobId: questionId };
@@ -212,12 +249,36 @@ export async function startFulfillment(questionId, pending, tier, payerAddress, 
       const pause = await getDispatchPause();
       if (pause) return refundForDispatchPause(questionId, tier, pause);
       await updateJob(questionId, { status: 'awaiting_workers', cancellableUntil: null, dispatchedAt: Date.now() });
-      runFulfillment(questionId, pending, tier);
+      runFulfillment(questionId, dispatchable, tier);
     },
     (err) => jobLogger(questionId).error({ err }, 'failed to start dispatch after the undo window'),
   );
 
   return { jobId: questionId, cancellableUntil };
+}
+
+/**
+ * Records a payer referral without ever failing the payment it rides on:
+ * the escrow has already landed by now, so a bad code or a store hiccup is
+ * logged and dropped.
+ */
+async function attributePayerReferral(questionId, payerAddress, code, tier, isFirstPayment) {
+  try {
+    const result = await payerReferralLedger.recordFirstPaymentReferral({
+      payerAddress,
+      code,
+      questionId,
+      amountStroops: tier.priceStroops,
+      isFirstPayment,
+    });
+    if (result.recorded) {
+      jobLogger(questionId).info({ referrer: result.referral.referrer, payer: payerAddress }, 'payer referral attributed');
+    } else if (result.reason !== 'already_attributed') {
+      jobLogger(questionId).info({ reason: result.reason, payer: payerAddress }, 'payer referral not attributed');
+    }
+  } catch (err) {
+    jobLogger(questionId).warn({ err, payer: payerAddress }, 'failed to record payer referral');
+  }
 }
 
 async function dispatchUnlessPaused(questionId, pending, tier) {
@@ -248,11 +309,15 @@ async function refundForDispatchPause(questionId, tier, pause) {
 }
 
 function runFulfillment(questionId, pending, tier) {
-  fulfillOracleCall(questionId, pending, tier).catch((err) => {
+  fulfillmentDrain.track(fulfillOracleCall(questionId, pending, tier)).catch((err) => {
     // fulfillOracleCall is written to always settle the escrow before
     // returning; this catch is a last-resort net so a bug there can't leave
     // the job record stuck in 'awaiting_workers' forever.
     jobLogger(questionId).error({ err }, 'fulfillment crashed unexpectedly');
+    raiseAlert('fulfillment_crashed', `fulfillment crashed for question ${questionId}`, {
+      questionId,
+      error: err.message,
+    });
     updateJob(questionId, {
       status: 'settled',
       outcome: 'refund_pending_timeout',
@@ -372,14 +437,13 @@ async function fulfillOracleCall(questionId, pending, tier) {
     : undefined;
 
   let submissions = [];
-  // Only set for escalating tiers; see dispatchEscalating's return shape.
-  let escalated = null;
   try {
     submissions = await dispatchAndCollect(questionId, pending.question, {
       quorumSize: tier.quorumSize,
       timeoutMs: tier.timeoutMs,
       category: pending.category,
       preferEstablished: tier.preferEstablished,
+      whitelist: pending.whitelist,
       suggestion,
     });
   } catch (err) {
@@ -391,6 +455,21 @@ async function fulfillOracleCall(questionId, pending, tier) {
   }
 
   await updateJob(questionId, { status: 'reconciling', totalAnswers: submissions.length });
+
+  // A private pool with nobody online can't be answered by anyone else, so
+  // refund instead of falling back to the open network (fail closed).
+  if (pending.whitelist && submissions.length === 0 && !hasOnlineWhitelistedWorker(pending.whitelist)) {
+    await settleRefunded(questionId, [], {
+      consensus: null,
+      confidence: 0,
+      matchingWorkerIds: [],
+      method: 'no-private-pool-workers',
+      reason: "no worker from this payer's private pool was online to answer",
+    });
+    const owner = await store.get(JOB_OWNER_PREFIX + questionId);
+    if (owner?.apiKeyAccountId) await restoreCredit(owner.apiKeyAccountId, Number(tier.priceStroops));
+    return;
+  }
 
   // A flagged pair (collusion.js) that gave the same answer in this quorum
   // loses the reconcile fast path: their shared track record is exactly
@@ -407,23 +486,13 @@ async function fulfillOracleCall(questionId, pending, tier) {
 
   const result = await reconcile(pending.question, submissions, questionId, consensusRuleFromPending(pending));
 
-  // A lone answer has no peers to be reconciled against, so reconcile()'s
-  // "unanimous + established" fast path reports confidence 1 for it. Settling
-  // on one worker must not get to skip the confidence bar by construction:
-  // cap it at the confidence dispatch actually had in that worker, so the
-  // shouldResolve / MIN_CONFIDENCE gate below judges the real number, exactly
-  // as it does for every other path.
-  if (escalated && submissions.length === 1 && escalated.confidence !== null) {
-    result.confidence = Math.min(result.confidence, escalated.confidence);
-  }
-
   const shouldResolve =
     submissions.length > 0 && result.matchingWorkerIds.length > 0 && result.confidence >= config.minConfidence;
 
   await commitProvenance(questionId, pending, tier, submissions, result, shouldResolve ? 'resolve' : 'refund');
 
   if (shouldResolve) {
-    await settleResolved(questionId, submissions, result);
+    await settleResolved(questionId, submissions, result, pending);
   } else {
     await settleRefunded(questionId, submissions, result);
   }
@@ -471,32 +540,6 @@ async function recordSettlementProvenance(questionId) {
 }
 
 /**
- * Persists what an escalating question really cost — recruited-worker count,
- * final quorum target, and the effective price against the ceiling that was
- * charged — on the job record (surfaced by GET /oracle/:jobId and the admin
- * console), then lets the caller refund the difference if its billing flow
- * can (see startFulfillment). `amountStroops` stays the amount actually
- * charged; `effectiveAmountStroops` is what the recruited quorum was worth.
- */
-async function recordEscalationCost(questionId, tier, escalated, hooks) {
-  const effective = effectiveEscalatedPriceStroops(tier, escalated.recruitedWorkers);
-  await updateJob(questionId, {
-    recruitedWorkers: escalated.recruitedWorkers,
-    quorumSizeUsed: escalated.finalQuorumSize,
-    dispatchSettledBy: escalated.settledBy,
-    effectiveAmountStroops: effective.toString(),
-    effectiveAmount: stroopsToUsdc(effective),
-  });
-  if (hooks.onEffectiveCost) {
-    try {
-      await hooks.onEffectiveCost(effective);
-    } catch (err) {
-      jobLogger(questionId).error({ err }, 'onEffectiveCost hook failed');
-    }
-  }
-}
-
-/**
  * The `instant` tier's fulfillment: no human dispatch, no quorum wait —
  * generate a draft answer directly and settle immediately. There is no
  * human worker to pay here, so on success the platform address itself is
@@ -524,16 +567,17 @@ async function fulfillInstant(questionId, pending, tier) {
   await commitProvenance(questionId, pending, tier, [], result, resolved ? 'resolve' : 'refund');
 
   if (resolved) {
-    await settleInstantResolved(questionId, result);
+    await settleInstantResolved(questionId, result, pending);
   } else {
     await settleRefunded(questionId, [], result);
   }
   await recordSettlementProvenance(questionId);
 }
 
-async function settleInstantResolved(questionId, result) {
+async function settleInstantResolved(questionId, result, pending) {
   try {
-    const { hash } = await resolveQuestion(questionId, [config.platformAddress], []);
+    const answerHash = computeAnswerHash(pending?.question, result.consensus);
+    const { hash } = await resolveQuestion(questionId, [config.platformAddress], [], answerHash);
     await dropStashedQuestion(questionId);
     await incrementStat('resolved');
     const job = await updateJob(questionId, {
@@ -571,7 +615,7 @@ async function settleInstantResolved(questionId, result) {
   }
 }
 
-async function settleResolved(questionId, submissions, result) {
+async function settleResolved(questionId, submissions, result, pending) {
   try {
     const validWorkerIds = new Set(submissions.map((s) => s.workerId));
     const unknownWorkerIds = (result.matchingWorkerIds || []).filter((id) => !validWorkerIds.has(id));
@@ -580,8 +624,19 @@ async function settleResolved(questionId, submissions, result) {
     }
     const matchingSet = new Set(result.matchingWorkerIds);
     const losingWorkerIds = submissions.map((s) => s.workerId).filter((id) => !matchingSet.has(id));
+    const answerHash = computeAnswerHash(pending?.question, result.consensus);
 
-    const { hash } = await resolveQuestion(questionId, result.matchingWorkerIds, losingWorkerIds);
+    // resolve() takes Vec<Address>, so only real Stellar addresses can be
+    // settled on-chain. A workerId that isn't a valid address (the
+    // no-signup convenience path, see workerAuth.js) can never hold stake or
+    // withdraw, so it is left out of the on-chain payout set rather than
+    // making the whole resolve() call throw.
+    const { hash } = await resolveQuestion(
+      questionId,
+      result.matchingWorkerIds.filter(requiresAuth),
+      losingWorkerIds.filter(requiresAuth),
+      answerHash,
+    );
     await recordReputationOutcomes(questionId, submissions, result.matchingWorkerIds);
     await dropStashedQuestion(questionId);
     await incrementStat('resolved');
@@ -667,6 +722,10 @@ async function settleRefunded(questionId, submissions, result, extraJobFields = 
         { err },
         "refund() ALSO failed — payer can fall back to refund_timeout()",
       );
+      raiseAlert('refund_pending_timeout', `refund() failed for question ${questionId}; payer must wait for refund_timeout()`, {
+        questionId,
+        error: err.message,
+      });
       return null;
     });
 
