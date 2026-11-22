@@ -24,6 +24,7 @@ import {
   feeBumpStake,
   feeBumpWithdraw,
   feeBumpWithdrawTo,
+  feeBumpWithdrawBalance,
 } from './sponsor.js';
 import { getStashedQuestion, nextQuestionId } from './pendingQuestions.js';
 import { getOwedOnChain, getStakeOnChain, getLatestLedgerSequence } from './stellarClient.js';
@@ -904,6 +905,24 @@ app.post('/sponsor/withdraw', rateLimited('sponsor', byIp), async (req, res) => 
     res.json(result);
   } catch (err) {
     req.log.error({ err }, 'sponsor withdraw failed');
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Gasless relay for a metered/prepaid-balance payer reclaiming unused
+// deposited funds (see metered.js's depositInstructions()). Closes the
+// one withdrawal path in this backend that previously required the caller
+// to hold XLM (#470).
+app.post('/sponsor/withdraw-balance', rateLimited('sponsor', byIp), async (req, res) => {
+  const { xdr, payerAddress, amountStroops } = req.body || {};
+  if (!xdr || !payerAddress || !amountStroops) {
+    return res.status(400).json({ error: 'xdr, payerAddress, and amountStroops are required' });
+  }
+  try {
+    const result = await feeBumpWithdrawBalance(xdr, payerAddress, amountStroops);
+    res.json(result);
+  } catch (err) {
+    req.log.error({ err }, 'sponsor withdraw-balance failed');
     res.status(400).json({ error: err.message });
   }
 });
