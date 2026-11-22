@@ -158,6 +158,44 @@ const QUORUM_PREDICTION_CONFIG = {
   veryLongQuestionTokens: 120,
 };
 
+/**
+ * Pure function: predict a quorum size from quote-time signals.
+ *
+ * Available signals (all known before dispatch):
+ *   - question: the raw question text (length is a difficulty proxy)
+ *   - category: optional category label
+ *   - categoryHistory: optional per-category stats, e.g.
+ *       { reconciliationMethodDistribution: { claude: 0.6, vote: 0.4 } }
+ *     A high share of `claude` (LLM adjudication) means the category tends
+ *     to need scrutiny, so we raise the quorum.
+ *
+ * Returns an integer clamped to [config.min, config.max]. Never returns 0.
+ */
+export function predictQuorumSize(question, { category = null, categoryHistory = null, config = QUORUM_PREDICTION_CONFIG } = {}) {
+  const cfg = { ...QUORUM_PREDICTION_CONFIG, ...config };
+  let score = cfg.base;
+
+  // Length signal: longer questions tend to be more involved.
+  const tokenCount = typeof question === 'string' ? tokenize(question).length : 0;
+  if (tokenCount >= cfg.veryLongQuestionTokens) score += 2;
+  else if (tokenCount >= cfg.longQuestionTokens) score += 1;
+
+  // Category-history signal: fraction of past reconciliations that needed
+  // LLM adjudication (method 'claude'). Higher => harder => larger quorum.
+  const dist = categoryHistory?.reconciliationMethodDistribution;
+  if (dist && typeof dist === 'object') {
+    const claudeShare = Number(dist.claude) || 0;
+    if (claudeShare >= 0.5) score += 2;
+    else if (claudeShare >= 0.25) score += 1;
+  }
+
+  // Clamp: floor is at least 1 so the finish condition can always be met.
+  const min = Math.max(1, Math.floor(cfg.min));
+  const max = Math.max(min, Math.floor(cfg.max));
+  const clamped = Math.min(max, Math.max(min, Math.round(score)));
+  return clamped;
+}
+
 async function reconcileWithClaude(question, submissions, rule = null) {
   const { consensus, confidence, matchingWorkerIds, llm } = await llmProvider.reportConsensus(question, submissions, rule);
   assertMatchingWorkerIdsAreReal(matchingWorkerIds, submissions, question?.id);
@@ -281,6 +319,55 @@ const DRAFT_PROVIDERS = [
   { configured: () => llmProvider.isConfigured(), run: draftWithClaude },
   { configured: () => Boolean(config.openaiApiKey), run: draftWithOpenAI },
 ];
+
+/**
+ * reconcile() never throws and never hangs indefinitely on an external API
+ * outage — LLM providers are tried in order (Claude, then OpenAI), and only
+ * when every configured one has failed does it fall back to a deterministic
+ * vote so the caller can always settle the escrow one way or the other.
+ *
+ * Fast path: if every worker's answer clusters together (near-duplicate
+ * phrasing counts as agreement, or within `rule`'s numeric tolerance) AND
+ * every one of those workers is reputation-established, there is nothing
+ * for an LLM to adjudicate — skip it and save the latency/cost.
+ */
+export async function reconcile(question, submissions, questionId, rule = null) {
+  if (submissions.length === 0) {
+    return { consensus: null, confidence: 0, matchingWorkerIds: [], method: 'no-answers' };
+  }
+
+  const numeric = rule?.mode === 'numeric-tolerance';
+  const vote = numeric
+    ? numericToleranceVote(submissions, rule.tolerance, groupByNormalizedAnswer)
+    : clusterVote(submissions);
+  const allEstablished = submissions.every((s) => s.established);
+
+  if (vote.allAgree && allEstablished) {
+    return {
+      consensus: vote.consensus,
+      confidence: 1,
+      matchingWorkerIds: vote.matchingWorkerIds,
+      method: 'cluster-fastpath',
+    };
+  }
+
+  for (const provider of RECONCILE_PROVIDERS) {
+    if (!provider.configured()) continue;
+    try {
+      return await provider.run(question, submissions, rule);
+    } catch (err) {
+      logger.error({ err, questionId }, 'LLM reconciliation failed, trying next provider');
+    }
+  }
+
+  logger.error({ questionId }, 'no LLM reconciliation provider answered, falling back to cluster vote');
+  return {
+    consensus: vote.consensus,
+    confidence: vote.confidence,
+    matchingWorkerIds: vote.matchingWorkerIds,
+    method: 'cluster-fallback',
+  };
+}
 
 /**
  * The `instant` tier's entire fulfillment path — no worker submissions

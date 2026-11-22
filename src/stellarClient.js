@@ -232,15 +232,16 @@ const signerLock = createSignerLock({
 });
 
 function invokeAsAdmin(method, scValArgs) {
-  return serializeAdminCall(() => signerLock.run(() => runInvokeAsAdmin(method, scValArgs))).then(
+  return enqueueAdminCall(() => signerLock.run(() => runInvokeAsAdmin(method, scValArgs))).then(
     (result) => {
       recordAdminInvocation(method, true);
       return result;
-    } catch (err) {
-      recordAdminInvocation(method, 'failure', Date.now() - startedAt);
+    },
+    (err) => {
+      recordAdminInvocation(method, false);
       throw err;
-    }
-  });
+    },
+  );
 }
 
 /** Reads a contract method via simulation (no submission, no signing). */
@@ -264,6 +265,89 @@ export async function simulateRead(method, scValArgs = []) {
       { attempts: 2, timeoutMs: 10_000, baseDelayMs: 300, label: `simulateRead(${method})` },
     ),
   );
+}
+
+export async function getOwedOnChain(workerAddress) {
+  const owed = await simulateRead('get_owed', [addressArg(workerAddress)]);
+  return BigInt(owed ?? 0);
+}
+
+export async function getStakeOnChain(workerAddress) {
+  const stake = await simulateRead('get_stake', [addressArg(workerAddress)]);
+  return BigInt(stake ?? 0);
+}
+
+export async function getBalanceOnChain(payerAddress) {
+  const balance = await simulateRead('get_balance', [addressArg(payerAddress)]);
+  return BigInt(balance ?? 0);
+}
+
+// A data-less Rust enum variant (Status::Pending etc.) decodes via
+// scValToNative as a single-element ARRAY, e.g. ['Pending'] — confirmed
+// against a real deployed contract's live RPC response, not assumed from
+// memory. Handling only the plain-object shape here silently decodes
+// onChain.status to "0" (an array's stringified numeric key) instead of
+// "pending".
+export function decodeStatus(raw) {
+  if (Array.isArray(raw)) return String(raw[0]).toLowerCase();
+  if (typeof raw === 'string') return raw.toLowerCase();
+  if (raw && typeof raw === 'object') return Object.keys(raw)[0]?.toLowerCase();
+  return String(raw).toLowerCase();
+}
+
+/** Zero-fee simulated read — checks payment state without needing a signature. */
+export async function getQuestionOnChain(questionId) {
+  const native = await simulateRead('get_question', [u64Arg(questionId)]);
+  if (!native) return null;
+  return {
+    payer: native.payer,
+    amount: BigInt(native.amount),
+    status: decodeStatus(native.status),
+    createdAt: Number(native.created_at),
+  };
+}
+
+/** Charges a payer's prepaid balance for a question as the platform admin.
+ * Retrying is not safe here — an insufficient-balance error fails the same
+ * way again, so the caller should surface it, not retry it. */
+export async function chargeBalance(payerAddress, questionId, amountStroops) {
+  return invokeAsAdmin('charge', [addressArg(payerAddress), u64Arg(questionId), i128Arg(amountStroops)]);
+}
+
+/** touch() keeps a worker's storage entries from archiving off-chain when
+ * they have a balance but haven't been touched by any other call recently —
+ * a worker who earns once and never returns has no other way to keep their
+ * balance from archiving off-chain storage. */
+export async function touchWorker(workerAddress) {
+  return invokeAsAdmin('touch', [addressArg(workerAddress)]);
+}
+
+/** Builds and prepares (simulates + assembles footprint/auth) the worker's
+ * OWN withdraw() or withdraw_to() call, with the worker's account as the
+ * source, and returns it UNSIGNED. The backend never signs this — the
+ * worker does, then it goes through the same fee-bump relay (sponsor.js),
+ * whose invoked-function check matches this call byte for byte since the
+ * args are built the same way. */
+export async function buildWorkerWithdrawTx(workerAddress, amountStroops, beneficiaryAddress = null, timeoutSeconds = 3600) {
+  const srv = getServer();
+  const account = await withRetry(() => srv.getAccount(workerAddress), {
+    attempts: 2,
+    timeoutMs: 5_000,
+    baseDelayMs: 200,
+    label: 'getAccount(worker)',
+  });
+  const contract = new Contract(config.contractId);
+  const op = beneficiaryAddress
+    ? contract.call('withdraw_to', addressArg(workerAddress), addressArg(beneficiaryAddress), i128Arg(amountStroops))
+    : contract.call('withdraw', addressArg(workerAddress), i128Arg(amountStroops));
+
+  const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
+    .addOperation(op)
+    .setTimeout(timeoutSeconds)
+    .build();
+
+  const prepared = await srv.prepareTransaction(tx);
+  return prepared.toXDR();
 }
 
 /** Settles a single question on-chain as the platform admin. */
