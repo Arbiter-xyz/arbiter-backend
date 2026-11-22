@@ -95,7 +95,7 @@ function splitPair(key) {
 }
 
 function hashIp(ip) {
-  return createHmac('sha256', config.session.secret).update(`ip:${ip}`).digest('hex').slice(0, 32);
+  return createHmac('sha256', config.collusion.ipHashSecret).update(`ip:${ip}`).digest('hex').slice(0, 32);
 }
 
 async function pushBounded(key, value, max, ttlMs) {

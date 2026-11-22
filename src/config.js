@@ -52,6 +52,23 @@ function sessionSecret() {
 }
 const SESSION_SECRET = sessionSecret();
 
+// Dedicated key for hashing worker IPs in collusion.js (#278). Kept separate
+// from SESSION_SECRET so a session-signing secret is never reused as a
+// pseudonymization key (and so rotating one doesn't silently break the
+// other). Falls back to a random per-process key when unset — same posture
+// as the session secret fallback above: IP hashes then don't survive a
+// restart, which only weakens the sharedIp heuristic, never correctness.
+let ipHashSecretFallbackWarned = false;
+function ipHashSecret() {
+  if (process.env.COLLUSION_IP_HASH_SECRET) return process.env.COLLUSION_IP_HASH_SECRET;
+  if (!ipHashSecretFallbackWarned) {
+    console.warn('[config] COLLUSION_IP_HASH_SECRET not set — generating a random per-process key (worker IP hashes will not survive a restart)');
+    ipHashSecretFallbackWarned = true;
+  }
+  return randomBytes(32).toString('hex');
+}
+const COLLUSION_IP_HASH_SECRET = ipHashSecret();
+
 // Graceful SESSION_SECRET rotation (#7): during a bounded grace window,
 // session verification also accepts tokens signed by the immediately-prior
 // secret (SESSION_SECRET_PREVIOUS). The window is measured from process
@@ -612,6 +629,10 @@ export const config = Object.freeze({
     // Pair score at or above which both workers are also dropped from
     // routing eligibility (soft, fails open like every other routing gate).
     suspendScore: num(process.env.COLLUSION_SUSPEND_SCORE, 0.85),
+    // Dedicated HMAC key for worker IP hashing (#278). Deliberately not
+    // config.session.secret: key separation between session signing and
+    // IP pseudonymization.
+    ipHashSecret: COLLUSION_IP_HASH_SECRET,
   }),
 });
 

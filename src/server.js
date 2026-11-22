@@ -1514,7 +1514,7 @@ app.post('/admin/collusion/clear', requireAdmin, async (req, res) => {
 // ---------------------------------------------------------------------
 
 app.get('/anchor/config', async (req, res) => {
-  if (!isAnchorConfigured()) {
+  if (!isAnchorConfigured(config)) {
     return res.status(503).json({ error: 'no fiat anchor is configured on this server (ANCHOR_HOME_DOMAIN unset)' });
   }
   try {
