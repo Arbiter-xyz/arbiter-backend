@@ -73,6 +73,53 @@ export function groupByNormalizedAnswer(submissions) {
 
 export { exactMatchVote } from './vote.js';
 
+// ---------------------------------------------------------------------------
+// Crash recovery (issue #272)
+//
+// jobs.js persists job records with a `status` field (awaiting_workers ->
+// reconciling -> settled, plus holding/cancelling/pending_review) and, once
+// settled, an `outcome` of 'resolved' or 'refunded'. There is no `state`
+// field — checking one meant every job looked in-flight, so recovery
+// re-reconciled jobs that had already settled. These helpers read the real
+// fields and mirror jobs.js's TERMINAL_STATUSES set.
+// ---------------------------------------------------------------------------
+
+// Keep in sync with jobs.js's TERMINAL_STATUSES.
+export const TERMINAL_STATUSES = new Set(['settled']);
+
+/** True when a persisted job record is terminal (no reconciliation needed). */
+export function isTerminalJob(job) {
+  if (!job) return false;
+  return TERMINAL_STATUSES.has(job.status);
+}
+
+/**
+ * Decides what crash recovery should do with one persisted job record.
+ * Returns { action: 'skip' } for terminal jobs, { action: 'reconcile' } for
+ * in-flight ones, and { action: 'drop' } for records that are missing or
+ * carry no recognizable status (nothing to reconcile against).
+ */
+export function reconcileJob(job) {
+  if (!job || typeof job.status !== 'string') return { action: 'drop' };
+  if (isTerminalJob(job)) return { action: 'skip', outcome: job.outcome ?? null };
+  return { action: 'reconcile', status: job.status };
+}
+
+/**
+ * Walks the persisted job records and returns only the ones still in flight,
+ * i.e. the jobs a restarted process must re-check against on-chain truth.
+ * `getJob` is injected (jobs.js's getJob) so this stays pure and testable.
+ */
+export async function recoverInFlightJobs(jobIds, getJob) {
+  const inFlight = [];
+  for (const jobId of jobIds) {
+    const job = await getJob(jobId);
+    const decision = reconcileJob(job);
+    if (decision.action === 'reconcile') inFlight.push({ jobId, job });
+  }
+  return inFlight;
+}
+
 /**
  * Cluster raw submissions by semantic similarity, then vote on clusters
  * rather than raw strings. A cluster's size (not any single string's exact
