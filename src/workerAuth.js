@@ -119,12 +119,10 @@ function issueSessionToken(address) {
  * individual fields so the grace window works regardless of which shape
  * the config exposes.
  */
-function acceptedSessionSecrets(now = Date.now()) {
-  const resolved = config.session.secrets;
-  if (Array.isArray(resolved) && resolved.length > 0) {
-    return resolved;
+export function acceptedSessionSecrets(now = Date.now()) {
+  if (now === undefined && Array.isArray(config.session.secrets)) {
+    return config.session.secrets;
   }
-
   const secrets = [config.session.secret];
   const previous = config.session.previousSecret;
   const graceMs = config.session.rotationGraceMs;

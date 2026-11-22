@@ -167,3 +167,25 @@ test('a token signed with the previous SESSION_SECRET is rejected once the grace
     delete process.env.SESSION_SECRET_ROTATED_AT;
   }
 });
+
+test('config.session.secrets evaluates to an array of active secrets rather than a function reference (#244)', async () => {
+  const { config } = await import('../src/config.js');
+  assert.equal(Array.isArray(config.session.secrets), true);
+  assert.equal(typeof config.session.secrets, 'object');
+
+  const prev = process.env.SESSION_SECRET;
+  process.env.SESSION_SECRET = 'active-secret-123';
+  process.env.SESSION_SECRET_PREVIOUS = 'prior-secret-456';
+  process.env.SESSION_SECRET_ROTATION_GRACE_MS = '60000';
+  process.env.SESSION_SECRET_ROTATED_AT = String(Date.now());
+  try {
+    assert.deepEqual(config.session.secrets, ['active-secret-123', 'prior-secret-456']);
+    assert.equal(config.session.previousSecret, 'prior-secret-456');
+    assert.equal(config.session.rotationGraceMs, 60000);
+  } finally {
+    process.env.SESSION_SECRET = prev;
+    delete process.env.SESSION_SECRET_PREVIOUS;
+    delete process.env.SESSION_SECRET_ROTATION_GRACE_MS;
+    delete process.env.SESSION_SECRET_ROTATED_AT;
+  }
+});
