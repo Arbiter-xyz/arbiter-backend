@@ -86,6 +86,9 @@ export function parseNumericAnswer(text) {
   s = s.replace(/\s+/g, '');
   s = s.replace(/\.$/, ''); // trailing sentence period: "42."
   if (s.endsWith('%')) s = s.slice(0, -1);
+  // One separator followed by exactly three digits ("1,234" / "1.234") reads
+  // as a thousands group in one locale and a decimal in the other: ambiguous.
+  if (/^[+-]?\d{1,3}[.,]\d{3}$/.test(s)) return null;
   if (THOUSANDS_GROUPED.test(s)) s = s.replace(/,/g, '');
   else if (EU_THOUSANDS_GROUPED.test(s)) s = s.replace(/\./g, '').replace(',', '.');
   else if (DECIMAL_COMMA.test(s) && !THOUSANDS_GROUPED.test(s)) s = s.replace(',', '.');
