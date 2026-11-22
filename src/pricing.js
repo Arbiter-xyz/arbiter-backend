@@ -238,9 +238,16 @@ export function effectiveEscalatedPriceStroops(tier, recruitedWorkers) {
   return (tier.priceStroops * BigInt(n)) / BigInt(maxQuorum);
 }
 
+/**
+ * Client-facing tier catalogue (the `tiers` array of the 402 challenge and
+ * the metered quote). Escalating tiers additionally advertise their quorum
+ * range so a payer can see the ceiling they're quoted at and the floor they
+ * may be charged.
+ */
 export function listTiersForClient() {
   return Object.values(PRICING_TIERS).map((t) => ({
     key: t.key,
+    label: t.key,
     amount: stroopsToUsdc(t.priceStroops),
     amountStroops: t.priceStroops.toString(),
     quorumSize: t.quorumSize,

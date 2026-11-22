@@ -63,6 +63,21 @@ own integration against a locally run instance:
 This keeps your integration independent of Arbiter's platform key and of
 any single hot key's funding.
 
+## Teams and member roles
+
+Team/organization accounts (`teams.js`) are a named group of Stellar
+addresses that can see each other's question history and spend in one
+place. A team adds no new credential: it is a membership list over
+existing identities, so every member keeps paying from, and owning, their
+own address. Roles, strongest first:
+
+- **owner** — exactly one per team. Everything an admin can do, plus
+  promoting/demoting admins, transferring ownership, and deleting the
+  team. Can't leave or be removed without first transferring ownership, so
+  a team is never ownerless.
+- **admin** — add and remove plain members, rename the team.
+- **member** — read the team and its combined question history; leave.
+
 ## Static frontend hosting (`SERVE_STATIC_APP`)
 
 By default the backend also serves the built worker-console/dashboard/
@@ -163,7 +178,25 @@ and against the developer sandbox for a real round trip.
 
 ## Webhooks
 
-Instead of polling `GE
+Instead of polling `GET /oracle/:jobId`, a payer can register a webhook
+endpoint and receive a signed delivery when a question settles. Deliveries
+are retried with bounded backoff and are idempotent per job id, so a
+receiver can safely treat a repeated delivery as the same event.
+
+## Running it locally
+
+Install dependencies, copy `.env.example` to `.env`, and start the server:
+
+```sh
+npm install
+cp .env.example .env
+npm start
+```
+
+`GET /health` should then answer, and `POST /oracle/sandbox` gives a
+zero-payment, zero-chain response shape without any wallet or chain setup.
+See [docs/local-full-stack.md](docs/local-full-stack.md) for the full
+local stack (Redis, worker console, and the app build).
 
 <!-- handsoff-issue-108 -->
 - #108: A public status page reporting real uptime/incident history

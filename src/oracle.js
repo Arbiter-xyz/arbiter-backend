@@ -437,8 +437,6 @@ async function fulfillOracleCall(questionId, pending, tier) {
     : undefined;
 
   let submissions = [];
-  // Only set for escalating tiers; see dispatchEscalating's return shape.
-  let escalated = null;
   try {
     submissions = await dispatchAndCollect(questionId, pending.question, {
       quorumSize: tier.quorumSize,
@@ -548,32 +546,6 @@ async function recordSettlementProvenance(questionId) {
     });
   } catch (err) {
     jobLogger(questionId).error({ err }, 'failed to record settlement provenance');
-  }
-}
-
-/**
- * Persists what an escalating question really cost — recruited-worker count,
- * final quorum target, and the effective price against the ceiling that was
- * charged — on the job record (surfaced by GET /oracle/:jobId and the admin
- * console), then lets the caller refund the difference if its billing flow
- * can (see startFulfillment). `amountStroops` stays the amount actually
- * charged; `effectiveAmountStroops` is what the recruited quorum was worth.
- */
-async function recordEscalationCost(questionId, tier, escalated, hooks) {
-  const effective = effectiveEscalatedPriceStroops(tier, escalated.recruitedWorkers);
-  await updateJob(questionId, {
-    recruitedWorkers: escalated.recruitedWorkers,
-    quorumSizeUsed: escalated.finalQuorumSize,
-    dispatchSettledBy: escalated.settledBy,
-    effectiveAmountStroops: effective.toString(),
-    effectiveAmount: stroopsToUsdc(effective),
-  });
-  if (hooks.onEffectiveCost) {
-    try {
-      await hooks.onEffectiveCost(effective);
-    } catch (err) {
-      jobLogger(questionId).error({ err }, 'onEffectiveCost hook failed');
-    }
   }
 }
 
