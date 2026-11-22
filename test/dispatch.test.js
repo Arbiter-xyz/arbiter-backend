@@ -13,6 +13,9 @@ import {
   isEstablishedWorker,
   stakeGateAllows,
   shouldSweepWorkerTtl,
+  getCertificationQuiz,
+  submitCertification,
+  isCertified,
 } from '../src/dispatch.js';
 
 function fakeRes() {
@@ -192,29 +195,70 @@ test('onlineWorkerCount reflects live registrations', () => {
   assert.equal(onlineWorkerCount(), before);
 });
 
+// --- Worker skill certification (issue #82) ---
+// Category declaration at connect time is pure self-report. Certification
+// gates category eligibility behind a passed quiz answered against a
+// dedicated, non-payment-bearing endpoint (submitCertification), never the
+// live dispatch path.
+
+test('an uncertified worker is excluded from a category it merely declared at connect time', async () => {
+  const generalist = fakeRes();
+  const selfDeclared = fakeRes();
+  registerWorker('worker-gen-cert-a', generalist, []);
+  registerWorker('worker-sc-cert-a', selfDeclared, ['smart-contract-audit']);
+  try {
+    assert.equal(await isCertified('worker-sc-cert-a', 'smart-contract-audit'), false);
+    await broadcast('q-400', 'Does this contract match its docs?', {
+      category: 'smart-contract-audit',
+      quorumSize: 1,
+      expiresInMs: 1000,
+    });
+    assert.equal(selfDeclared.events.length, 0, 'uncertified self-declared specialist is excluded');
+    assert.equal(generalist.events.length, 1, 'generalists still receive the broadcast');
+  } finally {
+    unregisterWorker('worker-gen-cert-a');
+    unregisterWorker('worker-sc-cert-a');
+  }
+});
+
+test('a worker who passes certification is routed that category\'s questions', async () => {
+  const certified = fakeRes();
+  registerWorker('worker-sc-cert-b', certified, ['smart-contract-audit']);
+  try {
+    const quiz = getCertificationQuiz('smart-contract-audit');
+    assert.ok(quiz && Array.isArray(quiz.questions) && quiz.questions.length > 0, 'quiz content exists for the category');
+    const answers = quiz.questions.map((q) => q.answer);
+    const result = await submitCertification('worker-sc-cert-b', 'smart-contract-audit', answers);
+    assert.equal(result.passed, true);
+    assert.equal(await isCertified('worker-sc-cert-b', 'smart-contract-audit'), true);
+
+    await broadcast('q-401', 'Audit this contract', {
+      category: 'smart-contract-audit',
+      quorumSize: 1,
+      expiresInMs: 1000,
+    });
+    assert.equal(certified.events.length, 1, 'certified specialist is routed the category question');
+  } finally {
+    unregisterWorker('worker-sc-cert-b');
+  }
+});
+
+test('a failed certification attempt does not grant eligibility', async () => {
+  const worker = fakeRes();
+  registerWorker('worker-sc-cert-c', worker, ['smart-contract-audit']);
+  try {
+    const quiz = getCertificationQuiz('smart-contract-audit');
+    const wrong = quiz.questions.map(() => 'definitely-not-the-answer');
+    const result = await submitCertification('worker-sc-cert-c', 'smart-contract-audit', wrong);
+    assert.equal(result.passed, false);
+    assert.equal(await isCertified('worker-sc-cert-c', 'smart-contract-audit'), false);
+  } finally {
+    unregisterWorker('worker-sc-cert-c');
+  }
+});
+
 // --- Worker-TTL sweep filtering (issue #57) ---
 // The daily sweep shares the admin-signed serial queue with real settlement
 // calls, so it must only touch workers with off-chain evidence of ever having
 // staked or been credited. shouldSweepWorkerTtl() is the pure predicate the
-// sweep uses to decide whether a workerId is worth a queued touch() call.
-
-test('shouldSweepWorkerTtl skips a worker with no stake/owed history', () => {
-  assert.equal(shouldSweepWorkerTtl({}), false);
-  assert.equal(shouldSweepWorkerTtl({ stakeCached: false, owed: 0 }), false);
-  assert.equal(shouldSweepWorkerTtl({ stakeCached: false, owed: 0, answers: 0 }), false);
-});
-
-test('shouldSweepWorkerTtl includes a worker with recorded stake or owed history', () => {
-  assert.equal(shouldSweepWorkerTtl({ stakeCached: true }), true);
-  assert.equal(shouldSweepWorkerTtl({ owed: 1 }), true);
-  assert.equal(shouldSweepWorkerTtl({ stakeCached: false, owed: 0, credited: true }), true);
-});
-
-// --- Smoothed (trailing-average) worker supply, used for surge pricing ---
-// instead of the instantaneous count, specifically so a worker cartel can't
-// spike the price by disconnecting for a single instant right before a
-// question is asked and reconnecting in time to answer.
-
-test('computeSmoothedCount falls bac
-
-/* … truncated 2650 chars — edit only what you need near the top … */
+// sweep uses

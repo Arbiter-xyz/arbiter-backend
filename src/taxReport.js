@@ -31,6 +31,17 @@ const STROOPS_PER_CENT = 100_000n;
 const US_STATE = /^[A-Z]{2}$/;
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
+/** Earliest tax year the platform could have recorded earnings. Derived
+ * from the platform's launch date (config.launchDate) rather than a
+ * hardcoded constant, so the floor moves with the platform instead of
+ * silently drifting out of date. Falls back to 2020 if no launch date is
+ * configured. */
+export function earliestTaxYear() {
+  const launch = config.launchDate ? new Date(config.launchDate) : null;
+  if (!launch || Number.isNaN(launch.getTime())) return 2020;
+  return launch.getUTCFullYear();
+}
+
 export class TaxReportError extends Error {
   constructor(message, status = 400) {
     super(message);
@@ -43,17 +54,28 @@ export class TaxReportError extends Error {
  * platform could have existed. */
 export function parseTaxYear(value, now = new Date()) {
   const currentYear = now.getUTCFullYear();
+  const minYear = earliestTaxYear();
   if (value === undefined || value === null || value === '') return currentYear - 1;
   const year = Number(value);
-  if (!Number.isInteger(year) || year < 2020 || year > currentYear) {
-    throw new TaxReportError(`year must be an integer between 2020 and ${currentYear}`);
+  if (!Number.isInteger(year) || year < minYear || year > currentYear) {
+    throw new TaxReportError(`year must be an integer between ${minYear} and ${currentYear}`);
   }
   return year;
 }
 
-/** USD with 2 decimals, rounded half-up to the cent, from USDC stroops. */
+/** USD with 2 decimals, rounded half-up to the cent, from USDC stroops.
+ *
+ * Reviewed for 1099 filing purposes (issue #276): adding half a cent then
+ * truncating on BigInt is exact round-half-up at the .005-cent boundary
+ * (e.g. 1_005_000n stroops -> 0.01, 1_004_999n -> 0.00), with no float
+ * error. Every call site passes a non-negative stroop total (credits,
+ * withdrawals, monthly sums), so the negative-input caveat of
+ * add-half-then-truncate does not apply. Negative input is rejected rather
+ * than silently rounded the wrong way. */
 export function stroopsToUsd(stroops) {
-  const cents = (BigInt(stroops) + STROOPS_PER_CENT / 2n) / STROOPS_PER_CENT;
+  const value = BigInt(stroops);
+  if (value < 0n) throw new TaxReportError('stroops must be non-negative');
+  const cents = (value + STROOPS_PER_CENT / 2n) / STROOPS_PER_CENT;
   return `${cents / 100n}.${(cents % 100n).toString().padStart(2, '0')}`;
 }
 
@@ -153,6 +175,8 @@ export async function buildTaxSummary(workerAddress, year, { includeLines = fals
   const withdrawnStroops = withdrawals.reduce((sum, w) => sum + BigInt(w.amountStroops), 0n);
 
   const thresholdCents = BigInt(Math.round(config.tax.reportingThresholdUsd * 100));
+  // Same half-up-to-the-cent rule as stroopsToUsd, so the threshold flag
+  // always agrees with the Box 1 figure it is derived from.
   const grossCents = (grossStroops + STROOPS_PER_CENT / 2n) / STROOPS_PER_CENT;
 
   const summary = {

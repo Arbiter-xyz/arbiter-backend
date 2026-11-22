@@ -1,21 +1,19 @@
 {
   "name": "backend",
   "version": "1.0.0",
-  "description": "Backend API for the payments demo",
-  "type": "module",
-  "main": "src/server.js",
+  "description": "",
+  "main": "src/index.js",
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "node --watch src/server.js",
-    "check": "node --check src/*.js",
-    "lint": "eslint src test",
-    "test": "node --test"
+    "start": "node server.js",
+    "grpc": "node grpc-server.js",
+    "test": "node --test test/*.js"
   },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
   "dependencies": {
-    "express": "^4.19.2"
-  },
-  "devDependencies": {
-    "eslint": "^9.9.0",
-    "eslint-plugin-promise": "^7.0.0"
+    "express": "^4.19.2",
+    "ioredis": "^5.4.1",
+    "pg": "^8.12.0"
   }
 }

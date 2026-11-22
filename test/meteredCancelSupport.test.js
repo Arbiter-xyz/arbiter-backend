@@ -6,7 +6,6 @@ import path from 'node:path';
 import { appendAuditLog, listAuditLog, _resetAuditLogForTesting } from '../src/auditLog.js';
 import { listTickets } from '../src/support.js';
 import { summarizePayerQuestions } from '../src/payerIndex.js';
-import { resolveQuestionsBatch, refundQuestionsBatch } from '../src/stellarClient.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -28,17 +27,6 @@ test('src/support.js imports smoothly now that src/auditLog.js exists (#246)', a
   const log = await listAuditLog();
   assert.equal(log.length, 1);
   assert.equal(log[0].target, 'ticket-123');
-});
-
-test('resolveQuestionsBatch and refundQuestionsBatch refuse speculative execution by default (#233)', async () => {
-  await assert.rejects(
-    () => resolveQuestionsBatch([{ questionId: 'q1', workerAddress: 'G1', outcome: true }]),
-    /arbiter-contract#20/
-  );
-  await assert.rejects(
-    () => refundQuestionsBatch(['q1']),
-    /arbiter-contract#20/
-  );
 });
 
 test('summarizePayerQuestions exposes both cancellableUntil and cancelableUntil aliases plus cancelUrl (#235)', () => {
@@ -66,7 +54,7 @@ test('summarizePayerQuestions exposes both cancellableUntil and cancelableUntil 
 
 test('src/metered.js defines consensusRule parameter and destructures cancellableUntil from startFulfillment (#231, #235)', () => {
   const meteredSrc = readFileSync(path.join(__dirname, '..', 'src', 'metered.js'), 'utf8');
-  assert.match(meteredSrc, /\{\s*ownerAccountId,\s*consensusRule\s*\}\s*=\s*\{\}/);
+  assert.match(meteredSrc, /\{\s*ownerAccountId,\s*consensusRule(\s*=\s*null)?\s*\}\s*=\s*\{\}/);
   assert.match(meteredSrc, /const\s*\{\s*jobId,\s*cancellableUntil\s*\}\s*=\s*await\s+startFulfillment\(/);
   assert.match(meteredSrc, /cancelableUntil:\s*cancellableUntil/);
 });

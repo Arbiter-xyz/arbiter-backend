@@ -47,6 +47,18 @@ import { getDeliveryTargets, resolveJobOwner, deactivateWebhook, isBlockedAddres
  * timers, so a restart mid-backoff drops the remaining attempts for that
  * event. That's acceptable for v1 because GET /oracle/:jobId remains the
  * source of truth, and it's logged so operators can see it.
+ *
+ * ── Restart durability (issue #289) ──────────────────────────────────────
+ *
+ * The in-process backoff timers above are intentionally not durable: a
+ * deploy mid-backoff drops the remaining attempts for that event. That is
+ * a deliberate v1 trade-off, not a bug — the event is still recoverable
+ * from GET /oracle/:jobId, and the drop is logged (see the `webhook retry
+ * abandoned` warning below) so operators can see it. Making retries
+ * survive a restart requires a durable queue (persisted pending deliveries
+ * + a startup drain), which is tracked separately as the dead-letter-queue
+ * feature gap. This comment exists so future audits can see the area was
+ * reviewed and the behavior is intentional.
  */
 
 export const SIGNATURE_HEADER = 'x-arbiter-signature';

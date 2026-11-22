@@ -33,7 +33,7 @@ const HOSTING_PLATFORM_MARKERS = [
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]', '0.0.0.0']);
 
-function isLoopbackHost(hostname) {
+export function isLoopbackHost(hostname) {
   return LOOPBACK_HOSTS.has(hostname) || hostname.startsWith('127.') || hostname.endsWith('.localhost');
 }
 
@@ -137,6 +137,18 @@ export function evaluateSecurityPosture(env) {
           'Use a rediss:// URL, unless this Redis is reachable only over a private network you trust.',
       });
     }
+  }
+
+  if (!env.METRICS_TOKEN) {
+    findings.push({
+      setting: 'METRICS_TOKEN',
+      severity: 'error',
+      message:
+        'METRICS_TOKEN is not set, so GET /metrics is wide open: anyone who can reach it sees job throughput, ' +
+        'admin-invocation counts, and the fiat-pool balance gauge. This is the conventional default for a scrape ' +
+        'target on a private network, so it is not fatal here, but confirm /metrics is not reachable from the ' +
+        'public internet, or set METRICS_TOKEN.',
+    });
   }
 
   return { production, signals, findings };

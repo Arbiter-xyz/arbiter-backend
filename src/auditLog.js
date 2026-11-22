@@ -2,9 +2,11 @@ import { randomUUID } from 'node:crypto';
 import { store } from './store.js';
 
 /**
- * Admin action audit trail (#129 / #246). A durable, bounded, newest-first
- * list using the same pattern as payerIndex.js's known-address index. Callers
- * treat this as best-effort (each call site wraps it in .catch(() => {})).
+ * Admin action audit trail (#129). A durable, bounded, newest-first list,
+ * using the same pattern as payerIndex.js's known-address index. Callers
+ * treat this as best-effort (each call site wraps it in .catch(() => {})):
+ * losing an audit entry is bad, but it must never make the admin action
+ * itself fail.
  */
 
 const AUDIT_LOG_KEY = 'audit-log';

@@ -164,3 +164,82 @@ smoke test. The runbook is therefore considered proven.
   used the same custody flow with testnet keys.
 - **DNS/infra:** the mainnet cutover touches the production DNS record; the dry run used a test
   record with the same procedure.
+
+## Multi-region deployment (architecture, not a hosting runbook)
+
+This section is the architecture companion to the cutover above. It is **not** a hosting runbook:
+provisioning regional infrastructure (Railway or otherwise) is out of scope. It exists because the
+backend as written assumes exactly one process, and a naive "deploy it in two regions" story would
+silently corrupt state. Read this before running more than one backend instance against the same
+contract.
+
+### Process-local state inventory
+
+Every piece of in-memory state that a second process would not share, and what happens to it under
+multi-region:
+
+| State | Location | What it holds | Under multi-region |
+| --- | --- | --- | --- |
+| `workers` Map | `dispatch.js` | Live SSE worker connections registered per process | **Process-local.** A worker connected to region A is invisible to region B. Requires pub/sub fan-out (below) so a broadcast opened in one region reaches workers in every region. |
+| `collectors` Map | `dispatch.js` | Per-question quorum collectors accumulating worker responses | **Process-local.** Quorum for a question opened via region B's `dispatchAndCollect()` only counts responses that land in region B's process. Requires pub/sub fan-out so responses from any region feed the same collector. |
+| `subscribedWorkers` Map | `push.js` | Workers subscribed to push notifications | **Process-local.** Push subscriptions registered in one region are not visible to another; requires the same pub/sub fan-out (or a shared store) to deliver pushes regardless of which region handled the subscription. |
+| `stakeCache` | `dispatch.js` | Cached stake lookups | **Process-local cache.** Safe to be per-process (it is a cache, not a source of truth), but each region warms independently and may briefly serve stale values. Acceptable; do not treat it as coordination state. |
+
+Anything backed by `RedisStore` (leaderboard, stats, and other persisted state) is already shared and
+is **not** in this list — it is the one piece that is genuinely multi-region-safe today.
+
+### SSE dispatch needs pub/sub fan-out
+
+The gap `store.js`'s top-of-file comment already flags is the missing piece: the `workers` and
+`collectors` Maps are intentionally process-local, so a worker connected to region A's process will
+**not** receive a broadcast for a question opened via region B's `dispatchAndCollect()`. The fix is
+a pub/sub fan-out channel (Redis pub/sub, since `RedisStore` already exists):
+
+- When `dispatchAndCollect()` opens a question, it publishes the question to a shared channel.
+- Every region's process subscribes to that channel and re-broadcasts to its own local `workers`.
+- Worker responses are published back on the channel so the originating region's `collectors`
+  entry sees responses from workers connected anywhere.
+
+**Worked example.** A worker is connected to region A. An admin opens a question through region B:
+
+1. Region B's `dispatchAndCollect()` creates the collector and **publishes** the question to the
+   shared channel.
+2. Region A's process is subscribed; it receives the message and re-broadcasts to its local
+   `workers` Map, so the worker on region A sees the question.
+3. The worker responds; region A **publishes** the response to the shared channel.
+4. Region B's collector receives the response and counts it toward quorum.
+
+Without steps 1–4 the worker on region A never sees the question and quorum never completes. This
+is why the pub/sub fan-out is a hard dependency for multi-region, not an optimization.
+
+### Admin-key sequence-number risk
+
+`stellarClient.js`'s `createSerialQueue()` serializes every admin-signed call against a single
+sequence number **within one process**. Two regions each running their own admin-key queue would
+race the same underlying Stellar account and produce sequence-number collisions (one region's tx
+invalidates the other's). This is a correctness bug, not a performance concern.
+
+**Recommendation: active-passive for admin-signed calls.** Run exactly one region as the active
+admin signer; the other region is passive and takes over only on failover. This is an acceptable
+permanent answer because active-active for admin-signed calls fundamentally cannot work without a
+distributed sequence-number coordinator, and a distributed lock (Redis-backed, since `RedisStore`
+exists) is a viable but heavier alternative that should be scoped as its own design if active-active
+admin signing is ever required. Do **not** run two active admin signers.
+
+### What is safely active-active today
+
+| Route / call class | Active-active? | Why |
+| --- | --- | --- |
+| Read-only via `simulateReadOnly` | **Yes** | No sequence number, no shared mutable state. |
+| `/leaderboard` | **Yes** | Backed by `RedisStore` (shared). |
+| `/stats` | **Yes** (if Redis-backed) | Shared store; verify the deployment actually uses `RedisStore`. |
+| Payer/worker-signed fee-bump relays (`sponsor.js`) | **Yes** | These do not touch the admin sequence number. |
+| Admin-signed calls (resolve/refund/charge/touch) | **No** | Share the admin sequence number; active-passive only. |
+
+> Review note (#320): this runbook does not reference `resolve_batch` or `refund_batch`; its settlement-related steps only mention the single-item resolve/refund calls above. If batch settlement methods are added to the contract later, re-check this table and the cutover steps.
+
+### Out of scope
+
+- Provisioning multi-region infrastructure (hosting-specific setup).
+- Regional Horizon/Soroban RPC endpoint selection (`config.horizonUrl`/`config.sorobanRpcUrl` are a
+  single URL each today); that belongs with the RPC-failover work, not here.
