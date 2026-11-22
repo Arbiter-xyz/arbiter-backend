@@ -437,6 +437,9 @@ async function fulfillOracleCall(questionId, pending, tier) {
     : undefined;
 
   let submissions = [];
+  // Only set for escalating tiers (none are currently priced); the lone-answer
+  // confidence cap below reads it, so it must stay declared.
+  const escalated = null;
   try {
     submissions = await dispatchAndCollect(questionId, pending.question, {
       quorumSize: tier.quorumSize,
