@@ -1,6 +1,7 @@
 import { timingSafeEqual, createHash } from 'node:crypto';
 import { config } from './config.js';
 import { hashApiKey } from './apiKeyAuth.js';
+import { verifyTotp } from './totp.js';
 
 /**
  * Constant-time string comparison so a wrong admin token can't leak
@@ -103,6 +104,15 @@ export function requireAdminRole(required = ROLE_FULL) {
     }
     if (!roleSatisfies(cred.role, required)) {
       return res.status(403).json({ error: 'forbidden', requiredRole: required });
+    }
+
+    // #130: admin 2FA. Only enforced once an operator has provisioned
+    // ADMIN_TOTP_SECRET; see config.js's admin.totpSecret doc comment.
+    if (config.admin.totpSecret) {
+      const code = req.get('x-admin-totp');
+      if (!verifyTotp(config.admin.totpSecret, code)) {
+        return res.status(401).json({ error: 'missing or invalid X-Admin-TOTP code' });
+      }
     }
 
     req.adminRole = cred.role;
