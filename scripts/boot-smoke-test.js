@@ -1,90 +1,38 @@
 #!/usr/bin/env node
-// Boot smoke test (#467): PR #206 merged `import { verifyTotp } from
-// './totp.js'` into src/adminAuth.js when src/totp.js didn't exist. `npm
-// run check` (node --check) only validates syntax, not that imports
-// actually resolve, so that merge passed CI and broke the server's boot
-// sequence in production — and nothing in the Wave completion process
-// caught it (see #467's full write-up).
+// Boot smoke test (#469): `npm run check` only runs `node --check` per file,
+// which catches syntax errors but NOT a missing/renamed named export, an
+// undefined identifier referenced at module-eval time, or any other wiring
+// break that only shows up when the real module graph is resolved and
+// evaluated. 48 of the last 54 Wave-bounty PR merges left main unable to
+// boot despite `npm run check` and `npm test` both being green, because
+// none of CI actually imported the entrypoint end to end.
 //
-// This actually boots src/server.js as a real child process and watches
-// for exactly that failure mode: a Node ERR_MODULE_NOT_FOUND (or any other
-// import-resolution error) thrown while the module graph loads, before
-// the process gets anywhere near a config check. A graceful, *intentional*
-// exit (missing security posture config, bad PLATFORM_SECRET, etc.) is not
-// a boot failure for this test's purposes — only "the module graph itself
-// doesn't resolve" is.
-import { spawn } from 'node:child_process';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+// This script imports src/server.js for real, with just enough env to get
+// past config validation, and listens on an ephemeral port. Any throw
+// (missing export, undefined ref, bad top-level await, etc.) fails loudly
+// here instead of surfacing for the first time in production.
+//
+// Intentionally dependency-free beyond what src/server.js itself needs, so
+// it can run as its own fast, early CI gate.
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const serverPath = path.join(__dirname, '..', 'src', 'server.js');
-const BOOT_WINDOW_MS = 5000;
+process.env.PORT = '0';
+process.env.NODE_ENV = process.env.NODE_ENV || 'test';
+process.env.REDIS_URL = process.env.REDIS_URL || ''; // force in-memory store fallback
 
-const MODULE_RESOLUTION_ERROR_PATTERNS = [
-  'ERR_MODULE_NOT_FOUND',
-  'Cannot find module',
-  'Cannot find package',
-  'ERR_UNSUPPORTED_DIR_IMPORT',
-];
+const timeoutMs = 20_000;
+const timer = setTimeout(() => {
+  console.error(`boot-smoke-test: server did not finish starting within ${timeoutMs}ms`);
+  process.exit(1);
+}, timeoutMs);
 
-function looksLikeModuleResolutionFailure(stderr) {
-  return MODULE_RESOLUTION_ERROR_PATTERNS.some((pattern) => stderr.includes(pattern));
+try {
+  await import('../src/server.js');
+  clearTimeout(timer);
+  console.log('boot-smoke-test: src/server.js imported and started cleanly');
+  process.exit(0);
+} catch (err) {
+  clearTimeout(timer);
+  console.error('boot-smoke-test: FAILED to boot');
+  console.error(err);
+  process.exit(1);
 }
-
-async function main() {
-  const child = spawn(process.execPath, [serverPath], {
-    env: {
-      ...process.env,
-      // Deliberately unset REDIS_URL so this never touches a real Redis
-      // (falls back to the in-memory store); unset PORT so a stray leftover
-      // process from a previous run can't collide on it.
-      REDIS_URL: '',
-      PORT: '0',
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-
-  let stderr = '';
-  let stdout = '';
-  child.stderr.on('data', (chunk) => {
-    stderr += chunk.toString();
-  });
-  child.stdout.on('data', (chunk) => {
-    stdout += chunk.toString();
-  });
-
-  const exit = await new Promise((resolve) => {
-    const timer = setTimeout(() => resolve({ timedOut: true }), BOOT_WINDOW_MS);
-    child.once('exit', (code, signal) => {
-      clearTimeout(timer);
-      resolve({ code, signal });
-    });
-  });
-
-  if (!exit.timedOut && child.exitCode === null) {
-    child.kill('SIGKILL');
-  } else if (exit.timedOut) {
-    child.kill('SIGKILL');
-  }
-
-  if (looksLikeModuleResolutionFailure(stderr) || looksLikeModuleResolutionFailure(stdout)) {
-    console.error('[boot-smoke-test] FAILED: src/server.js could not load its module graph.');
-    console.error(stderr || stdout);
-    process.exit(1);
-  }
-
-  if (!exit.timedOut && exit.code !== 0 && exit.code !== null) {
-    // A non-zero exit that isn't a module-resolution error is most likely
-    // an intentional refusal to start with this environment (security
-    // posture, missing required config) — not what this test checks.
-    // Surface it as informational so a real crash is still visible in CI
-    // logs, but don't fail the build on it.
-    console.log('[boot-smoke-test] server exited non-zero without a module-resolution error (likely a config refusal); treating as pass:');
-    console.log(stderr || stdout);
-  }
-
-  console.log('[boot-smoke-test] PASSED: module graph resolved cleanly.');
-}
-
-main();

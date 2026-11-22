@@ -18,6 +18,13 @@ jobs:
         with:
           node-version: 22
       - run: node scripts/check-env-example.js
+      - name: Parse every file under src/
+        run: |
+          status=0
+          for file in src/*.js; do
+            node --check "$file" || status=1
+          done
+          exit $status
       - name: Unit tests for the dependency-free modules
         run: node --test test/envExample.test.js test/payerReferrals.test.js test/replicaStore.test.js test/canary.test.js
 
@@ -37,8 +44,10 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
-      - name: Boot smoke test (catches boot-breaking imports like #467/PR #206's missing src/totp.js)
-        run: node scripts/boot-smoke-test.js
+      # Gate on the real module graph booting, not just per-file syntax
+      # (#469): `npm run check` is `node --check` per file and cannot catch
+      # a missing/renamed export or other cross-module wiring break.
+      - run: npm run boot-smoke-test
       - run: npm test
       - name: MCP server tests
         working-directory: mcp-server
