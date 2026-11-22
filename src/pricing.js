@@ -31,18 +31,6 @@ export const PRICING_TIERS = Object.freeze(
     express: Object.freeze({ key: 'express', instant: false, quorumSize: 2, timeoutMs: 12_000, preferEstablished: false, priceStroops: 4_000_000n }),
     // Priority buys the highest-confidence consensus: route to proven workers first.
     priority: Object.freeze({ key: 'priority', instant: false, quorumSize: 5, timeoutMs: 30_000, preferEstablished: true, priceStroops: 6_000_000n }),
-    // auto: variable-quorum tier. Quoted at the ceiling (the full maxQuorum
-    // price, same per-worker rate as priority) and charged proportionally to
-    // the workers actually recruited — see effectiveEscalatedPriceStroops().
-    auto: Object.freeze({
-      key: 'auto',
-      instant: false,
-      quorumSize: 5,
-      timeoutMs: 30_000,
-      preferEstablished: false,
-      priceStroops: 6_000_000n,
-      escalation: Object.freeze({ initialQuorum: 1, maxQuorum: 5 }),
-    }),
   }),
 );
 
@@ -164,7 +152,6 @@ export const TIER_TIMEOUT_MS = Object.freeze(
     standard: 45_000,
     express: 12_000,
     priority: 30_000,
-    auto: 30_000,
   }),
 );
 

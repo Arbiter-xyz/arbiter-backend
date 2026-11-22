@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Dict, List, Literal, Optional
 
-TierKey = Literal["instant", "standard", "express", "priority", "auto"]
+TierKey = Literal["instant", "standard", "express", "priority"]
 JobStatus = Literal["holding", "awaiting_workers", "reconciling", "cancelling", "settled"]
 JobOutcome = Literal["resolved", "refunded", "refund_pending_timeout", "lost_race_to_timeout_refund"]
 SandboxSimulation = Literal["resolved", "disagreement", "no-answers"]

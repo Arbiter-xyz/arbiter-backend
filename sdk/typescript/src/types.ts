@@ -7,7 +7,7 @@
  * Unix epoch milliseconds.
  */
 
-export type TierKey = 'instant' | 'standard' | 'express' | 'priority' | 'auto';
+export type TierKey = 'instant' | 'standard' | 'express' | 'priority';
 
 /** One entry of pricing.js's listTiersForClient(). */
 export interface Tier {
