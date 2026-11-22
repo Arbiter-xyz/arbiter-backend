@@ -228,7 +228,7 @@ async function runInvokeAsAdmin(method, scValArgs, admin) {
  * every subsequent call on that key) while still being propagated to that
  * task's own caller.
  */
-function createSerialQueue() {
+export function createSerialQueue() {
   let tail = Promise.resolve();
   return function enqueue(task) {
     const run = tail.then(task, task);
@@ -402,8 +402,12 @@ export async function buildWorkerWithdrawTx(workerAddress, amountStroops, benefi
 }
 
 /** Settles a single question on-chain as the platform admin. */
-export async function resolveQuestion(questionId, matchingPool, losingPool) {
-  return invokeAsAdmin('resolve', [u64Arg(questionId), i128Arg(matchingPool), i128Arg(losingPool)]);
+export async function resolveQuestion(questionId, matchingWorkerAddresses, losingWorkerAddresses) {
+  return invokeAsAdmin('resolve', [
+    u64Arg(questionId),
+    vecOfAddresses(matchingWorkerAddresses),
+    vecOfAddresses(losingWorkerAddresses),
+  ]);
 }
 
 /** Refunds a single question on-chain as the platform admin. */

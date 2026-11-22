@@ -244,9 +244,19 @@ export async function checkAutoWithdraw(workerAddress) {
  * changed) all mean it can never succeed as-is, and the next check
  * prepares a fresh one. */
 export async function submitAutoWithdraw(workerAddress, signedXdr) {
+  if (!StrKey.isValidEd25519PublicKey(workerAddress)) {
+    throw new AutoWithdrawError('auto-withdraw needs a real Stellar worker address');
+  }
+  if (typeof signedXdr !== 'string' || signedXdr.length === 0) {
+    throw new AutoWithdrawError('signedXdr is required');
+  }
   const pending = await store.get(PENDING_PREFIX + workerAddress);
   if (!pending) {
     throw new AutoWithdrawError('no pending auto-withdraw for this worker; it may have expired or already been submitted', 404);
+  }
+  if (pending.expiresAt && Date.now() > pending.expiresAt) {
+    await store.delete(PENDING_PREFIX + workerAddress);
+    throw new AutoWithdrawError('pending auto-withdraw transaction has expired; request a fresh one', 410);
   }
 
   let result;

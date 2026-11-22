@@ -604,14 +604,32 @@ async function reverseCharge(event) {
   // charge.refunded carries the cumulative amount_refunded on the charge;
   // charge.dispute.created carries the disputed amount.
   const amountCents = event.type === 'charge.refunded' ? obj.amount_refunded : obj.amount;
-  const requestedStroops = centsToStroops(amountCents || 0);
+  const cumulativeCents = amountCents || 0;
+
+  // amount_refunded is cumulative across every refund on the charge, so a
+  // second partial refund reports the total of both. Track what we have
+  // already reversed per payment_intent and debit only the delta, otherwise
+  // each partial refund would re-debit the whole cumulative amount.
+  const reversedKey = obj.payment_intent ? `stripe-reversed:${obj.payment_intent}` : null;
+  const alreadyReversedCents = reversedKey ? Number((await store.get(reversedKey)) || 0) : 0;
+  const deltaCents = cumulativeCents - alreadyReversedCents;
+  if (deltaCents <= 0) {
+    logger.info({ accountId, eventId: event.id, type: event.type, cumulativeCents, alreadyReversedCents }, 'stripe reversal already accounted for — no debit');
+    return;
+  }
+
+  const requestedStroops = centsToStroops(deltaCents);
   const debitedStroops = await debitCreditFloored(accountId, requestedStroops);
+
+  // Persist the new cumulative total only after the debit attempt, so a
+  // failed debit is retried by the next delivery rather than silently lost.
+  if (reversedKey) await store.set(reversedKey, cumulativeCents);
 
   await recordPaymentReversal(accountId, {
     eventId: event.id,
     type: event.type,
     paymentIntent: obj.payment_intent || null,
-    amountCents: amountCents || 0,
+    amountCents: deltaCents,
     requestedStroops: String(requestedStroops),
     debitedStroops: String(debitedStroops),
     shortfallStroops: String(requestedStroops - debitedStroops),

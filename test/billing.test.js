@@ -142,6 +142,58 @@ test('handleStripeWebhook is idempotent per Stripe event id (a retried delivery 
   assert.equal(await getCreditBalanceStroops(accountId), 100_000_000); // credited once, not twice
 });
 
+function chargeRefundedEvent({ eventId, paymentIntent, amountRefundedCents }) {
+  return {
+    id: eventId,
+    type: 'charge.refunded',
+    data: { object: { id: 'ch_test_1', payment_intent: paymentIntent, amount_refunded: amountRefundedCents } },
+  };
+}
+
+test('sequential partial refunds debit only the delta, not the cumulative amount_refunded', async () => {
+  const accountId = uniqueId('acct');
+  const paymentIntent = uniqueId('pi');
+  const checkoutPayload = JSON.stringify({
+    ...checkoutCompletedEvent({ eventId: uniqueId('evt'), accountId, amountCents: 1000 }),
+    data: { object: { id: 'cs_test_1', amount_total: 1000, payment_intent: paymentIntent, metadata: { accountId } } },
+  });
+  const checkoutHeader = Stripe.webhooks.generateTestHeaderString({
+    payload: checkoutPayload,
+    secret: config.billing.stripeWebhookSecret,
+  });
+  await handleStripeWebhook(checkoutPayload, checkoutHeader); // credits 100_000_000 stroops
+
+  const first = signedEvent(chargeRefundedEvent({ eventId: uniqueId('evt'), paymentIntent, amountRefundedCents: 300 }));
+  await handleStripeWebhook(first.payload, first.header);
+  assert.equal(await getCreditBalanceStroops(accountId), 70_000_000);
+
+  // Second partial refund: Stripe reports the cumulative 600 cents, but only
+  // the 300-cent delta is new — the account must not be debited 600 again.
+  const second = signedEvent(chargeRefundedEvent({ eventId: uniqueId('evt'), paymentIntent, amountRefundedCents: 600 }));
+  await handleStripeWebhook(second.payload, second.header);
+  assert.equal(await getCreditBalanceStroops(accountId), 40_000_000);
+
+  // An out-of-order/duplicate cumulative value yields a zero delta: no debit.
+  const stale = signedEvent(chargeRefundedEvent({ eventId: uniqueId('evt'), paymentIntent, amountRefundedCents: 600 }));
+  await handleStripeWebhook(stale.payload, stale.header);
+  assert.equal(await getCreditBalanceStroops(accountId), 40_000_000);
+});
+
+test('a single full refund still debits the whole charge', async () => {
+  const accountId = uniqueId('acct');
+  const paymentIntent = uniqueId('pi');
+  const payload = JSON.stringify({
+    ...checkoutCompletedEvent({ eventId: uniqueId('evt'), accountId, amountCents: 1000 }),
+    data: { object: { id: 'cs_test_1', amount_total: 1000, payment_intent: paymentIntent, metadata: { accountId } } },
+  });
+  const header = Stripe.webhooks.generateTestHeaderString({ payload, secret: config.billing.stripeWebhookSecret });
+  await handleStripeWebhook(payload, header);
+
+  const refund = signedEvent(chargeRefundedEvent({ eventId: uniqueId('evt'), paymentIntent, amountRefundedCents: 1000 }));
+  await handleStripeWebhook(refund.payload, refund.header);
+  assert.equal(await getCreditBalanceStroops(accountId), 0);
+});
+
 test('handleStripeWebhook ignores event types other than checkout.session.completed', async () => {
   const accountId = uniqueId('acct');
   const { payload, header } = signedEvent({

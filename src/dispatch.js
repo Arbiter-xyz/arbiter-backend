@@ -403,7 +403,7 @@ export async function isEstablishedWorker(workerId) {
  * Pure heuristic deciding whether a known workerId is worth a `touch()` call
  * during the daily TTL sweep. `touch()` is permissionless (see lib.rs) but
  * every call still round-trips through the SAME admin-signed serial queue as
- * real resolve()/refund()/charge() settlement calls (see serializeAdminCall
+ * real resolve()/refund()/charge() settlement calls (see enqueueAdminCall
  * in stellarClient.js) — so touching a worker that has never staked or been
  * credited is pure queue-time waste that can delay a payer or worker's
  * money. A worker is only worth touching when there is off-chain evidence
