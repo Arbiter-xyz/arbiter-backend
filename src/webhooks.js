@@ -25,6 +25,15 @@ import { config } from './config.js';
  * registerWebhook(), and never exposed by any read path afterwards. That's
  * the same one-time-reveal convention as billing.js's API keys, and as
  * Stripe's webhook signing secrets.
+ *
+ * Module boundary (reviewed, #324): this file never computes an HMAC or
+ * opens a socket. It validates URLs up front (validateWebhookUrl, with
+ * isBlockedAddress as the shared address check) and seals/opens the secret
+ * at rest (sealSecret/openSecret). webhookDelivery.js owns signing and
+ * sending, and re-applies isBlockedAddress at connect time (its DNS lookup
+ * hook) to close the rebinding gap between registration and delivery. The
+ * two checks are intentionally redundant; the signing convention is
+ * documented only in webhookDelivery.js.
  */
 
 const REG_PREFIX = 'webhook:';

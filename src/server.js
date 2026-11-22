@@ -4,7 +4,7 @@ import express from 'express';
 import cors from 'cors';
 
 import { config } from './config.js';
-import { issueChallengeIdempotent, verifyPayment, startFulfillment, getJobStatus, cancelJob } from './oracle.js';
+import { issueChallengeIdempotent, verifyPayment, startFulfillment, getJobStatus, cancelJob, fulfillmentDrain } from './oracle.js';
 import {
   onlineWorkerCount,
   checkConnectionRateLimit,
@@ -16,7 +16,7 @@ import {
 import { getStats } from './stats.js';
 import { getVapidPublicKey, isPushConfigured, saveSubscription, removeSubscription } from './push.js';
 import { getPayerQuestionIds, summarizePayerQuestions, bucketPayerSpend } from './payerIndex.js';
-import { requiresAuth, verifySession, mountSessionRoutes } from './workerAuth.js';
+import { requiresAuth, verifySession, mountSessionRoutes, verifySessionToken } from './workerAuth.js';
 import {
   buildSponsoredOnboardTx,
   finalizeSponsoredOnboardTx,
@@ -26,7 +26,7 @@ import {
   feeBumpWithdrawTo,
 } from './sponsor.js';
 import { getStashedQuestion, nextQuestionId } from './pendingQuestions.js';
-import { getOwedOnChain, getStakeOnChain } from './stellarClient.js';
+import { getOwedOnChain, getStakeOnChain, getLatestLedgerSequence } from './stellarClient.js';
 import { askMetered, getMeteredBalance, depositInstructions } from './metered.js';
 import { getLeaderboard } from './leaderboard.js';
 import { getWorkerDashboard } from './workerAnalytics.js';
@@ -35,7 +35,17 @@ import { stroopsToUsdc, resolveTier, MAX_SURGE_MULTIPLIER } from './pricing.js';
 import { checkRateLimit } from './rateLimit.js';
 import { issueSandboxChallenge, startSandboxFulfillment } from './sandbox.js';
 import { requireAdmin } from './adminAuth.js';
-import { listTransactions, listWorkers, listPayers, getTreasury, getFeeRevenue, listAnchorPayouts, listAnchorKyc } from './admin.js';
+import {
+  listTransactions,
+  listWorkers,
+  listPayers,
+  getTreasury,
+  getFeeRevenue,
+  listAnchorPayouts,
+  listAnchorKyc,
+  listReferralEarnings,
+  getReadReplicaStatus,
+} from './admin.js';
 import { listPaymentReversals } from './paymentReversals.js';
 import { getAnchorConfig, isAnchorConfigured } from './anchorClient.js';
 import { recordAnchorTransaction, recordAnchorKyc } from './anchorRecords.js';
@@ -44,9 +54,13 @@ import { parseConsensusRule } from './consensus.js';
 import { getPrivatePool, addPoolWorkers, removePoolWorkers, PoolValidationError } from './privatePools.js';
 import { isBillingConfigured, createCheckoutSession, handleStripeWebhook, rotateApiKey, getCreditBalanceStroops, reserveCredit, settleReservation } from './billing.js';
 import { registerWebhook, listWebhooks, deleteWebhook, WebhookError } from './webhooks.js';
+import { getDispatchPause, listUpcomingWindows, describePause } from './maintenanceWindows.js';
 import { logger, httpLogger } from './logger.js';
+import { startTreasuryMonitor } from './alerting.js';
 import { getProvenance } from './provenance.js';
 import { enforceSecurityPosture } from './securityPosture.js';
+import { store, RedisStore } from './store.js';
+import { createReadOnlyGate, deploymentFingerprint, INSTANCE_ID } from './canary.js';
 import {
   getOrCreateReferralCode,
   lookupReferralCode,
@@ -54,8 +68,49 @@ import {
   getReferralSummary,
   listReferrers,
   ReferralError,
+  normalizeCode,
 } from './referrals.js';
 import { recordWorkerIp, noteAnswerTiming, listFlaggedPairs, getWorkerCollusionReport, clearPairFlag } from './collusion.js';
+import { getKnownJobIds, getJob } from './jobs.js';
+import {
+  metricsMiddleware,
+  metricsHandler,
+  buildInfo,
+} from './metrics.js';
+import { createFaultInjector, mountFaultRoutes } from './faultInjection.js';
+import { securityHeadersMiddleware } from './securityHeaders.js';
+import {
+  TeamError,
+  createTeam,
+  listTeamsFor,
+  requireTeamRole,
+  renameTeam,
+  deleteTeam,
+  addMembers,
+  setMemberRole,
+  removeMember,
+} from './teams.js';
+import { recordWorkerWithdrawal } from './earnings.js';
+import {
+  AutoWithdrawError,
+  getAutoWithdrawSettings,
+  setAutoWithdrawSettings,
+  deleteAutoWithdrawSettings,
+  checkAutoWithdraw,
+  submitAutoWithdraw,
+  startAutoWithdrawSweep,
+} from './autoWithdraw.js';
+import {
+  TaxReportError,
+  parseTaxYear,
+  getTaxProfile,
+  saveTaxProfile,
+  buildTaxSummary,
+  listTaxYears,
+  taxSummaryToCsv,
+} from './taxReport.js';
+import { runRecoverySweep, defaultRecoveryDeps, startRecoverySweeper } from './disasterRecovery.js';
+import { startHealthProbes } from './healthProbes.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -98,6 +153,15 @@ app.use(securityHeadersMiddleware());
 // limiting below, not a substitute for it.
 app.use(cors(config.allowedOrigins.includes('*') ? { origin: '*' } : { origin: config.allowedOrigins }));
 
+// Canary instances (INSTANCE_ROLE=canary) serve only read-only paths; every
+// other request gets a 503 the traffic splitter routes to the primary. A
+// no-op on a primary. Before every route, including /billing/webhook. See
+// canary.js and docs/runbooks/canary-deployment.md.
+app.use(createReadOnlyGate({ role: config.canary.role, readPaths: config.canary.readPaths }));
+if (config.canary.role === 'canary') {
+  logger.warn({ readPaths: config.canary.readPaths }, 'INSTANCE_ROLE=canary: serving read-only paths, never signing as the platform key');
+}
+
 // Stripe webhook signature verification needs the RAW request body, and
 // Express only hands raw bytes to whichever parser claims a request first
 // — so this route (and only this one) must be registered with its own
@@ -131,10 +195,29 @@ function rateLimited(bucket, keyFn) {
 }
 const byIp = (req) => req.ip;
 
+/** Once SIGTERM starts a drain, new questions go elsewhere (the client
+ * retries against whichever instance is live) while this one finishes the
+ * fulfillments it already owns. */
+function refuseWhileDraining(req, res, next) {
+  if (!fulfillmentDrain.isDraining()) return next();
+  res.set('Retry-After', '1');
+  return res.status(503).json({ error: 'this instance is shutting down; retry shortly' });
+}
+
+async function storeReachable() {
+  const client = store.getClient();
+  if (!client) return true; // in-memory store: nothing to reach
+  try {
+    return (await Promise.race([client.ping(), new Promise((resolve) => setTimeout(() => resolve(null), 1_000))])) === 'PONG';
+  } catch {
+    return false;
+  }
+}
+
 app.get('/metrics', metricsHandler({ token: config.metrics.token }));
 
-app.get('/health', (req, res) => {
-  res.json({ ok: true, onlineWorkers: onlineWorkerCount(), contractId: config.contractId });
+app.get('/health', async (req, res) => {
+  res.json({ ok: true, onlineWorkers: await onlineWorkerCount(), contractId: config.contractId });
 });
 
 // Public, like /health: the dispatch pause in effect (if any) and every
@@ -201,7 +284,7 @@ app.get('/gamification/badges', (req, res) => {
 
 app.get('/stats', async (req, res) => {
   const stats = await getStats();
-  res.json({ onlineWorkers: onlineWorkerCount(), ...stats });
+  res.json({ onlineWorkers: await onlineWorkerCount(), ...stats });
 });
 
 // ---------------------------------------------------------------------
@@ -215,7 +298,7 @@ app.get('/stats', async (req, res) => {
 // Sandbox mode: zero payment, zero chain, zero LLM — a single call that
 // returns a fully realistic job to poll. Rate-limited on its own (more
 // generous than the paid flow, but not unlimited) since it's free to call.
-app.post('/oracle/sandbox', rateLimited('sandbox', byIp), async (req, res) => {
+app.post('/oracle/sandbox', refuseWhileDraining, rateLimited('sandbox', byIp), async (req, res) => {
   const { question, tier, simulate } = req.body || {};
   if (!question || typeof question !== 'string') {
     return res.status(400).json({ error: 'body.question (string) is required' });
@@ -245,10 +328,18 @@ app.post('/oracle/sandbox', rateLimited('sandbox', byIp), async (req, res) => {
  * /oracle/metered route; fusing it into /oracle itself is the point —
  * "how you pay" shouldn't be a different URL than "what you're asking."
  */
-app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
+app.post('/oracle', refuseWhileDraining, rateLimited('oracle', byIp), async (req, res) => {
   const questionId = req.header('X-Question-Id');
   const paymentTx = req.header('X-Payment-Tx');
   const { question, tier, category, payerAddress, token, consensusMode, tolerance } = req.body || {};
+  // Optional worker referral code (#99). Rejected here only if malformed;
+  // whether it actually attributes the payer is decided once payment is
+  // verified (first payment only, never self-referral — payerReferrals.js).
+  let referralCode = null;
+  if (req.body?.referralCode !== undefined && req.body.referralCode !== null && req.body.referralCode !== '') {
+    referralCode = normalizeCode(req.body.referralCode);
+    if (!referralCode) return res.status(400).json({ error: 'body.referralCode is not a valid referral code' });
+  }
   // Only checked on the paths that create a question — step 2 of the
   // classic flow reuses the rule already stashed at step 1.
   const consensus = parseConsensusRule({ consensusMode, tolerance });
@@ -300,6 +391,7 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
     try {
       const result = await askMetered(config.billing.fiatPoolAddress, question, tier, category, {
         ownerAccountId: apiKeyAccountId, // routes this customer's settlement webhooks
+        consensusRule: consensus.rule,
       });
       await settleReservation(apiKeyAccountId, maxStroops, Number(result.amountStroops));
       return res.status(202).json({ ...result, statusUrl: `/oracle/${result.jobId}` });
@@ -327,7 +419,7 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
     }
     if (!consensus.ok) return res.status(400).json({ error: consensus.error });
     try {
-      const result = await askMetered(payerAddress, question, tier, category, consensus.rule);
+      const result = await askMetered(payerAddress, question, tier, category, { consensusRule: consensus.rule });
       return res.status(202).json({ ...result, statusUrl: `/oracle/${result.jobId}` });
     } catch (err) {
       // #13 is ContractError::InsufficientBalance — see contracts/oracle-escrow/src/lib.rs.
@@ -354,7 +446,7 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
     }
     if (!consensus.ok) return res.status(400).json({ error: consensus.error });
     try {
-      const challenge = await issueChallengeIdempotent(question, tier, category, req.header('Idempotency-Key'), consensus.rule);
+      const challenge = await issueChallengeIdempotent(question, tier, category, req.header('Idempotency-Key'), consensus.rule, { referralCode });
       return res.status(402).json(challenge);
     } catch (err) {
       req.log.error({ err }, 'failed to issue challenge');
@@ -368,7 +460,7 @@ app.post('/oracle', rateLimited('oracle', byIp), async (req, res) => {
       return res.status(verdict.status).json({ questionId, reason: verdict.reason });
     }
 
-    const { jobId, cancellableUntil } = await startFulfillment(questionId, verdict.pending, verdict.tier, verdict.payerAddress);
+    const { jobId, cancellableUntil } = await startFulfillment(questionId, verdict.pending, verdict.tier, verdict.payerAddress, { referralCode });
     return res.status(202).json({
       jobId,
       questionId,
@@ -1215,12 +1307,16 @@ app.get('/admin/transactions', requireAdmin, async (req, res) => {
   res.json(await listTransactions({ limit, offset }));
 });
 
+function adminPage(query) {
+  return { limit: Math.min(Number(query.limit) || 50, 200), offset: Number(query.offset) || 0 };
+}
+
 app.get('/admin/workers', requireAdmin, async (req, res) => {
-  res.json({ workers: await listWorkers() });
+  res.json({ workers: await listWorkers(adminPage(req.query)) });
 });
 
 app.get('/admin/payers', requireAdmin, async (req, res) => {
-  res.json({ payers: await listPayers() });
+  res.json({ payers: await listPayers(adminPage(req.query)) });
 });
 
 app.get('/admin/treasury', requireAdmin, async (req, res) => {
@@ -1241,6 +1337,18 @@ app.get('/admin/kyc', requireAdmin, async (req, res) => {
 
 app.get('/admin/referrals', requireAdmin, async (req, res) => {
   res.json({ referrers: await listReferrers() });
+});
+
+// Payer referrals (#99): informational referral credit per worker for the
+// payers they brought in. Bookkeeping only — nothing here is paid out.
+app.get('/admin/referral-earnings', requireAdmin, async (req, res) => {
+  res.json({ workers: await listReferralEarnings() });
+});
+
+// Where admin reads are coming from (replica or primary) and the replica's
+// lag, so the console can flag possibly-stale numbers (#92).
+app.get('/admin/read-replica', requireAdmin, async (req, res) => {
+  res.json(await getReadReplicaStatus());
 });
 
 // Collusion heuristics (collusion.js). Flags are leads for review, not
@@ -1331,11 +1439,19 @@ app.post('/admin/recovery/sweep', requireAdmin, async (req, res) => {
   }
 });
 
-// Serve the built worker UI from the same Express app.
-app.use(express.static(path.join(__dirname, '../../app/dist')));
+// Serve the built worker UI from the same Express app, unless a CDN fronts
+// it (SERVE_STATIC_APP=false, see README).
+if (config.serveStaticApp) app.use(express.static(path.join(__dirname, '../../app/dist')));
 
-app.listen(config.port, () => {
-  startAutoWithdrawSweep();
+const isCanary = config.canary.role === 'canary';
+
+const server = app.listen(config.port, () => {
+  // A canary takes read traffic only: no background job that signs, sends
+  // pushes or raises alerts, or the fleet would do each of them twice.
+  if (!isCanary) {
+    startAutoWithdrawSweep();
+    startTreasuryMonitor();
+  }
   logger.info(
     { port: config.port, contractId: config.contractId || null, network: config.networkPassphrase, allowedOrigins: config.allowedOrigins },
     `Arbiter backend listening on :${config.port}`,
@@ -1354,9 +1470,37 @@ app.listen(config.port, () => {
 
   // After a total state loss this is what gets stranded payers refunded:
   // the first sweep runs immediately on boot, against an empty store.
-  if (config.recovery.enabled && config.contractId && config.platformSecret) {
+  if (isCanary) {
+    logger.info('recovery sweep not started on a canary instance');
+  } else if (config.recovery.enabled && config.contractId && config.platformSecret) {
     startRecoverySweeper({ store, intervalMs: config.recovery.intervalMs, options: config.recovery });
   } else {
     logger.warn('recovery sweep disabled (RECOVERY_SWEEP_ENABLED=false, or ORACLE_CONTRACT_ID/PLATFORM_SECRET unset)');
   }
 });
+
+// Graceful drain (#89). On SIGTERM (a redeploy, a canary promotion or
+// rollback) stop taking new questions, keep running until every fulfillment
+// this instance owns has settled or DRAIN_TIMEOUT_MS passes, then exit. The
+// minimum wait covers questions still in their undo-window hold, which
+// start fulfillment only once the hold elapses. Anything still running at
+// the deadline falls back to the existing paths: the recovery sweep and
+// the contract's refund_timeout().
+let shuttingDown = false;
+async function drainAndExit(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  fulfillmentDrain.beginDrain();
+  logger.info({ signal, inFlight: fulfillmentDrain.inFlightCount() }, 'draining before shutdown');
+  const result = await fulfillmentDrain.waitForIdle({
+    timeoutMs: config.canary.drainTimeoutMs,
+    minWaitMs: isCanary ? 0 : Number(config.undoWindowMs) || 0,
+  });
+  if (result.drained) logger.info('drain complete');
+  else logger.warn({ inFlight: result.inFlight }, 'drain timed out with fulfillments still in flight');
+  server.close();
+  await new Promise((resolve) => logger.flush(resolve));
+  process.exit(0);
+}
+process.once('SIGTERM', () => drainAndExit('SIGTERM'));
+process.once('SIGINT', () => drainAndExit('SIGINT'));

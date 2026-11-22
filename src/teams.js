@@ -37,6 +37,28 @@ export const MAX_TEAM_NAME_LENGTH = 80;
 export const ROLES = Object.freeze(['owner', 'admin', 'member']);
 const RANK = { owner: 3, admin: 2, member: 1 };
 
+/**
+ * Per-address serialization for membership writes. The cap check in
+ * addMembers() reads team-memberships:{address} and then writes it back;
+ * two concurrent calls for the same address (e.g. the same address added
+ * to two teams at once) could both read the same pre-cap list, both pass
+ * the check, and both write — pushing the address past
+ * MAX_TEAMS_PER_ADDRESS. Chaining each address's membership mutations
+ * through a promise queue makes the read-check-write atomic per address,
+ * so the cap holds under concurrency. Keyed by address, so unrelated
+ * addresses never block each other.
+ */
+const membershipLocks = new Map();
+
+function withMembershipLock(address, fn) {
+  const previous = membershipLocks.get(address) || Promise.resolve();
+  const next = previous.then(fn, fn);
+  // Keep the chain alive for the next caller, but don't let a rejection
+  // here surface as an unhandled rejection on the stored tail.
+  membershipLocks.set(address, next.then(() => {}, () => {}));
+  return next;
+}
+
 /** `status` is the HTTP status the route should answer with. */
 export class TeamError extends Error {
   constructor(message, status = 400) {
@@ -77,20 +99,24 @@ async function getMemberships(address) {
 }
 
 async function addMembership(address, teamId) {
-  const existing = await getMemberships(address);
-  if (existing.includes(teamId)) return;
-  if (existing.length >= MAX_TEAMS_PER_ADDRESS) {
-    throw new TeamError(`${address} already belongs to the maximum of ${MAX_TEAMS_PER_ADDRESS} teams`, 409);
-  }
-  await store.set(MEMBERSHIP_PREFIX + address, [teamId, ...existing]);
+  return withMembershipLock(address, async () => {
+    const existing = await getMemberships(address);
+    if (existing.includes(teamId)) return;
+    if (existing.length >= MAX_TEAMS_PER_ADDRESS) {
+      throw new TeamError(`${address} already belongs to the maximum of ${MAX_TEAMS_PER_ADDRESS} teams`, 409);
+    }
+    await store.set(MEMBERSHIP_PREFIX + address, [teamId, ...existing]);
+  });
 }
 
 async function removeMembership(address, teamId) {
-  const existing = await getMemberships(address);
-  const next = existing.filter((id) => id !== teamId);
-  if (next.length === existing.length) return;
-  if (next.length === 0) await store.delete(MEMBERSHIP_PREFIX + address);
-  else await store.set(MEMBERSHIP_PREFIX + address, next);
+  return withMembershipLock(address, async () => {
+    const existing = await getMemberships(address);
+    const next = existing.filter((id) => id !== teamId);
+    if (next.length === existing.length) return;
+    if (next.length === 0) await store.delete(MEMBERSHIP_PREFIX + address);
+    else await store.set(MEMBERSHIP_PREFIX + address, next);
+  });
 }
 
 export async function getTeam(teamId) {
@@ -102,6 +128,18 @@ export async function getTeam(teamId) {
  * Loads a team and checks the actor holds at least `minRole`. Answers 404
  * (not 403) to non-members, so team ids can't be probed by outsiders —
  * same convention as DELETE /webhooks/:id.
+ *
+ * Reviewed for side channels (#284): a missing team and a team you're not
+ * in get the same status and body, and both do the same one store.get —
+ * the only extra work for a real team is roleOf() over at most
+ * MAX_TEAM_MEMBERS in-memory entries, microseconds against a store
+ * round-trip's jitter. Every check that runs before this one in the team
+ * functions (validateAssignableRole, the ROLES check in setMemberRole)
+ * depends only on the request, never on the team, so error ordering leaks
+ * nothing either. And even a perfect oracle wouldn't enumerate anything:
+ * ids are `team_${randomUUID()}`, 122 random bits, unguessable by design.
+ * Keep it that way — a team-dependent check before this call, or
+ * sequential/derived team ids, would reopen the question.
  */
 export async function requireTeamRole(teamId, actor, minRole) {
   const team = await getTeam(teamId);
@@ -176,7 +214,9 @@ export async function addMembers(teamId, actor, addresses, role = 'member') {
   if (additions.length === 0) return team;
 
   // Membership caps are checked up front for every address, so a cap hit on
-  // the last address can't leave the first few half-added.
+  // the last address can't leave the first few half-added. The actual write
+  // in addMembership() re-checks the cap under a per-address lock, so a
+  // concurrent add for the same address can't slip past this pre-check.
   const full = [];
   for (const address of additions) {
     if ((await getMemberships(address)).length >= MAX_TEAMS_PER_ADDRESS) full.push(address);

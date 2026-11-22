@@ -1,7 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { isAnchorConfigured, getAnchorConfig } from '../src/anchorClient.js';
-import { recordAnchorTransaction, getAnchorTransactions, recordAnchorKyc, getAnchorKyc } from '../src/anchorRecords.js';
+import {
+  recordAnchorTransaction,
+  getAnchorTransactions,
+  recordAnchorKyc,
+  getAnchorKyc,
+  eraseAnchorRecords,
+  getKnownAnchorAddresses,
+} from '../src/anchorRecords.js';
 import { listAnchorPayouts, listAnchorKyc } from '../src/admin.js';
 
 function uniqueAddress(prefix) {
@@ -79,6 +86,25 @@ test('recordAnchorKyc / getAnchorKyc round trip', async () => {
 
   await recordAnchorKyc(address, { status: 'ACCEPTED', tier: 'basic' });
   assert.equal((await getAnchorKyc(address)).status, 'ACCEPTED');
+});
+
+test('eraseAnchorRecords removes tx, KYC and the index entry for that address only (#285)', async () => {
+  const address = uniqueAddress('addr');
+  const bystander = uniqueAddress('addr');
+  for (const a of [address, bystander]) {
+    await recordAnchorTransaction(a, { kind: 'deposit', status: 'completed', anchorTransactionId: uniqueAddress('tx') });
+    await recordAnchorKyc(a, { status: 'ACCEPTED', tier: 'basic' });
+  }
+
+  await eraseAnchorRecords(address);
+
+  assert.deepEqual(await getAnchorTransactions(address), []);
+  assert.equal(await getAnchorKyc(address), null);
+  assert.ok(!(await getKnownAnchorAddresses()).includes(address), 'erased address must leave the index');
+
+  assert.equal((await getAnchorTransactions(bystander)).length, 1, 'other addresses are untouched');
+  assert.equal((await getAnchorKyc(bystander)).status, 'ACCEPTED');
+  assert.ok((await getKnownAnchorAddresses()).includes(bystander));
 });
 
 test('listAnchorPayouts only surfaces withdrawal-kind reports, across all known addresses', async () => {

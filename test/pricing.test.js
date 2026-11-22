@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PRICING_TIERS, surgeMultiplier, priceForTier, resolveTier, DEFAULT_TIER_KEY } from '../src/pricing.js';
-import { exactMatchVote, reconcile } from '../src/reconcile.js';
 
 // Regression coverage: resolveTier used a plain bracket lookup, so a
 // caller-supplied tierKey of "__proto__" resolved Object.prototype itself
