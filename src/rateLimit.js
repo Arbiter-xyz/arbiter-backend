@@ -70,7 +70,7 @@ function budgetKey(now = Date.now()) {
  * false as "do not call real Claude" and fall back to their deterministic path
  * (sandbox: canned response; Instant tier: fail closed to a refund).
  *
- * The reservation is recorded atomically via store.incr, so concurrent
+ * The reservation is recorded atomically via store.incrBy, so concurrent
  * requests across instances can never collectively overshoot the cap by more
  * than a single in-flight reservation.
  */
@@ -78,10 +78,14 @@ export async function reserveClaudeBudget(cents) {
   const amount = Number(cents);
   if (!Number.isFinite(amount) || amount <= 0) return true;
 
-  const windowMs = budgetWindowMs();
   const key = budgetKey();
-  const spent = await store.incr(key, windowMs, amount);
-  return spent <= budgetCents();
+  const spent = await store.incrBy(key, amount);
+  if (spent <= budgetCents()) return true;
+
+  // A rejected reservation must not stay on the counter, or a burst of
+  // over-cap attempts would keep inflating spend that was never incurred.
+  await store.incrBy(key, -amount);
+  return false;
 }
 
 /**
@@ -100,17 +104,8 @@ export async function settleClaudeBudget(reservedCents, actualCents) {
   const delta = actual - reserved;
   if (delta === 0) return;
 
-  const windowMs = budgetWindowMs();
   const key = budgetKey();
-  if (delta > 0) {
-    await store.incr(key, windowMs, delta);
-  } else {
-    // Refund the over-estimate with a negative delta. incrBy is durable (no
-    // TTL), so re-apply the window TTL to keep the rolling-window aging-out
-    // behaviour the reservation's incr() established.
-    await store.incrBy(key, delta);
-    await store.set(key, await store.get(key), windowMs);
-  }
+  await store.incrBy(key, delta);
 }
 
 /**

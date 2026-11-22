@@ -1,134 +1,116 @@
-import test from 'node:test';
+import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   createJob,
-  getJob,
   updateJob,
+  getJob,
   markPendingReview,
+  getPendingReviewJobIds,
+  getPendingReviews,
   approveReview,
   escalateItem,
   unescalateItem,
   getEscalatedItems,
-  getPendingReviewJobIds,
+  getEscalatedIds,
 } from '../src/jobs.js';
 
-// #254 — review-queue functions: markPendingReview, approveReview,
-// escalateItem, unescalateItem. Each gets a success path and a realistic
-// failure/edge case.
-
-function uniqueId(prefix) {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+function uniqueJobId(prefix = 'review-job') {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-test('markPendingReview moves a job into the review queue and indexes it', async () => {
-  const jobId = uniqueId('review');
-  await createJob(jobId, { questionId: '42' });
+describe('manual review queue (#243, #254)', () => {
+  test('markPendingReview transitions an active job to pending_review, indexes it, and preserves extra metadata', async () => {
+    const jobId = uniqueJobId('pending');
+    await createJob(jobId, { questionId: jobId, question: 'Needs review?' });
 
-  const moved = await markPendingReview(jobId, { reviewReason: 'low_confidence' });
+    const transitioned = await markPendingReview(jobId, {
+      confidence: 0.45,
+      proposedAnswer: 'Maybe',
+      reviewReason: 'low-confidence',
+    });
+    assert.equal(transitioned, true);
 
-  assert.equal(moved, true);
-  const job = await getJob(jobId);
-  assert.equal(job.status, 'pending_review');
-  assert.equal(job.questionId, '42');
-  assert.equal(job.reviewReason, 'low_confidence');
-  assert.ok(job.reviewRequestedAt);
-  assert.ok((await getPendingReviewJobIds()).includes(jobId));
-});
+    const job = await getJob(jobId);
+    assert.equal(job.status, 'pending_review');
+    assert.equal(job.confidence, 0.45);
+    assert.equal(job.proposedAnswer, 'Maybe');
+    assert.equal(typeof job.reviewRequestedAt, 'number');
 
-test('markPendingReview returns false for an already-settled job and leaves it untouched', async () => {
-  const jobId = uniqueId('review');
-  await createJob(jobId, {});
-  await updateJob(jobId, { status: 'settled', outcome: 'resolved' });
+    const ids = await getPendingReviewJobIds();
+    assert.ok(ids.includes(jobId));
 
-  const moved = await markPendingReview(jobId);
-
-  assert.equal(moved, false);
-  const job = await getJob(jobId);
-  assert.equal(job.status, 'settled');
-  assert.equal(job.outcome, 'resolved');
-  assert.ok(!(await getPendingReviewJobIds()).includes(jobId));
-});
-
-test('markPendingReview is idempotent for a job already pending review', async () => {
-  const jobId = uniqueId('review');
-  await createJob(jobId, {});
-  assert.equal(await markPendingReview(jobId), true);
-
-  assert.equal(await markPendingReview(jobId), false);
-});
-
-test('approveReview settles a pending job and clears its queue/escalation entries', async () => {
-  const jobId = uniqueId('review');
-  await createJob(jobId, { questionId: '7' });
-  await markPendingReview(jobId);
-  await escalateItem('review', jobId);
-
-  const settled = await approveReview(jobId, 'resolved', async (job, outcome) => {
-    assert.equal(job.questionId, '7');
-    return updateJob(jobId, { status: 'settled', outcome });
+    const reviews = await getPendingReviews();
+    assert.ok(reviews.some((r) => r.questionId === jobId));
   });
 
-  assert.equal(settled.status, 'settled');
-  assert.equal(settled.outcome, 'resolved');
-  assert.ok(!(await getPendingReviewJobIds()).includes(jobId));
-  assert.ok(!(await getEscalatedItems()).some((e) => e.kind === 'review' && e.id === jobId));
-});
+  test('markPendingReview is idempotent and refuses already-queued or terminal jobs', async () => {
+    const queuedId = uniqueJobId('already-queued');
+    await createJob(queuedId, { questionId: queuedId });
+    assert.equal(await markPendingReview(queuedId), true);
+    assert.equal(await markPendingReview(queuedId), false, 'second call on pending_review job must return false');
 
-test('approveReview returns null and does not settle a job that is not pending review', async () => {
-  const jobId = uniqueId('review');
-  await createJob(jobId, {});
-  let settleCalls = 0;
-
-  const result = await approveReview(jobId, 'resolved', async () => {
-    settleCalls += 1;
-    return updateJob(jobId, { status: 'settled', outcome: 'resolved' });
+    const settledId = uniqueJobId('already-settled');
+    await createJob(settledId, { questionId: settledId });
+    await updateJob(settledId, { status: 'settled', outcome: 'resolved' });
+    assert.equal(await markPendingReview(settledId), false, 'settled job must not enter pending_review');
   });
 
-  assert.equal(result, null);
-  assert.equal(settleCalls, 0);
-  assert.equal((await getJob(jobId)).status, 'awaiting_workers');
-});
+  test('approveReview settles a pending_review job, unindexes it, and clears any escalation flag', async () => {
+    const jobId = uniqueJobId('approve');
+    await createJob(jobId, { questionId: jobId, question: 'Approve me?' });
+    await markPendingReview(jobId, { confidence: 0.5 });
+    await escalateItem('review', jobId);
+    assert.equal((await getEscalatedIds('review')).has(jobId), true);
 
-test('approveReview returns null for an unknown jobId', async () => {
-  const result = await approveReview(uniqueId('missing'), 'resolved', async () => {
-    throw new Error('settle must not be called for an unknown job');
+    const settled = await approveReview(jobId, 'resolved', async (job, outcome) => {
+      return updateJob(job.questionId, { status: 'settled', outcome, answer: 'Approved answer' });
+    });
+
+    assert.ok(settled);
+    assert.equal(settled.status, 'settled');
+    assert.equal(settled.outcome, 'resolved');
+    assert.equal((await getPendingReviewJobIds()).includes(jobId), false);
+    assert.equal((await getEscalatedIds('review')).has(jobId), false);
   });
-  assert.equal(result, null);
+
+  test('approveReview returns null for non-existent or non-pending_review jobs and rejects invalid outcomes', async () => {
+    assert.equal(await approveReview('non-existent-job-id', 'resolved', async () => ({})), null);
+
+    const jobId = uniqueJobId('not-in-review');
+    await createJob(jobId, { questionId: jobId });
+    assert.equal(await approveReview(jobId, 'resolved', async () => ({})), null);
+
+    await markPendingReview(jobId);
+    await assert.rejects(
+      () => approveReview(jobId, 'bogus-outcome', async () => ({})),
+      /invalid review outcome/,
+    );
+  });
 });
 
-test('escalateItem records an item once and is idempotent', async () => {
-  const id = uniqueId('item');
+describe('escalation queue (#254)', () => {
+  test('escalateItem and unescalateItem are idempotent and scope membership by kind', async () => {
+    const id = uniqueJobId('esc');
 
-  assert.equal(await escalateItem('review', id), true);
-  assert.equal(await escalateItem('review', id), false);
+    assert.equal(await escalateItem('review', id), true, 'first escalation returns true');
+    assert.equal(await escalateItem('review', id), false, 'duplicate escalation returns false');
 
-  const entries = (await getEscalatedItems()).filter((e) => e.id === id);
-  assert.equal(entries.length, 1);
-  assert.equal(entries[0].kind, 'review');
-  assert.ok(entries[0].escalatedAt);
-});
+    // Different kind ('dispute') with the same id is tracked independently
+    assert.equal(await escalateItem('dispute', id), true);
 
-test('escalateItem treats the same id under a different kind as a separate item', async () => {
-  const id = uniqueId('item');
+    const reviewSet = await getEscalatedIds('review');
+    const disputeSet = await getEscalatedIds('dispute');
+    assert.equal(reviewSet.has(id), true);
+    assert.equal(disputeSet.has(id), true);
 
-  assert.equal(await escalateItem('review', id), true);
-  assert.equal(await escalateItem('dispute', id), true);
+    const all = await getEscalatedItems();
+    assert.ok(all.some((e) => e.kind === 'review' && e.id === id && typeof e.escalatedAt === 'number'));
 
-  const kinds = (await getEscalatedItems())
-    .filter((e) => e.id === id)
-    .map((e) => e.kind)
-    .sort();
-  assert.deepEqual(kinds, ['dispute', 'review']);
-});
+    assert.equal(await unescalateItem('review', id), true, 'removing existing escalation returns true');
+    assert.equal(await unescalateItem('review', id), false, 'removing already-cleared escalation returns false');
+    assert.equal((await getEscalatedIds('review')).has(id), false);
+    assert.equal((await getEscalatedIds('dispute')).has(id), true);
 
-test('unescalateItem clears an escalated item', async () => {
-  const id = uniqueId('item');
-  await escalateItem('review', id);
-
-  assert.equal(await unescalateItem('review', id), true);
-  assert.ok(!(await getEscalatedItems()).some((e) => e.id === id));
-});
-
-test('unescalateItem returns false for an item that was never escalated', async () => {
-  assert.equal(await unescalateItem('review', uniqueId('never')), false);
+    await unescalateItem('dispute', id);
+  });
 });

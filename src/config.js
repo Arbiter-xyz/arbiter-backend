@@ -52,6 +52,23 @@ function sessionSecret() {
 }
 const SESSION_SECRET = sessionSecret();
 
+// Dedicated key for hashing worker IPs in collusion.js (#278). Kept separate
+// from SESSION_SECRET so a session-signing secret is never reused as a
+// pseudonymization key (and so rotating one doesn't silently break the
+// other). Falls back to a random per-process key when unset — same posture
+// as the session secret fallback above: IP hashes then don't survive a
+// restart, which only weakens the sharedIp heuristic, never correctness.
+let ipHashSecretFallbackWarned = false;
+function ipHashSecret() {
+  if (process.env.COLLUSION_IP_HASH_SECRET) return process.env.COLLUSION_IP_HASH_SECRET;
+  if (!ipHashSecretFallbackWarned) {
+    console.warn('[config] COLLUSION_IP_HASH_SECRET not set — generating a random per-process key (worker IP hashes will not survive a restart)');
+    ipHashSecretFallbackWarned = true;
+  }
+  return randomBytes(32).toString('hex');
+}
+const COLLUSION_IP_HASH_SECRET = ipHashSecret();
+
 // Graceful SESSION_SECRET rotation (#7): during a bounded grace window,
 // session verification also accepts tokens signed by the immediately-prior
 // secret (SESSION_SECRET_PREVIOUS). The window is measured from process
@@ -193,6 +210,17 @@ export const config = Object.freeze({
   contractId: process.env.ORACLE_CONTRACT_ID || '',
   platformSecret: process.env.PLATFORM_SECRET || '',
   platformAddress: process.env.PLATFORM_ADDRESS || '',
+  // Multi-signer settlement pool (#466/#161/#164): a comma-separated list of
+  // additional admin-authorized secret keys. When set, admin-signed calls
+  // (resolve/refund/charge/touch) are routed across ALL of PLATFORM_SECRET
+  // plus these, round-robin, instead of serializing through one keypair.
+  // Each key needs its own serial queue + signer-lock role to stay safe
+  // under Stellar's per-account sequence-number rule; see stellarClient.js.
+  // Unset (default) behaves exactly as before: a pool of size 1.
+  platformSecretsExtra: (process.env.PLATFORM_SECRETS_EXTRA || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
 
   // Pinned arbiter-contract release this backend expects (see
   // contractCompatibility above and contractVersionCheck.js).
@@ -538,6 +566,13 @@ export const config = Object.freeze({
         .map((t) => t.trim())
         .filter(Boolean),
     ),
+    // #130: admin 2FA. A base32 TOTP secret (RFC 6238), shared across every
+    // admin token holder (same single-operator-set model as the bearer
+    // token above — see this block's own doc comment). Unset = 2FA is not
+    // required, preserving today's behavior for deployments that haven't
+    // provisioned it yet. When set, every /admin/* request must also
+    // present the current 6-digit code via X-Admin-TOTP (adminAuth.js).
+    totpSecret: process.env.ADMIN_TOTP_SECRET || '',
   }),
 
   // Settlement webhooks (see webhooks.js for registration/validation and
@@ -594,6 +629,10 @@ export const config = Object.freeze({
     // Pair score at or above which both workers are also dropped from
     // routing eligibility (soft, fails open like every other routing gate).
     suspendScore: num(process.env.COLLUSION_SUSPEND_SCORE, 0.85),
+    // Dedicated HMAC key for worker IP hashing (#278). Deliberately not
+    // config.session.secret: key separation between session signing and
+    // IP pseudonymization.
+    ipHashSecret: COLLUSION_IP_HASH_SECRET,
   }),
 });
 

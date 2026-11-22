@@ -34,6 +34,11 @@ import { config } from './config.js';
  * hook) to close the rebinding gap between registration and delivery. The
  * two checks are intentionally redundant; the signing convention is
  * documented only in webhookDelivery.js.
+ *
+ * Concurrency (#277): the per-owner index is a read-modify-write of a single
+ * KV key, so registerWebhook() and deleteWebhook() serialize it through
+ * withOwnerLock() and re-read the index inside the lock. See
+ * docs/issues/277-webhook-owner-index-race.md for the cross-instance limit.
  */
 
 const REG_PREFIX = 'webhook:';
@@ -187,6 +192,31 @@ async function ownerIds(owner) {
   return (await store.get(OWNER_PREFIX + owner)) || [];
 }
 
+// Per-owner in-process lock. The owner index is a read-modify-write of one
+// KV key, and store.set() is a blind overwrite, so two concurrent
+// registrations for the same owner would otherwise both read the same ids
+// and the second write would drop the first's id (#277). Serializing the
+// read-modify-write per owner closes that window within an instance; the
+// cross-instance case is documented in docs/issues/277-webhook-owner-index-race.md.
+const ownerLocks = new Map();
+
+async function withOwnerLock(owner, fn) {
+  const previous = ownerLocks.get(owner) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => {
+    release = resolve;
+  });
+  const chained = previous.then(() => current);
+  ownerLocks.set(owner, chained);
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (ownerLocks.get(owner) === chained) ownerLocks.delete(owner);
+  }
+}
+
 /**
  * Creates a registration and returns it WITH its signing secret. This is
  * the only time the secret is ever returned.
@@ -223,7 +253,13 @@ export async function registerWebhook(owner, rawUrl, { description } = {}) {
   // No TTL: registrations are identity/config records and must survive
   // restarts, like every other such record in this codebase.
   await store.set(REG_PREFIX + id, record);
-  await store.set(OWNER_PREFIX + owner, [id, ...ids.filter((x) => existing.some((r) => r.id === x))]);
+  // Re-read the index inside the lock: the ids read above may be stale by
+  // now, and writing them back would drop a concurrently added id (#277).
+  await withOwnerLock(owner, async () => {
+    const current = await ownerIds(owner);
+    const live = (await Promise.all(current.map((x) => store.get(REG_PREFIX + x)))).filter(Boolean);
+    await store.set(OWNER_PREFIX + owner, [id, ...live.map((r) => r.id)]);
+  });
   const known = (await store.get(WEBHOOK_INDEX_KEY)) || [];
   await store.set(WEBHOOK_INDEX_KEY, [id, ...known].slice(0, MAX_TRACKED_WEBHOOKS));
 
@@ -249,7 +285,9 @@ export async function deleteWebhook(owner, id) {
 
   await store.delete(REG_PREFIX + id);
   await store.delete(`webhook-delivery:${id}`);
-  await store.set(OWNER_PREFIX + owner, (await ownerIds(owner)).filter((x) => x !== id));
+  await withOwnerLock(owner, async () => {
+    await store.set(OWNER_PREFIX + owner, (await ownerIds(owner)).filter((x) => x !== id));
+  });
   const known = (await store.get(WEBHOOK_INDEX_KEY)) || [];
   await store.set(WEBHOOK_INDEX_KEY, known.filter((x) => x !== id));
   return true;

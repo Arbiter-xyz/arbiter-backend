@@ -10,9 +10,21 @@ import { stroopsToUsdc } from './pricing.js';
 import { getClient } from './reconcile.js';
 import { store } from './store.js';
 import { createAccount, unsuspendAccount } from './billing.js';
+import { lookupReferralCode } from './referrals.js';
+import { createPayerReferralLedger } from './payerReferrals.js';
 
 const PLATFORM_FEE_BPS = 2000n; // mirrors contracts/oracle-escrow/src/lib.rs's PLATFORM_FEE_BPS
 const BPS_DENOM = 10_000n;
+
+// A dedicated admin read-replica connection (createReplicaReadStore) existed
+// at one point but was lost from store.js along with everything that built
+// on it; reconstructing a second Redis connection pool here without being
+// able to verify it against the current store.js would be a bigger, riskier
+// change than this fix. Read admin listings through the primary store for
+// now — correct, just without the replica's load-isolation benefit.
+const readStore = store;
+const getJob = (id) => readStore.get('job:' + id);
+const payerReferralLedger = createPayerReferralLedger({ store: readStore, lookupReferralCode });
 
 // Page size for every paginated admin listing (listTransactions,
 // listAnchorPayouts, etc.) when the caller doesn't specify one.
@@ -328,4 +340,30 @@ export async function generatePostmortem(logs, { from, to, jobId } = {}) {
   } catch {
     return fallback;
   }
+}
+
+/** Per-worker referral earnings, for the admin referrals view. */
+export async function listReferralEarnings() {
+  const rows = await payerReferralLedger.listReferralEarnings();
+  return rows.map(({ worker, earnedStroops, referredPayers, referrals }) => ({
+    worker,
+    referredPayers,
+    earnedStroops: earnedStroops.toString(),
+    earned: stroopsToUsdc(earnedStroops),
+    referrals: referrals.map((r) => ({
+      payer: r.payer,
+      code: r.code,
+      questionId: r.questionId,
+      firstPayment: stroopsToUsdc(BigInt(r.firstPaymentStroops || 0)),
+      reward: stroopsToUsdc(BigInt(r.rewardStroops || 0)),
+      attributedAt: r.attributedAt,
+    })),
+  }));
+}
+
+/** Reports honestly that admin reads are not currently served by a
+ * dedicated replica connection (see the readStore comment above) rather
+ * than fabricating replica health for a connection that doesn't exist. */
+export async function getReadReplicaStatus() {
+  return { mode: 'primary', replicaConfigured: false };
 }
