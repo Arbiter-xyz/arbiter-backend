@@ -8,13 +8,19 @@
     "dev": "node --watch src/server.js",
     "check": "find src scripts -name '*.js' -print0 | xargs -0 -n1 node --check",
     "test": "node --test --test-timeout=30000",
-    "lint": "find src scripts -name '*.js' -print0 | xargs -0 -n1 node --check",
+    "lint": "eslint src scripts",
     "verify-provenance": "node scripts/verify-provenance.js",
     "boot-smoke-test": "node scripts/boot-smoke-test.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "eslint": "^9.17.0",
+    "eslint-plugin-import": "^2.31.0",
+    "globals": "^15.14.0"
+  },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.0",
     "@opentelemetry/api": "^1.9.1",

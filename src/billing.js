@@ -286,6 +286,18 @@ const stripeProcessor = {
       throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
     }
 
+    // Apple Pay / Google Pay (issue #105) require the redirect domain to be
+    // registered with Stripe for Apple Pay domain association. Resolve and
+    // log the origin Stripe will associate with this session so an operator
+    // can confirm it's registered; isAllowedRedirectUrl() above already
+    // guarantees this resolves to a real origin, never null, for both URLs.
+    const applePayOrigin = getApplePayVerificationOrigin(successUrl);
+    if (applePayOrigin) {
+      logger.info({ applePayOrigin }, 'createCheckoutSession: Apple Pay/Google Pay domain for this session');
+    } else {
+      logger.warn({ successUrl }, 'createCheckoutSession: could not resolve Apple Pay verification origin for successUrl');
+    }
+
     // Reject unsupported/malformed currencies before creating any account or
     // Stripe session — a bad currency is a 400, never a silent USD default.
     const { code, minorUnits, usdPerUnit } = resolveCurrency(currency);
