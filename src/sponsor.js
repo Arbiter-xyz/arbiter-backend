@@ -1,6 +1,6 @@
 import { Horizon, TransactionBuilder, Operation, Asset, BASE_FEE, Address, xdr, nativeToScVal } from '@stellar/stellar-sdk';
 import { config } from './config.js';
-import { getAdminKeypair, u64Arg, addressArg } from './stellarClient.js';
+import { getAdminKeypair, u64Arg, addressArg, getContractId } from './stellarClient.js';
 import { withRetry } from './retry.js';
 
 // Horizon submission is safe to retry as a whole: a resubmission of the
@@ -108,7 +108,7 @@ export async function finalizeSponsoredOnboardTx(workerSignedXdr) {
 
 function expectedHostFunctionBytes(functionName, args) {
   const invokeArgs = new xdr.InvokeContractArgs({
-    contractAddress: new Address(config.contractId).toScAddress(),
+    contractAddress: new Address(getContractId()).toScAddress(),
     functionName,
     args,
   });

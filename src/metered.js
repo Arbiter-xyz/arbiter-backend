@@ -1,7 +1,7 @@
 import { nextQuestionId, stashQuestion } from './pendingQuestions.js';
 import { priceForTier, listTiersForClient, stroopsToUsdc } from './pricing.js';
 import { getSmoothedOnlineWorkerCount } from './dispatch.js';
-import { chargeBalance, getBalanceOnChain } from './stellarClient.js';
+import { chargeBalance, getBalanceOnChain, getContractId } from './stellarClient.js';
 import { startFulfillment, consensusStashFields } from './oracle.js';
 import { config } from './config.js';
 
@@ -117,7 +117,7 @@ export async function getMeteredBalance(payerAddress) {
  * kept as a human-readable summary for backward compatibility with any
  * existing consumer that renders it verbatim. */
 export function depositInstructions(payerAddress) {
-  const contractId = config.contractId;
+  const contractId = getContractId();
   const sessionTokenEndpoint = `/payers/${payerAddress}/session`;
   const askEndpoint = '/oracle';
   return {
