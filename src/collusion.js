@@ -290,7 +290,7 @@ function matchRatio(rep) {
  * each signal is 0..1 before weighting.
  */
 export function scorePair({ counters, ratioA, ratioB, referral, sharedIp }, minShared = config.collusion.minSharedQuestions) {
-  const { shared, sameAnswer, sameWrong, synced } = counters;
+  const { shared = 0, sameAnswer = 0, sameWrong = 0, synced = 0 } = counters || {};
   const signals = { sameWrong: 0, lift: 0, sync: 0, referral: referral ? 1 : 0, sharedIp: sharedIp ? 1 : 0 };
 
   // Once is a coincidence; twice in identical words is a pattern. Scales
@@ -315,12 +315,25 @@ export function scorePair({ counters, ratioA, ratioB, referral, sharedIp }, minS
   return { score: Math.round((1 - clean) * 1000) / 1000, signals };
 }
 
+async function getPairCounters(key) {
+  return (await store.get(PAIR_PREFIX + key)) || {};
+}
+
+async function sharesIp(a, b) {
+  const [ipsA, ipsB] = await Promise.all([
+    store.get(WORKER_IPS_PREFIX + a),
+    store.get(WORKER_IPS_PREFIX + b),
+  ]);
+  return (ipsA || []).some((ip) => (ipsB || []).includes(ip));
+}
+
 export async function evaluatePair(a, b, getReputation) {
   const key = pairKey(a, b);
+  const reputation = typeof getReputation === 'function' ? getReputation : async () => null;
   const [counters, repA, repB, link, sharedIp] = await Promise.all([
     getPairCounters(key),
-    getReputation(a),
-    getReputation(b),
+    reputation(a),
+    reputation(b),
     store.get(LINK_PREFIX + key),
     sharesIp(a, b),
   ]);
@@ -331,6 +344,7 @@ export async function evaluatePair(a, b, getReputation) {
     referral: link?.kind === 'referral',
     sharedIp,
   });
+  result.disposition = classifyPairScore(result.score);
   return { pair: key, workers: splitPair(key), counters, referral: link || null, ...result };
 }
 
@@ -342,7 +356,7 @@ export async function evaluatePair(a, b, getReputation) {
  * Fails open (not suspicious) on a store error, since the caller is on the
  * settlement path.
  */
-export async function assessQuorum(submissions) {
+export async function assessQuorum(submissions = []) {
   const pairs = [];
   try {
     for (let i = 0; i < submissions.length; i += 1) {
