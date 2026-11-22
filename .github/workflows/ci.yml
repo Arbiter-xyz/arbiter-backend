@@ -37,6 +37,8 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
+      - name: Boot smoke test (catches boot-breaking imports like #467/PR #206's missing src/totp.js)
+        run: node scripts/boot-smoke-test.js
       - run: npm test
       - name: MCP server tests
         working-directory: mcp-server
