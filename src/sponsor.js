@@ -184,3 +184,16 @@ export async function feeBumpWithdrawTo(signedInnerXdr, workerAddress, beneficia
     nativeToScVal(BigInt(amountStroops), { type: 'i128' }),
   ]);
 }
+
+/** Relays a payer's own withdraw_balance(payer, amountStroops) call —
+ * reclaiming unused prepaid/metered balance (see metered.js's
+ * depositInstructions()). Without this, a metered payer who deposited via
+ * their own signature (never touching platform funds) would still need to
+ * hold XLM for this one reclaim call, the last gap in this backend's
+ * otherwise-consistent zero-XLM promise (#470). */
+export async function feeBumpWithdrawBalance(signedInnerXdr, payerAddress, amountStroops) {
+  return relayFeeBump(signedInnerXdr, 'sponsor/withdraw-balance', 'withdraw_balance', [
+    addressArg(payerAddress),
+    nativeToScVal(BigInt(amountStroops), { type: 'i128' }),
+  ]);
+}

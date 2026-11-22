@@ -6,6 +6,7 @@ import { hashApiKey } from './apiKeyAuth.js';
 import { logger } from './logger.js';
 import { recordPaymentReversal } from './paymentReversals.js';
 import { billingReservationCount, billingSettlementCount, fiatPoolBalanceStroops } from './metrics.js';
+import { isLoopbackHost } from './securityPosture.js';
 
 /**
  * The non-crypto onramp: a fiat customer pays via Stripe and is issued an
@@ -174,12 +175,18 @@ export async function restoreCredit(accountId, stroops) {
 }
 
 export function isAllowedRedirectUrl(url) {
-  if (config.allowedOrigins.includes('*')) return true; // wide-open dev mode, same default as CORS
+  let parsed;
   try {
-    return config.allowedOrigins.includes(new URL(url).origin);
+    parsed = new URL(url);
   } catch {
     return false;
   }
+  // A wildcard CORS allowlist must NOT disable redirect validation: the raw
+  // API key is appended to successUrl, so any origin would receive it. With
+  // '*' we fall back to loopback-only redirects (local dev), never arbitrary
+  // hosts. Set ALLOWED_ORIGINS to an explicit list to allow real frontends.
+  if (config.allowedOrigins.includes('*')) return isLoopbackHost(parsed.hostname);
+  return config.allowedOrigins.includes(parsed.origin);
 }
 
 /**

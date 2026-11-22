@@ -44,6 +44,19 @@ export async function getLatestLedgerSequence() {
   return sequence;
 }
 
+/** Fetches the real settlement transaction's envelope XDR by hash, for
+ * provenanceVerify.js's extractContractCall()/verifyPayout() (#468): this
+ * is what ties a committed provenance record to the actual on-chain call,
+ * instead of trusting this backend's own job record. Returns null if the
+ * RPC endpoint no longer has the transaction (outside its retention
+ * window) or it isn't found, so callers can report "not independently
+ * verifiable right now" rather than throwing. */
+export async function getTransactionEnvelope(hash) {
+  const tx = await getServer().getTransaction(hash);
+  if (!tx || tx.status !== 'SUCCESS' || !tx.envelopeXdr) return null;
+  return typeof tx.envelopeXdr === 'string' ? tx.envelopeXdr : tx.envelopeXdr.toXDR('base64');
+}
+
 /** Comma-separated list of configured RPC URLs, mirroring
  * config.allowedOrigins' comma-split parsing convention. The first entry is
  * the primary; the rest are ordered failover candidates. A single-URL
@@ -89,6 +102,20 @@ export function getAdminKeypair() {
   if (!config.platformSecret) throw new Error('PLATFORM_SECRET not configured');
   if (!adminKeypair) adminKeypair = Keypair.fromSecret(config.platformSecret);
   return adminKeypair;
+}
+
+/** The full settlement signer pool (#161/#164/#466): PLATFORM_SECRET plus
+ * any PLATFORM_SECRETS_EXTRA keys, each lazily turned into a Keypair once.
+ * Pool size 1 (the default, nothing configured beyond PLATFORM_SECRET) is
+ * byte-for-byte the old single-signer behavior. */
+let signerPool = null;
+export function getSignerPool() {
+  if (!signerPool) {
+    const secrets = [config.platformSecret, ...config.platformSecretsExtra].filter(Boolean);
+    if (secrets.length === 0) throw new Error('PLATFORM_SECRET not configured');
+    signerPool = secrets.map((secret) => Keypair.fromSecret(secret));
+  }
+  return signerPool;
 }
 
 /** Live-reloadable contract id. `config.contractId` is frozen at module load,
@@ -154,11 +181,10 @@ export function vecOfAddresses(addresses) {
  * are exhausted, so a failover attempt always starts with its own fresh
  * getAccount() read against the server that will actually submit it.
  */
-async function runInvokeAsAdmin(method, scValArgs) {
+async function runInvokeAsAdmin(method, scValArgs, admin) {
   return withServerFailover((srv) =>
     withRetry(
       async () => {
-        const admin = getAdminKeypair();
         const account = await srv.getAccount(admin.publicKey());
         const contract = new Contract(getContractId());
 
@@ -186,25 +212,21 @@ async function runInvokeAsAdmin(method, scValArgs) {
   );
 }
 
-/** There is exactly one Stellar account signing every admin call (the
- * platform key), and Stellar requires a strictly increasing, gap-free
- * sequence number per submitted transaction from that account. Two
- * invokeAsAdmin() calls that overlap in time would otherwise both fetch
- * the *same* current sequence and both build a transaction for
- * `sequence + 1` — only one can land, and the other fails outright rather
- * than retrying into success, since a fresh getAccount() read moments
- * later would just collide with a THIRD concurrent caller instead. This
- * is ordinary production traffic, not a rare edge case: two questions
- * settling around the same moment, or sweepWorkerTtls()'s daily
- * Promise.all() fan-out across every known worker, all sign from this
- * same key at once.
+/** Each Stellar account requires a strictly increasing, gap-free sequence
+ * number per submitted transaction from that account. Two invokeAsAdmin()
+ * calls signing with the SAME key that overlap in time would otherwise both
+ * fetch the same current sequence and both build a transaction for
+ * `sequence + 1` — only one can land. This is ordinary production traffic,
+ * not a rare edge case: two questions settling around the same moment, or
+ * sweepWorkerTtls()'s daily Promise.all() fan-out across every known worker.
  *
- * Queuing every call onto one chain — waiting for the previous call's
- * entire build/sign/submit/poll cycle to finish before the next one even
- * starts — makes the sequence numbers strictly ordered by construction.
- * The queue is a plain promise chain: each task's rejection is swallowed
- * for the *chain* (so one failed call can't poison every subsequent
- * call) while still being propagated to that task's own caller.
+ * Queuing every call for a given key onto one chain — waiting for the
+ * previous call's entire build/sign/submit/poll cycle to finish before the
+ * next one even starts — makes that key's sequence numbers strictly ordered
+ * by construction. The queue is a plain promise chain: each task's
+ * rejection is swallowed for the *chain* (so one failed call can't poison
+ * every subsequent call on that key) while still being propagated to that
+ * task's own caller.
  */
 function createSerialQueue() {
   let tail = Promise.resolve();
@@ -218,29 +240,59 @@ function createSerialQueue() {
   };
 }
 
-const enqueueAdminCall = createSerialQueue();
+/** Multi-signer settlement pool (#161/#164/#466): removes the single
+ * admin-key throughput ceiling by giving EACH key in getSignerPool() its
+ * own serial queue (so sequence numbers per key stay strictly ordered) and
+ * its own signer-lock role (so the cross-instance canary/primary handoff in
+ * canary.js keeps working per key, not just globally). Calls are routed
+ * round-robin across the pool, which is exactly what #161's own acceptance
+ * criteria asks for: throughput scales with pool size instead of
+ * flatlining at one signer's rate. A pool of size 1 (default, nothing
+ * configured beyond PLATFORM_SECRET) collapses back to the old
+ * one-queue-one-lock behavior byte-for-byte. */
+let signerSlots = null;
+function getSignerSlots() {
+  if (!signerSlots) {
+    signerSlots = getSignerPool().map((keypair, i) => ({
+      keypair,
+      enqueue: createSerialQueue(),
+      lock: createSignerLock({
+        store,
+        role: config.canary.role,
+        ttlMs: config.canary.signerLockTtlMs,
+        waitMs: config.canary.signerLockWaitMs,
+        // Namespaced per signer so N keys don't contend for one lock key.
+        key: `lock:platform-signer:${i}:${keypair.publicKey()}`,
+      }),
+    }));
+  }
+  return signerSlots;
+}
 
-// The serial queue above only orders calls within this process. The signer
-// lock extends that across instances (canary.js): a canary never signs, and
-// two primaries sharing PLATFORM_SECRET take turns per call. Acquired inside
-// the queued fn, so calls in one process never contend with each other for it.
-const signerLock = createSignerLock({
-  store,
-  role: config.canary.role,
-  ttlMs: config.canary.signerLockTtlMs,
-  waitMs: config.canary.signerLockWaitMs,
-});
+let nextSlot = 0;
+/** Picks the next pool slot round-robin. Exported for load-test tooling
+ * that wants to assert throughput actually scales with pool size. */
+export function pickSignerSlot() {
+  const slots = getSignerSlots();
+  const slot = slots[nextSlot % slots.length];
+  nextSlot += 1;
+  return slot;
+}
 
 function invokeAsAdmin(method, scValArgs) {
-  return serializeAdminCall(() => signerLock.run(() => runInvokeAsAdmin(method, scValArgs))).then(
-    (result) => {
-      recordAdminInvocation(method, true);
-      return result;
-    } catch (err) {
-      recordAdminInvocation(method, 'failure', Date.now() - startedAt);
-      throw err;
-    }
-  });
+  const slot = pickSignerSlot();
+  return slot
+    .enqueue(() => slot.lock.run(() => runInvokeAsAdmin(method, scValArgs, slot.keypair)))
+    .then(
+      (result) => {
+        recordAdminInvocation(method, true);
+        return result;
+      },
+      (err) => {
+        recordAdminInvocation(method, false);
+        throw err;
+      },
+    );
 }
 
 /** Reads a contract method via simulation (no submission, no signing). */
@@ -264,6 +316,89 @@ export async function simulateRead(method, scValArgs = []) {
       { attempts: 2, timeoutMs: 10_000, baseDelayMs: 300, label: `simulateRead(${method})` },
     ),
   );
+}
+
+export async function getOwedOnChain(workerAddress) {
+  const owed = await simulateRead('get_owed', [addressArg(workerAddress)]);
+  return BigInt(owed ?? 0);
+}
+
+export async function getStakeOnChain(workerAddress) {
+  const stake = await simulateRead('get_stake', [addressArg(workerAddress)]);
+  return BigInt(stake ?? 0);
+}
+
+export async function getBalanceOnChain(payerAddress) {
+  const balance = await simulateRead('get_balance', [addressArg(payerAddress)]);
+  return BigInt(balance ?? 0);
+}
+
+// A data-less Rust enum variant (Status::Pending etc.) decodes via
+// scValToNative as a single-element ARRAY, e.g. ['Pending'] — confirmed
+// against a real deployed contract's live RPC response, not assumed from
+// memory. Handling only the plain-object shape here silently decodes
+// onChain.status to "0" (an array's stringified numeric key) instead of
+// "pending".
+export function decodeStatus(raw) {
+  if (Array.isArray(raw)) return String(raw[0]).toLowerCase();
+  if (typeof raw === 'string') return raw.toLowerCase();
+  if (raw && typeof raw === 'object') return Object.keys(raw)[0]?.toLowerCase();
+  return String(raw).toLowerCase();
+}
+
+/** Zero-fee simulated read — checks payment state without needing a signature. */
+export async function getQuestionOnChain(questionId) {
+  const native = await simulateRead('get_question', [u64Arg(questionId)]);
+  if (!native) return null;
+  return {
+    payer: native.payer,
+    amount: BigInt(native.amount),
+    status: decodeStatus(native.status),
+    createdAt: Number(native.created_at),
+  };
+}
+
+/** Charges a payer's prepaid balance for a question as the platform admin.
+ * Retrying is not safe here — an insufficient-balance error fails the same
+ * way again, so the caller should surface it, not retry it. */
+export async function chargeBalance(payerAddress, questionId, amountStroops) {
+  return invokeAsAdmin('charge', [addressArg(payerAddress), u64Arg(questionId), i128Arg(amountStroops)]);
+}
+
+/** touch() keeps a worker's storage entries from archiving off-chain when
+ * they have a balance but haven't been touched by any other call recently —
+ * a worker who earns once and never returns has no other way to keep their
+ * balance from archiving off-chain storage. */
+export async function touchWorker(workerAddress) {
+  return invokeAsAdmin('touch', [addressArg(workerAddress)]);
+}
+
+/** Builds and prepares (simulates + assembles footprint/auth) the worker's
+ * OWN withdraw() or withdraw_to() call, with the worker's account as the
+ * source, and returns it UNSIGNED. The backend never signs this — the
+ * worker does, then it goes through the same fee-bump relay (sponsor.js),
+ * whose invoked-function check matches this call byte for byte since the
+ * args are built the same way. */
+export async function buildWorkerWithdrawTx(workerAddress, amountStroops, beneficiaryAddress = null, timeoutSeconds = 3600) {
+  const srv = getServer();
+  const account = await withRetry(() => srv.getAccount(workerAddress), {
+    attempts: 2,
+    timeoutMs: 5_000,
+    baseDelayMs: 200,
+    label: 'getAccount(worker)',
+  });
+  const contract = new Contract(config.contractId);
+  const op = beneficiaryAddress
+    ? contract.call('withdraw_to', addressArg(workerAddress), addressArg(beneficiaryAddress), i128Arg(amountStroops))
+    : contract.call('withdraw', addressArg(workerAddress), i128Arg(amountStroops));
+
+  const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
+    .addOperation(op)
+    .setTimeout(timeoutSeconds)
+    .build();
+
+  const prepared = await srv.prepareTransaction(tx);
+  return prepared.toXDR();
 }
 
 /** Settles a single question on-chain as the platform admin. */

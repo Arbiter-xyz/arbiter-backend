@@ -1,14 +1,16 @@
 {
-  "name": "backend",
+  "name": "arbiter-backend",
   "version": "1.0.0",
   "description": "Dispatch, settlement, and billing backend",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "check": "node --check src/*.js scripts/*.js",
+    "check": "find src scripts -name '*.js' -print0 | xargs -0 -n1 node --check",
+    "test": "node --test --test-timeout=30000",
     "lint": "eslint src scripts",
-    "test": "node --test --test-timeout=30000"
+    "verify-provenance": "node scripts/verify-provenance.js",
+    "boot-smoke-test": "node scripts/boot-smoke-test.js"
   },
   "keywords": [],
   "author": "",

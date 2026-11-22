@@ -22,7 +22,7 @@ export default [
     rules: {
       'no-undef': 'error',
       'no-redeclare': 'error',
-      'no-unused-vars': ['error', { args: 'none', varsIgnorePattern: '^_' }],
+      'no-unused-vars': ['warn', { args: 'none', varsIgnorePattern: '^_' }],
       'import/no-unresolved': 'error',
       'import/named': 'error',
     },

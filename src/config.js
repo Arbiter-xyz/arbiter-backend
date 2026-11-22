@@ -193,6 +193,17 @@ export const config = Object.freeze({
   contractId: process.env.ORACLE_CONTRACT_ID || '',
   platformSecret: process.env.PLATFORM_SECRET || '',
   platformAddress: process.env.PLATFORM_ADDRESS || '',
+  // Multi-signer settlement pool (#466/#161/#164): a comma-separated list of
+  // additional admin-authorized secret keys. When set, admin-signed calls
+  // (resolve/refund/charge/touch) are routed across ALL of PLATFORM_SECRET
+  // plus these, round-robin, instead of serializing through one keypair.
+  // Each key needs its own serial queue + signer-lock role to stay safe
+  // under Stellar's per-account sequence-number rule; see stellarClient.js.
+  // Unset (default) behaves exactly as before: a pool of size 1.
+  platformSecretsExtra: (process.env.PLATFORM_SECRETS_EXTRA || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
 
   // Pinned arbiter-contract release this backend expects (see
   // contractCompatibility above and contractVersionCheck.js).

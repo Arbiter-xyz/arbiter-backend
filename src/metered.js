@@ -120,6 +120,7 @@ export function depositInstructions(payerAddress) {
   const contractId = getContractId();
   const sessionTokenEndpoint = `/payers/${payerAddress}/session`;
   const askEndpoint = '/oracle';
+  const withdrawRelayEndpoint = '/sponsor/withdraw-balance';
   return {
     payerAddress,
     contractId,
@@ -132,6 +133,11 @@ export function depositInstructions(payerAddress) {
       contractId,
       function: 'withdraw_balance',
       args: [payerAddress, '<amount>'],
+      // Sign this call but submit it via withdrawRelayEndpoint instead of
+      // directly to the network — the platform fee-bumps it, so reclaiming
+      // unused balance never requires the payer to hold XLM (#470).
+      relayEndpoint: withdrawRelayEndpoint,
+      relayFields: ['xdr', 'payerAddress', 'amountStroops'],
     },
     sessionTokenEndpoint,
     askEndpoint,
@@ -141,7 +147,8 @@ export function depositInstructions(payerAddress) {
       'prepaid balance, then include payerAddress + a session token (from ' +
       `POST ${sessionTokenEndpoint}) in a normal POST ${askEndpoint} call to ask questions against ` +
       'it with no further signatures — same endpoint as the classic pay-per-call flow, just ' +
-      `with those two extra fields. Call withdraw_balance(${payerAddress}, <amount>) at any ` +
-      'time to reclaim unused funds.',
+      `with those two extra fields. To reclaim unused funds, sign a withdraw_balance(${payerAddress}, ` +
+      `<amount>) call and POST its XDR to ${withdrawRelayEndpoint} as { xdr, payerAddress, ` +
+      'amountStroops } — the platform pays the network fee, so this never requires holding XLM.',
   };
 }
