@@ -44,6 +44,19 @@ export async function getLatestLedgerSequence() {
   return sequence;
 }
 
+/** Fetches the real settlement transaction's envelope XDR by hash, for
+ * provenanceVerify.js's extractContractCall()/verifyPayout() (#468): this
+ * is what ties a committed provenance record to the actual on-chain call,
+ * instead of trusting this backend's own job record. Returns null if the
+ * RPC endpoint no longer has the transaction (outside its retention
+ * window) or it isn't found, so callers can report "not independently
+ * verifiable right now" rather than throwing. */
+export async function getTransactionEnvelope(hash) {
+  const tx = await getServer().getTransaction(hash);
+  if (!tx || tx.status !== 'SUCCESS' || !tx.envelopeXdr) return null;
+  return typeof tx.envelopeXdr === 'string' ? tx.envelopeXdr : tx.envelopeXdr.toXDR('base64');
+}
+
 /** Comma-separated list of configured RPC URLs, mirroring
  * config.allowedOrigins' comma-split parsing convention. The first entry is
  * the primary; the rest are ordered failover candidates. A single-URL
