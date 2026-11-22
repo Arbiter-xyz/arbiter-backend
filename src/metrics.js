@@ -108,6 +108,26 @@ export const probeErrorsTotal = new client.Counter({
   registers: [registry],
 });
 
+export const fiatPoolBalanceStroops = new client.Gauge({
+  name: 'arbiter_fiat_pool_balance_stroops',
+  help: 'Current balance of the pooled fiat-onramp custody address, in stroops.',
+  registers: [registry],
+});
+
+export const billingReservationCount = new client.Counter({
+  name: 'arbiter_billing_reservation_total',
+  help: 'Fiat-credit reservations against a customer balance, by outcome (reserved, insufficient).',
+  labelNames: ['outcome'],
+  registers: [registry],
+});
+
+export const billingSettlementCount = new client.Counter({
+  name: 'arbiter_billing_settlement_total',
+  help: 'Fiat-credit reservations settled against an actual charge, by outcome (charged, refunded).',
+  labelNames: ['outcome'],
+  registers: [registry],
+});
+
 // --- Disaster recovery (disasterRecovery.js) -------------------------------
 
 export const onchainPendingQuestions = new client.Gauge({
@@ -141,6 +161,7 @@ export const recoverySweepLastSuccess = new client.Gauge({
 export const recoverySweepFailuresTotal = new client.Counter({
   name: 'arbiter_recovery_sweep_failures_total',
   help: 'Recovery sweeps that could not complete their chain scan.',
+  labelNames: ['reason'],
   registers: [registry],
 });
 
@@ -206,10 +227,11 @@ export function recordJobScan(jobs, now = Date.now()) {
   for (const job of jobs) {
     if (!job || job.status === 'settled') continue;
     byStatus.set(job.status, (byStatus.get(job.status) || 0) + 1);
-    const createdAt = job.createdAt ?? job.updatedAt;
-    if (createdAt && (oldestCreatedAt === null || createdAt < oldestCreatedAt)) oldestCreatedAt = createdAt;
+    if (oldestCreatedAt === null || job.createdAt < oldestCreatedAt) oldestCreatedAt = job.createdAt;
   }
+  // Reset every known status to 0 before rebuilding, so a status that drained
+  // since the last scan doesn't leave a stale non-zero series behind.
   jobsInflight.reset();
   for (const [status, count] of byStatus) jobsInflight.set({ status }, count);
-  oldestInflightJobAge.set(oldestCreatedAt === null ? 0 : Math.max(0, ms(now - oldestCreatedAt)));
+  oldestInflightJobAge.set(oldestCreatedAt === null ? 0 : ms(now - oldestCreatedAt));
 }

@@ -48,6 +48,19 @@ test('simulate=disagreement settles as refunded with low confidence, no real Cla
   assert.ok(job.confidence < 0.6, `expected low confidence, got ${job.confidence}`);
 });
 
+test('simulate=disagreement takes the refund branch, not the resolved branch', async () => {
+  const jobId = 'sandbox-disagreement-branch-1';
+  await startSandboxFulfillment(jobId, 'What is the best language?', { simulate: 'disagreement' });
+  const job = await waitForSettled(jobId);
+
+  // The disagreement mode must settle through the refund path: no payout tx,
+  // a refund tx present, and the disagreement reason recorded.
+  assert.equal(job.outcome, 'refunded');
+  assert.equal(job.payoutTx, undefined);
+  assert.match(job.refundTx, /^SANDBOX-refund-/);
+  assert.match(job.reason, /disagree/i);
+});
+
 test('simulate=no-answers settles as refunded with the no-answers reason', async () => {
   const jobId = 'sandbox-no-answers-1';
   await startSandboxFulfillment(jobId, 'Anyone home?', { simulate: 'no-answers' });
@@ -56,6 +69,19 @@ test('simulate=no-answers settles as refunded with the no-answers reason', async
   assert.equal(job.outcome, 'refunded');
   assert.equal(job.totalAnswers, 0);
   assert.match(job.reason, /no workers answered/);
+});
+
+test('simulate=no-answers takes the refund branch, not the resolved branch', async () => {
+  const jobId = 'sandbox-no-answers-branch-1';
+  await startSandboxFulfillment(jobId, 'Anyone home?', { simulate: 'no-answers' });
+  const job = await waitForSettled(jobId);
+
+  // The no-answers mode must settle through the refund path: no payout tx,
+  // a refund tx present, and zero matching workers.
+  assert.equal(job.outcome, 'refunded');
+  assert.equal(job.payoutTx, undefined);
+  assert.match(job.refundTx, /^SANDBOX-refund-/);
+  assert.equal(job.matchingWorkers.length, 0);
 });
 
 test('with no ANTHROPIC_API_KEY configured (this test environment), the resolved path stays fully canned/deterministic', async () => {

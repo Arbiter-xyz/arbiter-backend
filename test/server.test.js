@@ -67,6 +67,13 @@ describe('CORS and input validation', () => {
     assert.equal(res.headers.get('access-control-allow-origin'), 'https://allowed.example.com');
   });
 
+  test('GET /health reports onlineWorkers as a number, not a serialized Promise', async () => {
+    const res = await fetch(`${base}/health`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(typeof body.onlineWorkers, 'number');
+  });
+
   test('a question over the configured max length is rejected with 400', async () => {
     const res = await fetch(`${base}/oracle`, {
       method: 'POST',
@@ -175,6 +182,7 @@ describe('stats and worker reputation endpoints, and sandbox isolation from real
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.ok('onlineWorkers' in body);
+    assert.equal(typeof body.onlineWorkers, 'number');
     assert.ok('totalResolved' in body);
     assert.ok('totalRefunded' in body);
     assert.ok('totalSettled' in body);
