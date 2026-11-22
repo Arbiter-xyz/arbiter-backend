@@ -14,7 +14,7 @@ import {
   getReputation,
 } from './dispatch.js';
 import { getStats } from './stats.js';
-import { getVapidPublicKey, isPushConfigured, saveSubscription, removeSubscription } from './push.js';
+import { getVapidPublicKey, isPushConfigured, saveSubscription, removeSubscription, initPush } from './push.js';
 import { getPayerQuestionIds, summarizePayerQuestions, bucketPayerSpend } from './payerIndex.js';
 import { requiresAuth, verifySession, mountSessionRoutes, verifySessionToken } from './workerAuth.js';
 import {
@@ -1453,6 +1453,10 @@ const server = app.listen(config.port, () => {
     startAutoWithdrawSweep();
     startTreasuryMonitor();
   }
+  // Rebuild the push subscribed-workers index from the durable store so
+  // push subscriptions survive a restart instead of staying empty until
+  // each worker happens to resubscribe (see push.js). Never throws.
+  initPush().catch((err) => logger.error({ err }, 'initPush failed on startup'));
   logger.info(
     { port: config.port, contractId: config.contractId || null, network: config.networkPassphrase, allowedOrigins: config.allowedOrigins },
     `Arbiter backend listening on :${config.port}`,
