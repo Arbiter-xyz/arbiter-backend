@@ -76,3 +76,41 @@ test('accepts correct token', () => {
   assert.strictEqual(res.statusCode, null);
   assert.strictEqual(nextCalled, true);
 });
+
+test('createInvoiceBilledAccount provisions account and credits invoice amount', async () => {
+  const billing = require('../src/billing');
+  const handler = billing.createInvoiceBilledAccount;
+  assert.strictEqual(typeof handler, 'function');
+
+  const creditCalls = [];
+  const originalCredit = billing.credit;
+  billing.credit = (accountId, amount, meta) => {
+    creditCalls.push({ accountId, amount, meta });
+    return { accountId, amount };
+  };
+
+  try {
+    const req = {
+      body: {
+        email: 'invoice@example.com',
+        name: 'Invoice Co',
+        invoiceAmount: 2500,
+      },
+    };
+    const res = mockRes();
+    let nextErr = null;
+    let nextCalled = false;
+    await handler(req, res, (err) => {
+      nextCalled = true;
+      nextErr = err || null;
+    });
+
+    assert.strictEqual(nextErr, null);
+    assert.strictEqual(nextCalled, true);
+    assert.strictEqual(creditCalls.length, 1);
+    assert.strictEqual(creditCalls[0].amount, 2500);
+    assert.ok(creditCalls[0].accountId, 'credit() should receive a provisioned account id');
+  } finally {
+    billing.credit = originalCredit;
+  }
+});
