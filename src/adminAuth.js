@@ -1,6 +1,8 @@
 import { timingSafeEqual, createHash } from 'node:crypto';
 import { config } from './config.js';
 import { hashApiKey } from './apiKeyAuth.js';
+import { store } from './store.js';
+import { logger, recordRequestContext } from './logger.js';
 import { verifyTotp } from './totp.js';
 
 /**
@@ -38,6 +40,35 @@ const ROLE_FULL = 'full';
 /** Derive a stable, non-reversible session id from a credential hash. */
 function sessionIdForHash(hash) {
   return createHash('sha256').update(`admin-session:${hash}`).digest('hex').slice(0, 32);
+}
+
+// #132: session recording/replay. Every authenticated admin request is
+// appended (redacted, via logger.js's recordRequestContext) to a durable,
+// capped list keyed by the caller's session id, so a ticket can be debugged
+// by replaying the ordered sequence of admin calls that session made.
+const SESSION_RECORDING_PREFIX = 'admin-session-recording:';
+const MAX_RECORDED_ACTIONS_PER_SESSION = 500;
+const SESSION_RECORDING_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Appends one redacted request context to the recording for `sessionId`.
+ * Best-effort and never throws into the request path: a store hiccup must
+ * never fail or delay the admin call it's merely recording. */
+async function recordAdminSessionAction(sessionId, req) {
+  try {
+    const key = `${SESSION_RECORDING_PREFIX}${sessionId}`;
+    const existing = (await store.get(key)) || [];
+    const entry = { ...recordRequestContext(req), at: Date.now() };
+    const next = [...existing, entry].slice(-MAX_RECORDED_ACTIONS_PER_SESSION);
+    await store.set(key, next, SESSION_RECORDING_TTL_MS);
+  } catch (err) {
+    logger.warn({ err }, 'admin session recording failed');
+  }
+}
+
+/** Replays the recorded sequence of admin calls for one session, soonest
+ * first — the actual "replay" half of #132's session recording/replay. */
+export async function getAdminSessionRecording(sessionId) {
+  return (await store.get(`${SESSION_RECORDING_PREFIX}${sessionId}`)) || [];
 }
 
 /**
@@ -117,6 +148,11 @@ export function requireAdminRole(required = ROLE_FULL) {
 
     req.adminRole = cred.role;
     req.adminSessionId = cred.sessionId;
+
+    // #132: session recording. Fire-and-forget — recording a call must
+    // never slow down or fail the call itself.
+    recordAdminSessionAction(cred.sessionId, req);
+
     return next();
   };
 }
