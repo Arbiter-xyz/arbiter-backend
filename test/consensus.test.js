@@ -83,8 +83,17 @@ test('parseNumericAnswer handles currency, percent, thousands separators, and ap
   assert.equal(parseNumericAnswer('~42'), 42);
 });
 
+test('parseNumericAnswer handles European decimal comma and dot-grouped thousands', () => {
+  assert.equal(parseNumericAnswer('3,5'), 3.5);
+  assert.equal(parseNumericAnswer('1.234,56'), 1234.56);
+  assert.equal(parseNumericAnswer('€1.234,56'), 1234.56);
+  assert.equal(parseNumericAnswer('-1.234.567,89'), -1234567.89);
+  assert.equal(parseNumericAnswer('1.234.567'), 1234567);
+  assert.equal(parseNumericAnswer('about 2,5%'), 2.5);
+});
+
 test('parseNumericAnswer returns null for non-numbers and ambiguous formats', () => {
-  for (const text of ['Paris', '', '   ', '42 apples', 'forty-two', '3,5', '1,23,456', '12-15', '$', '%', 'NaN', 'Infinity', null, undefined]) {
+  for (const text of ['Paris', '', '   ', '42 apples', 'forty-two', '1,234', '1.234', '1,23,456', '12-15', '$', '%', 'NaN', 'Infinity', null, undefined]) {
     assert.equal(parseNumericAnswer(text), null, String(text));
   }
 });

@@ -15,6 +15,7 @@ import {
   getProcessor,
 } from '../src/billing.js';
 import { config } from '../src/config.js';
+import { store } from '../src/store.js';
 
 /** config.allowedOrigins is an array nested inside a frozen config object
  * — Object.freeze is shallow, so the array's own contents are still
@@ -311,6 +312,44 @@ test('PayPal verifyAndParseWebhook rejects a tampered payload (verification_stat
   );
 });
 
+test('PayPal verifyAndParseWebhook converts using the minorUnits snapshotted at checkout', async () => {
+  const paypal = getProcessor('paypal');
+  const orderId = uniqueId('ORDER');
+  const accountId = uniqueId('acct');
+  // A hypothetical 3-decimal currency: 1.234 major units = 1234 minor units.
+  await store.set(`paypal-order:${orderId}`, {
+    accountId,
+    stroopsPerUnit: '10000000',
+    usdPerUnit: '1',
+    minorUnits: 1000,
+    currency: 'usd',
+  });
+  const payload = JSON.stringify({
+    id: uniqueId('evt'),
+    event_type: 'PAYMENT.CAPTURE.COMPLETED',
+    resource: {
+      custom_id: accountId,
+      amount: { value: '1.234', currency_code: 'USD' },
+      supplementary_data: { related_ids: { order_id: orderId } },
+    },
+  });
+  const headers = {
+    'paypal-transmission-id': 'tx-1',
+    'paypal-transmission-time': '2024-01-01T00:00:00Z',
+    'paypal-cert-url': 'https://api.paypal.com/cert.pem',
+    'paypal-auth-algo': 'SHA256withRSA',
+    'paypal-transmission-sig': 'valid-sig',
+  };
+
+  await withMockFetch(
+    () => jsonResponse({ verification_status: 'SUCCESS' }),
+    async () => {
+      const event = await paypal.verifyAndParseWebhook(payload, headers);
+      assert.equal(event.stroops, 10000000n * 1234n);
+    },
+  );
+});
+
 // --- Coinbase Commerce processor coverage --------------------------------
 
 test('Coinbase createCheckoutSession posts a charge and returns hosted_url as checkoutUrl', async () => {
@@ -345,6 +384,31 @@ test('Coinbase verifyAndParseWebhook accepts a genuinely valid HMAC signature', 
 
   const event = await coinbase.verifyAndParseWebhook(payload, headers);
   assert.equal(event.type, 'charge:confirmed');
+});
+
+test('Coinbase verifyAndParseWebhook converts using the minorUnits snapshotted at checkout', async () => {
+  const coinbase = getProcessor('coinbase');
+  const chargeId = uniqueId('charge');
+  const accountId = uniqueId('acct');
+  await store.set(`coinbase-charge:${chargeId}`, {
+    accountId,
+    stroopsPerUnit: '10000000',
+    usdPerUnit: '1',
+    minorUnits: 1000,
+    currency: 'usd',
+  });
+  const payload = JSON.stringify({
+    id: uniqueId('evt'),
+    event: {
+      type: 'charge:confirmed',
+      data: { id: chargeId, metadata: { accountId }, pricing: { local: { amount: '1.234', currency: 'USD' } } },
+    },
+  });
+  const secret = config.billing.coinbaseCommerceWebhookSecret;
+  const headers = { 'x-cc-webhook-signature': coinbaseSignature(payload, secret) };
+
+  const event = await coinbase.verifyAndParseWebhook(payload, headers);
+  assert.equal(event.stroops, 10000000n * 1234n);
 });
 
 test('Coinbase verifyAndParseWebhook rejects a tampered payload (HMAC mismatch)', async () => {
