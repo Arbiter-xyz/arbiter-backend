@@ -225,6 +225,20 @@ export function predictQuorumSize(question, { category = null, categoryHistory =
   return clamped;
 }
 
+/** An LLM verdict may only credit workers who actually answered (#238): an
+ * unknown id would be paid on-chain for work never submitted. Throwing here
+ * makes reconcile() fall through to the next provider / deterministic vote. */
+export function assertMatchingWorkerIdsAreReal(matchingWorkerIds, submissions, questionId = null) {
+  if (!Array.isArray(matchingWorkerIds)) {
+    throw new Error(`LLM returned non-array matching_worker_ids (question ${questionId})`);
+  }
+  const known = new Set(submissions.map((s) => s.workerId));
+  const unknown = matchingWorkerIds.filter((id) => !known.has(id));
+  if (unknown.length > 0) {
+    throw new Error(`LLM returned matching_worker_ids not in the quorum (question ${questionId}): ${unknown.join(', ')}`);
+  }
+}
+
 async function reconcileWithClaude(question, submissions, rule = null) {
   const { consensus, confidence, matchingWorkerIds, llm } = await llmProvider.reportConsensus(question, submissions, rule);
   assertMatchingWorkerIdsAreReal(matchingWorkerIds, submissions, question?.id);
