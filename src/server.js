@@ -113,6 +113,7 @@ import {
 } from './taxReport.js';
 import { runRecoverySweep, defaultRecoveryDeps, startRecoverySweeper } from './disasterRecovery.js';
 import { startHealthProbes } from './healthProbes.js';
+import { checkContractVersion } from './contractVersionCheck.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -123,6 +124,26 @@ if (!enforceSecurityPosture(process.env, logger)) {
   console.error('[security-posture] refusing to start: fix the setting(s) named above.');
   await new Promise((resolve) => logger.flush(resolve));
   process.exit(1);
+}
+
+// Startup contract-version verification (#465): closes the gap left by
+// #163, where compatibleContractWasmHash was computed but never actually
+// checked against the deployed contract. A mismatch here means this
+// backend's settlement logic (resolve/refund argument shapes, event
+// decoding) was written against a different contract build than what's
+// actually live — exactly the kind of drift that caused the
+// resolve_batch/refund_batch mismatch in #233. Warn loudly rather than
+// refuse to boot: unlike securityPosture's findings this depends on a
+// live RPC call that can itself be flaky, so a transient RPC failure
+// should not take the whole backend down.
+const contractVersionResult = await checkContractVersion({
+  contractId: config.contractId,
+  compatibleContractWasmHash: config.compatibleContractWasmHash,
+});
+if (!contractVersionResult.ok) {
+  logger.error({ contractVersionResult }, `[contract-version] ${contractVersionResult.reason}`);
+} else if (!contractVersionResult.skipped) {
+  logger.info({ contractVersionResult }, '[contract-version] deployed contract matches the configured compatible version');
 }
 
 const app = express();
@@ -219,7 +240,26 @@ async function storeReachable() {
 app.get('/metrics', metricsHandler({ token: config.metrics.token }));
 
 app.get('/health', async (req, res) => {
-  res.json({ ok: true, onlineWorkers: await onlineWorkerCount(), contractId: config.contractId });
+  // deploymentFingerprint() (#465/#163) was written for exactly this route
+  // but never actually called from it, so canary.js's comparePreflight()
+  // cross-instance check had no real data to compare. storeReachable is a
+  // best-effort ping: a RedisStore failing it just means the fingerprint
+  // reports it honestly, never that /health itself fails.
+  let storeReachable = true;
+  if (store instanceof RedisStore) {
+    try {
+      await store.client.ping();
+    } catch {
+      storeReachable = false;
+    }
+  }
+  const fingerprint = deploymentFingerprint({
+    config,
+    instanceId: INSTANCE_ID,
+    storeKind: store instanceof RedisStore ? 'redis' : 'memory',
+    storeReachable,
+  });
+  res.json({ ok: true, onlineWorkers: await onlineWorkerCount(), contractId: config.contractId, ...fingerprint });
 });
 
 // Public, like /health: the dispatch pause in effect (if any) and every
