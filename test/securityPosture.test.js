@@ -12,6 +12,7 @@ const SECURE_PROD = {
   SESSION_SECRET: 'a'.repeat(64),
   ALLOWED_ORIGINS: 'https://app.example.com',
   REDIS_URL: 'rediss://default:pw@redis.example.com:6380',
+  METRICS_TOKEN: 'm'.repeat(32),
 };
 
 function settingsOf(result) {
@@ -67,7 +68,7 @@ describe('evaluateSecurityPosture', () => {
 
   test('production with all three insecure defaults flags all three by name', () => {
     const result = evaluateSecurityPosture({ NODE_ENV: 'production', REDIS_URL: 'redis://redis.example.com:6379' });
-    assert.deepEqual(settingsOf(result), ['ALLOWED_ORIGINS', 'REDIS_URL', 'SESSION_SECRET']);
+    assert.deepEqual(settingsOf(result), ['ALLOWED_ORIGINS', 'METRICS_TOKEN', 'REDIS_URL', 'SESSION_SECRET']);
   });
 
   test('SESSION_SECRET unset in production is fatal, and the message says why and how to fix it', () => {
@@ -97,7 +98,7 @@ describe('evaluateSecurityPosture', () => {
   });
 
   test('a platform marker alone (no NODE_ENV) still catches a missing SESSION_SECRET', () => {
-    const result = evaluateSecurityPosture({ RENDER: 'true', ALLOWED_ORIGINS: 'https://app.example.com' });
+    const result = evaluateSecurityPosture({ RENDER: 'true', ALLOWED_ORIGINS: 'https://app.example.com', METRICS_TOKEN: 'm'.repeat(32) });
     assert.deepEqual(settingsOf(result), ['SESSION_SECRET']);
   });
 });

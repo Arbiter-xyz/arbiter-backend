@@ -6,6 +6,7 @@ import { hashApiKey } from './apiKeyAuth.js';
 import { logger } from './logger.js';
 import { recordPaymentReversal } from './paymentReversals.js';
 import { billingReservationCount, billingSettlementCount, fiatPoolBalanceStroops } from './metrics.js';
+import { isLoopbackHost } from './securityPosture.js';
 
 /**
  * The non-crypto onramp: a fiat customer pays via Stripe and is issued an
@@ -174,12 +175,18 @@ export async function restoreCredit(accountId, stroops) {
 }
 
 export function isAllowedRedirectUrl(url) {
-  if (config.allowedOrigins.includes('*')) return true; // wide-open dev mode, same default as CORS
+  let parsed;
   try {
-    return config.allowedOrigins.includes(new URL(url).origin);
+    parsed = new URL(url);
   } catch {
     return false;
   }
+  // A wildcard CORS allowlist must NOT disable redirect validation: the raw
+  // API key is appended to successUrl, so any origin would receive it. With
+  // '*' we fall back to loopback-only redirects (local dev), never arbitrary
+  // hosts. Set ALLOWED_ORIGINS to an explicit list to allow real frontends.
+  if (config.allowedOrigins.includes('*')) return isLoopbackHost(parsed.hostname);
+  return config.allowedOrigins.includes(parsed.origin);
 }
 
 /**
@@ -289,6 +296,18 @@ const stripeProcessor = {
     }
     if (!isAllowedRedirectUrl(successUrl) || !isAllowedRedirectUrl(cancelUrl)) {
       throw new Error('successUrl/cancelUrl must be on an allowed origin (see ALLOWED_ORIGINS)');
+    }
+
+    // Apple Pay / Google Pay (issue #105) require the redirect domain to be
+    // registered with Stripe for Apple Pay domain association. Resolve and
+    // log the origin Stripe will associate with this session so an operator
+    // can confirm it's registered; isAllowedRedirectUrl() above already
+    // guarantees this resolves to a real origin, never null, for both URLs.
+    const applePayOrigin = getApplePayVerificationOrigin(successUrl);
+    if (applePayOrigin) {
+      logger.info({ applePayOrigin }, 'createCheckoutSession: Apple Pay/Google Pay domain for this session');
+    } else {
+      logger.warn({ successUrl }, 'createCheckoutSession: could not resolve Apple Pay verification origin for successUrl');
     }
 
     // Reject unsupported/malformed currencies before creating any account or
@@ -604,14 +623,32 @@ async function reverseCharge(event) {
   // charge.refunded carries the cumulative amount_refunded on the charge;
   // charge.dispute.created carries the disputed amount.
   const amountCents = event.type === 'charge.refunded' ? obj.amount_refunded : obj.amount;
-  const requestedStroops = centsToStroops(amountCents || 0);
+  const cumulativeCents = amountCents || 0;
+
+  // amount_refunded is cumulative across every refund on the charge, so a
+  // second partial refund reports the total of both. Track what we have
+  // already reversed per payment_intent and debit only the delta, otherwise
+  // each partial refund would re-debit the whole cumulative amount.
+  const reversedKey = obj.payment_intent ? `stripe-reversed:${obj.payment_intent}` : null;
+  const alreadyReversedCents = reversedKey ? Number((await store.get(reversedKey)) || 0) : 0;
+  const deltaCents = cumulativeCents - alreadyReversedCents;
+  if (deltaCents <= 0) {
+    logger.info({ accountId, eventId: event.id, type: event.type, cumulativeCents, alreadyReversedCents }, 'stripe reversal already accounted for — no debit');
+    return;
+  }
+
+  const requestedStroops = centsToStroops(deltaCents);
   const debitedStroops = await debitCreditFloored(accountId, requestedStroops);
+
+  // Persist the new cumulative total only after the debit attempt, so a
+  // failed debit is retried by the next delivery rather than silently lost.
+  if (reversedKey) await store.set(reversedKey, cumulativeCents);
 
   await recordPaymentReversal(accountId, {
     eventId: event.id,
     type: event.type,
     paymentIntent: obj.payment_intent || null,
-    amountCents: amountCents || 0,
+    amountCents: deltaCents,
     requestedStroops: String(requestedStroops),
     debitedStroops: String(debitedStroops),
     shortfallStroops: String(requestedStroops - debitedStroops),

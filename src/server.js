@@ -14,7 +14,7 @@ import {
   getReputation,
 } from './dispatch.js';
 import { getStats } from './stats.js';
-import { getVapidPublicKey, isPushConfigured, saveSubscription, removeSubscription } from './push.js';
+import { getVapidPublicKey, isPushConfigured, saveSubscription, removeSubscription, initPush } from './push.js';
 import { getPayerQuestionIds, summarizePayerQuestions, bucketPayerSpend } from './payerIndex.js';
 import { requiresAuth, verifySession, mountSessionRoutes, verifySessionToken } from './workerAuth.js';
 import {
@@ -24,6 +24,7 @@ import {
   feeBumpStake,
   feeBumpWithdraw,
   feeBumpWithdrawTo,
+  feeBumpWithdrawBalance,
 } from './sponsor.js';
 import { getStashedQuestion, nextQuestionId } from './pendingQuestions.js';
 import { getOwedOnChain, getStakeOnChain, getLatestLedgerSequence } from './stellarClient.js';
@@ -54,10 +55,12 @@ import { parseConsensusRule } from './consensus.js';
 import { getPrivatePool, addPoolWorkers, removePoolWorkers, PoolValidationError } from './privatePools.js';
 import { isBillingConfigured, createCheckoutSession, handleStripeWebhook, rotateApiKey, getCreditBalanceStroops, reserveCredit, settleReservation } from './billing.js';
 import { registerWebhook, listWebhooks, deleteWebhook, WebhookError } from './webhooks.js';
-import { getDispatchPause, listUpcomingWindows, describePause } from './maintenanceWindows.js';
+import { getDispatchPause, listUpcomingWindows, describePause, addWindow, removeWindow, listWindows, MaintenanceWindowError } from './maintenanceWindows.js';
 import { logger, httpLogger } from './logger.js';
 import { startTreasuryMonitor } from './alerting.js';
 import { getProvenance } from './provenance.js';
+import { verifyProvenance, extractContractCall, verifyPayout } from './provenanceVerify.js';
+import { getTransactionEnvelope } from './stellarClient.js';
 import { enforceSecurityPosture } from './securityPosture.js';
 import { store, RedisStore } from './store.js';
 import { createReadOnlyGate, deploymentFingerprint, INSTANCE_ID } from './canary.js';
@@ -71,7 +74,6 @@ import {
   normalizeCode,
 } from './referrals.js';
 import { recordWorkerIp, noteAnswerTiming, listFlaggedPairs, getWorkerCollusionReport, clearPairFlag } from './collusion.js';
-import { store } from './store.js';
 import { getKnownJobIds, getJob } from './jobs.js';
 import {
   metricsMiddleware,
@@ -112,6 +114,7 @@ import {
 } from './taxReport.js';
 import { runRecoverySweep, defaultRecoveryDeps, startRecoverySweeper } from './disasterRecovery.js';
 import { startHealthProbes } from './healthProbes.js';
+import { checkContractVersion } from './contractVersionCheck.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -122,6 +125,26 @@ if (!enforceSecurityPosture(process.env, logger)) {
   console.error('[security-posture] refusing to start: fix the setting(s) named above.');
   await new Promise((resolve) => logger.flush(resolve));
   process.exit(1);
+}
+
+// Startup contract-version verification (#465): closes the gap left by
+// #163, where compatibleContractWasmHash was computed but never actually
+// checked against the deployed contract. A mismatch here means this
+// backend's settlement logic (resolve/refund argument shapes, event
+// decoding) was written against a different contract build than what's
+// actually live — exactly the kind of drift that caused the
+// resolve_batch/refund_batch mismatch in #233. Warn loudly rather than
+// refuse to boot: unlike securityPosture's findings this depends on a
+// live RPC call that can itself be flaky, so a transient RPC failure
+// should not take the whole backend down.
+const contractVersionResult = await checkContractVersion({
+  contractId: config.contractId,
+  compatibleContractWasmHash: config.compatibleContractWasmHash,
+});
+if (!contractVersionResult.ok) {
+  logger.error({ contractVersionResult }, `[contract-version] ${contractVersionResult.reason}`);
+} else if (!contractVersionResult.skipped) {
+  logger.info({ contractVersionResult }, '[contract-version] deployed contract matches the configured compatible version');
 }
 
 const app = express();
@@ -218,7 +241,26 @@ async function storeReachable() {
 app.get('/metrics', metricsHandler({ token: config.metrics.token }));
 
 app.get('/health', async (req, res) => {
-  res.json({ ok: true, onlineWorkers: await onlineWorkerCount(), contractId: config.contractId });
+  // deploymentFingerprint() (#465/#163) was written for exactly this route
+  // but never actually called from it, so canary.js's comparePreflight()
+  // cross-instance check had no real data to compare. storeReachable is a
+  // best-effort ping: a RedisStore failing it just means the fingerprint
+  // reports it honestly, never that /health itself fails.
+  let storeReachable = true;
+  if (store instanceof RedisStore) {
+    try {
+      await store.client.ping();
+    } catch {
+      storeReachable = false;
+    }
+  }
+  const fingerprint = deploymentFingerprint({
+    config,
+    instanceId: INSTANCE_ID,
+    storeKind: store instanceof RedisStore ? 'redis' : 'memory',
+    storeReachable,
+  });
+  res.json({ ok: true, onlineWorkers: await onlineWorkerCount(), contractId: config.contractId, ...fingerprint });
 });
 
 // Public, like /health: the dispatch pause in effect (if any) and every
@@ -524,6 +566,44 @@ app.get('/oracle/:jobId/provenance', async (req, res) => {
     hash: entry.hash,
     record: entry.record,
     settlement: entry.settlement,
+  });
+});
+
+// Closes #468/#170's unfinished half: actually RUNS the verification chain
+// (provenanceVerify.js's verifyProvenance/extractContractCall/verifyPayout)
+// instead of just storing a record nobody checks. Re-derives the consensus
+// from the committed inputs alone, then — when the question has settled —
+// fetches the real on-chain resolve()/refund() transaction and confirms it
+// paid exactly who the record says it should. Public and unauthenticated,
+// same trust level as GET /oracle/:jobId/provenance: this is what makes a
+// record "independently verifiable" by anyone, not just this backend.
+app.get('/oracle/:jobId/provenance/verify', async (req, res) => {
+  const entry = await getProvenance(req.params.jobId);
+  if (!entry) return res.status(404).json({ error: 'no provenance recorded for this jobId (not settled yet, or settled before provenance existed)' });
+
+  const derivation = verifyProvenance(entry);
+  let payout = null;
+  const txHash = entry.settlement?.payoutTx || entry.settlement?.refundTx || null;
+  if (txHash) {
+    try {
+      const envelope = await getTransactionEnvelope(txHash);
+      if (envelope) {
+        const call = extractContractCall(envelope);
+        payout = { txHash, ...verifyPayout(entry.record, call) };
+      } else {
+        payout = { txHash, ok: false, checks: [{ name: 'on-chain transaction retrievable', ok: false, detail: 'RPC endpoint no longer has this transaction' }] };
+      }
+    } catch (err) {
+      payout = { txHash, ok: false, checks: [{ name: 'on-chain transaction decodes', ok: false, detail: String(err.message || err) }] };
+    }
+  }
+
+  return res.json({
+    jobId: req.params.jobId,
+    hash: entry.hash,
+    derivation,
+    payout,
+    ok: derivation.ok && (payout === null || payout.ok),
   });
 });
 
@@ -905,6 +985,24 @@ app.post('/sponsor/withdraw', rateLimited('sponsor', byIp), async (req, res) => 
     res.json(result);
   } catch (err) {
     req.log.error({ err }, 'sponsor withdraw failed');
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Gasless relay for a metered/prepaid-balance payer reclaiming unused
+// deposited funds (see metered.js's depositInstructions()). Closes the
+// one withdrawal path in this backend that previously required the caller
+// to hold XLM (#470).
+app.post('/sponsor/withdraw-balance', rateLimited('sponsor', byIp), async (req, res) => {
+  const { xdr, payerAddress, amountStroops } = req.body || {};
+  if (!xdr || !payerAddress || !amountStroops) {
+    return res.status(400).json({ error: 'xdr, payerAddress, and amountStroops are required' });
+  }
+  try {
+    const result = await feeBumpWithdrawBalance(xdr, payerAddress, amountStroops);
+    res.json(result);
+  } catch (err) {
+    req.log.error({ err }, 'sponsor withdraw-balance failed');
     res.status(400).json({ error: err.message });
   }
 });
@@ -1363,6 +1461,33 @@ app.get('/admin/collusion/workers/:workerId', requireAdmin, async (req, res) => 
   res.json(await getWorkerCollusionReport(req.params.workerId, getReputation));
 });
 
+// #461: the actual admin routes for scheduling/cancelling maintenance
+// windows that this module's own docstring (maintenanceWindows.js) already
+// named — POST /admin/maintenance-windows and DELETE
+// /admin/maintenance-windows/:id — wired to the existing addWindow()/
+// removeWindow() primitives, which previously had no caller at all.
+// body: { startsAt, endsAt, reason? } (see parseWindowInput for format).
+app.get('/admin/maintenance-windows', requireAdmin, async (req, res) => {
+  res.json({ windows: await listWindows() });
+});
+
+app.post('/admin/maintenance-windows', requireAdmin, async (req, res) => {
+  try {
+    const window = await addWindow(req.body || {});
+    res.status(201).json(window);
+  } catch (err) {
+    if (err instanceof MaintenanceWindowError) return res.status(400).json({ error: err.message });
+    req.log.error({ err }, 'failed to schedule maintenance window');
+    res.status(500).json({ error: 'failed to schedule maintenance window' });
+  }
+});
+
+app.delete('/admin/maintenance-windows/:id', requireAdmin, async (req, res) => {
+  const removed = await removeWindow(req.params.id);
+  if (!removed) return res.status(404).json({ error: 'no maintenance window with that id' });
+  res.json({ ok: true });
+});
+
 // The one admin write: an operator reviewed a pair and lifts its routing
 // suspension. Only a strictly worse score re-suspends afterwards.
 // body: { workers: [a, b], note? }
@@ -1453,6 +1578,10 @@ const server = app.listen(config.port, () => {
     startAutoWithdrawSweep();
     startTreasuryMonitor();
   }
+  // Rebuild the push subscribed-workers index from the durable store so
+  // push subscriptions survive a restart instead of staying empty until
+  // each worker happens to resubscribe (see push.js). Never throws.
+  initPush().catch((err) => logger.error({ err }, 'initPush failed on startup'));
   logger.info(
     { port: config.port, contractId: config.contractId || null, network: config.networkPassphrase, allowedOrigins: config.allowedOrigins },
     `Arbiter backend listening on :${config.port}`,

@@ -193,6 +193,17 @@ export const config = Object.freeze({
   contractId: process.env.ORACLE_CONTRACT_ID || '',
   platformSecret: process.env.PLATFORM_SECRET || '',
   platformAddress: process.env.PLATFORM_ADDRESS || '',
+  // Multi-signer settlement pool (#466/#161/#164): a comma-separated list of
+  // additional admin-authorized secret keys. When set, admin-signed calls
+  // (resolve/refund/charge/touch) are routed across ALL of PLATFORM_SECRET
+  // plus these, round-robin, instead of serializing through one keypair.
+  // Each key needs its own serial queue + signer-lock role to stay safe
+  // under Stellar's per-account sequence-number rule; see stellarClient.js.
+  // Unset (default) behaves exactly as before: a pool of size 1.
+  platformSecretsExtra: (process.env.PLATFORM_SECRETS_EXTRA || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
 
   // Pinned arbiter-contract release this backend expects (see
   // contractCompatibility above and contractVersionCheck.js).
@@ -538,6 +549,13 @@ export const config = Object.freeze({
         .map((t) => t.trim())
         .filter(Boolean),
     ),
+    // #130: admin 2FA. A base32 TOTP secret (RFC 6238), shared across every
+    // admin token holder (same single-operator-set model as the bearer
+    // token above — see this block's own doc comment). Unset = 2FA is not
+    // required, preserving today's behavior for deployments that haven't
+    // provisioned it yet. When set, every /admin/* request must also
+    // present the current 6-digit code via X-Admin-TOTP (adminAuth.js).
+    totpSecret: process.env.ADMIN_TOTP_SECRET || '',
   }),
 
   // Settlement webhooks (see webhooks.js for registration/validation and
