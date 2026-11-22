@@ -52,6 +52,23 @@ function sessionSecret() {
 }
 const SESSION_SECRET = sessionSecret();
 
+// Dedicated key for hashing worker IPs in collusion.js (#278). Kept separate
+// from SESSION_SECRET so a session-signing secret is never reused as a
+// pseudonymization key (and so rotating one doesn't silently break the
+// other). Falls back to a random per-process key when unset — same posture
+// as the session secret fallback above: IP hashes then don't survive a
+// restart, which only weakens the sharedIp heuristic, never correctness.
+let ipHashSecretFallbackWarned = false;
+function ipHashSecret() {
+  if (process.env.COLLUSION_IP_HASH_SECRET) return process.env.COLLUSION_IP_HASH_SECRET;
+  if (!ipHashSecretFallbackWarned) {
+    console.warn('[config] COLLUSION_IP_HASH_SECRET not set — generating a random per-process key (worker IP hashes will not survive a restart)');
+    ipHashSecretFallbackWarned = true;
+  }
+  return randomBytes(32).toString('hex');
+}
+const COLLUSION_IP_HASH_SECRET = ipHashSecret();
+
 // Graceful SESSION_SECRET rotation (#7): during a bounded grace window,
 // session verification also accepts tokens signed by the immediately-prior
 // secret (SESSION_SECRET_PREVIOUS). The window is measured from process
@@ -90,6 +107,10 @@ export const WEBHOOK_RETRY_POLICY_BOUNDS = Object.freeze({
 
 // Baseline policy #56 ships with when a customer has no policy configured.
 // Matches the existing bounded-retry posture in retry.js.
+// NOTE (#321): retry.js defines a second DEFAULT_WEBHOOK_RETRY_POLICY /
+// validateWebhookRetryPolicy with different values (default 3 attempts /
+// 200ms; minBaseDelayMs 0 vs 100 here). Neither is imported outside its own
+// module today; reconcile the two before wiring either into delivery.
 export const DEFAULT_WEBHOOK_RETRY_POLICY = Object.freeze({
   attempts: 2,
   baseDelayMs: 1_000,
@@ -153,6 +174,10 @@ function trustProxy() {
 
 export const config = Object.freeze({
   port: num(process.env.PORT, 4000),
+  // Serve the built frontend (app/dist) from this process (#94). false when
+  // a CDN/Vercel deployment fronts the app build, so static-asset traffic
+  // never enters this process's middleware chain.
+  serveStaticApp: process.env.SERVE_STATIC_APP !== 'false',
   horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
   // Primary RPC URL — kept for backward compatibility with existing callers
   // that read config.sorobanRpcUrl directly. Equals sorobanRpcUrls[0].
@@ -166,6 +191,16 @@ export const config = Object.freeze({
   // README can distinguish the two environments unambiguously.
   deploymentProfile,
 
+  // LLM provider behind reconcile()/draftAnswer() (see llmProvider.js).
+  // 'anthropic' is the only implementation today; unknown values fail at startup.
+  llmProvider: process.env.LLM_PROVIDER || 'anthropic',
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
+  anthropicModel: process.env.CLAUDE_MODEL || 'claude-sonnet-5-5',
+  // OpenAI fallback (#68): tried only when the primary provider above is
+  // unconfigured or fails. No key means it's skipped, never an error.
+  openaiApiKey: process.env.OPENAI_API_KEY || '',
+  openaiModel: process.env.OPENAI_MODEL || 'gpt-4o',
+
   usdc: Object.freeze({
     sacId: process.env.USDC_SAC_ID || '',
     code: process.env.USDC_ASSET_CODE || 'USDC',
@@ -175,6 +210,17 @@ export const config = Object.freeze({
   contractId: process.env.ORACLE_CONTRACT_ID || '',
   platformSecret: process.env.PLATFORM_SECRET || '',
   platformAddress: process.env.PLATFORM_ADDRESS || '',
+  // Multi-signer settlement pool (#466/#161/#164): a comma-separated list of
+  // additional admin-authorized secret keys. When set, admin-signed calls
+  // (resolve/refund/charge/touch) are routed across ALL of PLATFORM_SECRET
+  // plus these, round-robin, instead of serializing through one keypair.
+  // Each key needs its own serial queue + signer-lock role to stay safe
+  // under Stellar's per-account sequence-number rule; see stellarClient.js.
+  // Unset (default) behaves exactly as before: a pool of size 1.
+  platformSecretsExtra: (process.env.PLATFORM_SECRETS_EXTRA || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
 
   // Pinned arbiter-contract release this backend expects (see
   // contractCompatibility above and contractVersionCheck.js).
@@ -185,6 +231,121 @@ export const config = Object.freeze({
   // with — this copy is for display/UX only (e.g. "auto-refund available
   // after ledger N"); the contract enforces its own stored value regardless.
   timeoutLedgers: num(process.env.TIMEOUT_LEDGERS, 100),
+
+  // Shared state (store.js). Unset = in-memory store: single instance, and
+  // every piece of state is lost on restart.
+  redisUrl: process.env.REDIS_URL || '',
+
+  // Read replica for the admin console's heavy read endpoints (#92, see
+  // replicaStore.js). Only admin.js's list/summary reads use it; dispatch,
+  // jobs and settlement always read the primary, since they need
+  // read-your-writes. Unset = admin reads hit the primary, as before.
+  readReplica: Object.freeze({
+    url: process.env.REDIS_REPLICA_URL || '',
+    // After a replica read fails, admin reads go to the primary for this
+    // long before the replica is tried again.
+    retryAfterMs: num(process.env.REDIS_REPLICA_RETRY_AFTER_MS, 30_000),
+  }),
+
+  // Input bounds on free-form request fields. Category and worker ids are
+  // written into indexes and broadcast to workers, so an unbounded value
+  // inflates storage and every SSE payload.
+  maxQuestionLength: num(process.env.MAX_QUESTION_LENGTH, 2000),
+  maxAnswerLength: num(process.env.MAX_ANSWER_LENGTH, 2000),
+  maxCategoryLength: num(process.env.MAX_CATEGORY_LENGTH, 64),
+  maxWorkerIdLength: num(process.env.MAX_WORKER_ID_LENGTH, 128),
+
+  // Profanity/spam screening of worker answers (answerFilter.js).
+  answerFilter: Object.freeze({
+    enabled: process.env.ANSWER_FILTER_ENABLED === 'true',
+    blocklist: Object.freeze(
+      (process.env.ANSWER_FILTER_BLOCKLIST || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
+    maxLinks: num(process.env.ANSWER_FILTER_MAX_LINKS, 2),
+    maxRepeatedChars: num(process.env.ANSWER_FILTER_MAX_REPEATED_CHARS, 10),
+    maxUppercaseRatio: num(process.env.ANSWER_FILTER_MAX_UPPERCASE_RATIO, 0.8),
+    // Short answers ("YES", "NO", "USA") are legitimately all-caps, so the
+    // uppercase-ratio check only applies once an answer has this many letters.
+    minLettersForCaseCheck: num(process.env.ANSWER_FILTER_MIN_LETTERS_FOR_CASE_CHECK, 20),
+  }),
+
+  // Home domain of the SEP-24/SEP-12 anchor Arbiter integrates with for
+  // fiat rails (bank deposit/withdraw, KYC status). Arbiter is a CLIENT of
+  // this anchor's stellar.toml — it never stores PII or bank details
+  // itself. Unset disables the /anchor/* routes entirely.
+  anchor: Object.freeze({
+    homeDomain: process.env.ANCHOR_HOME_DOMAIN || '',
+  }),
+
+  // The non-crypto onramp (see billing.js): API-key customers pay in fiat
+  // via Stripe and are settled on-chain from ONE pooled balance under this
+  // dedicated identity — deliberately separate from platformSecret/
+  // platformAddress above (which already collects platform fee revenue via
+  // resolve()/refund()), so customer float and fee revenue never commingle
+  // in one account. Unset disables the /billing/* routes and the API-key
+  // branch of POST /oracle entirely.
+  billing: Object.freeze({
+    stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
+    stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
+    fiatPoolSecret: process.env.FIAT_POOL_SECRET || '',
+    fiatPoolAddress: process.env.FIAT_POOL_ADDRESS || '',
+    // 1 USD = 1 USDC face value, at USDC's 7-decimal stroop convention.
+    usdToStroops: 10_000_000n,
+    minTopupUsd: num(process.env.MIN_TOPUP_USD, 10),
+  }),
+
+  // Auto-withdraw (autoWithdraw.js): a worker opts in to having their full
+  // Owed balance prepared for withdrawal once it crosses a threshold.
+  autoWithdraw: Object.freeze({
+    // Floor on the threshold a worker can set, so the sweep can't be
+    // configured to fire on dust amounts not worth a network fee.
+    minThresholdStroops: num(process.env.AUTO_WITHDRAW_MIN_THRESHOLD_STROOPS, 10_000_000),
+    // How long a built-but-unsigned withdraw transaction stays valid before
+    // the worker must request a fresh one.
+    pendingTtlMs: num(process.env.AUTO_WITHDRAW_PENDING_TTL_MS, 10 * 60 * 1000),
+    // How often the sweep checks every opted-in worker's Owed balance.
+    sweepIntervalMs: num(process.env.AUTO_WITHDRAW_SWEEP_INTERVAL_MS, 60 * 60 * 1000),
+  }),
+
+  // Payer referrals (#99, see payerReferrals.js): a worker's referral code
+  // (the same one referrals.js mints for worker onboarding) passed on a
+  // payer's first verified payment attributes that payer to the worker.
+  // Bookkeeping only — the credit is informational, nothing is paid out.
+  payerReferrals: Object.freeze({
+    enabled: process.env.PAYER_REFERRALS_ENABLED !== 'false',
+    // One-time referral credit, as basis points of the referred payer's
+    // first payment. 500 = 5%. 0 records attribution with no credit.
+    rewardBps: num(process.env.PAYER_REFERRAL_REWARD_BPS, 500),
+  }),
+
+  // Canary deployments (#89, see canary.js and
+  // docs/runbooks/canary-deployment.md).
+  canary: Object.freeze({
+    // 'primary' (default) serves everything. 'canary' serves only the
+    // read-only paths below and never signs as the platform key, so it can
+    // take a slice of real traffic with no sequence-number risk.
+    role: process.env.INSTANCE_ROLE === 'canary' ? 'canary' : 'primary',
+    // Comma-separated GET paths a canary serves. Everything else gets a 503
+    // the traffic splitter (or the client's retry) sends to the primary.
+    readPaths: Object.freeze(
+      (process.env.CANARY_READ_PATHS || '/health,/leaderboard,/leaderboard/xp,/stats,/maintenance,/gamification/badges')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
+    // Cross-instance mutex around every platform-key transaction, so two
+    // primaries sharing PLATFORM_SECRET (e.g. during a cutover) never race
+    // the account's sequence number. TTL must outlast one admin call's full
+    // build/sign/submit/poll cycle including retries.
+    signerLockTtlMs: num(process.env.SIGNER_LOCK_TTL_MS, 60_000),
+    // How long an admin call waits for another instance's lock before failing.
+    signerLockWaitMs: num(process.env.SIGNER_LOCK_WAIT_MS, 90_000),
+    // On SIGTERM, how long to keep running so in-flight quorums can settle.
+    drainTimeoutMs: num(process.env.DRAIN_TIMEOUT_MS, 120_000),
+  }),
 
   // Cross-instance quorum collection (#160). When more than one backend
   // instance is running, a question's collector lives in the memory of
@@ -242,6 +403,20 @@ export const config = Object.freeze({
     minAgeLedgers: num(process.env.RECOVERY_MIN_AGE_LEDGERS, 12),
     staleInflightMs: num(process.env.RECOVERY_STALE_INFLIGHT_MS, 30 * 60 * 1000),
     maxRefundsPerSweep: num(process.env.RECOVERY_MAX_REFUNDS_PER_SWEEP, 50),
+  }),
+
+  // Auto-withdraw (autoWithdraw.js): lets a worker opt in to a sweep that
+  // withdraws their Owed balance automatically once it crosses a threshold,
+  // instead of a manual withdraw() every time.
+  autoWithdraw: Object.freeze({
+    // Floor on the threshold a worker can set, so the sweep can't be
+    // configured to fire on dust amounts not worth a network fee.
+    minThresholdStroops: num(process.env.AUTO_WITHDRAW_MIN_THRESHOLD_STROOPS, 10_000_000),
+    // How long a built-but-unsigned withdraw transaction stays valid before
+    // the worker must request a fresh one.
+    pendingTtlMs: num(process.env.AUTO_WITHDRAW_PENDING_TTL_MS, 10 * 60 * 1000),
+    // How often the sweep checks every opted-in worker's Owed balance.
+    sweepIntervalMs: num(process.env.AUTO_WITHDRAW_SWEEP_INTERVAL_MS, 60 * 60 * 1000),
   }),
 
   // Alert drill only (faultInjection.js). Refused in production by
@@ -334,6 +509,17 @@ export const config = Object.freeze({
     subject: process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
   }),
 
+  // On-call alerting (alerting.js). Unset ALERT_WEBHOOK_URL disables every
+  // alert, same fail-closed-if-unconfigured pattern as vapid above. Payloads
+  // carry a Slack-compatible `text` field, so a Slack incoming webhook or any
+  // generic JSON receiver works unchanged. The treasury monitor only runs
+  // when ALERT_TREASURY_MIN_USDC is also set.
+  alerting: Object.freeze({
+    webhookUrl: process.env.ALERT_WEBHOOK_URL || '',
+    treasuryMinUsdc: num(process.env.ALERT_TREASURY_MIN_USDC, null),
+    treasuryIntervalMs: num(process.env.ALERT_TREASURY_INTERVAL_MS, 5 * 60 * 1000),
+  }),
+
   push: Object.freeze({
     // Push notifications supplement, never replace, the SSE dispatch
     // channel — they're for workers who aren't currently connected. A
@@ -364,8 +550,29 @@ export const config = Object.freeze({
   // has no user-account system anywhere, so a bearer token is consistent
   // with everything else here. Multi-operator auth is a real follow-up,
   // not something to invent ahead of need.
+  // Home domain of the SEP-24/SEP-12 fiat anchor (anchorClient.js). Unset
+  // disables /anchor/* entirely.
+  anchor: Object.freeze({
+    homeDomain: process.env.ANCHOR_HOME_DOMAIN || '',
+  }),
+
   admin: Object.freeze({
     token: process.env.ADMIN_TOKEN || '',
+    // Every accepted /admin/* bearer token (#24): ADMIN_TOKENS (comma-
+    // separated, each revocable on its own) plus the legacy single
+    // ADMIN_TOKEN. Empty = the admin console refuses every request.
+    tokens: Object.freeze(
+      [...(process.env.ADMIN_TOKENS || '').split(','), process.env.ADMIN_TOKEN || '']
+        .map((t) => t.trim())
+        .filter(Boolean),
+    ),
+    // #130: admin 2FA. A base32 TOTP secret (RFC 6238), shared across every
+    // admin token holder (same single-operator-set model as the bearer
+    // token above — see this block's own doc comment). Unset = 2FA is not
+    // required, preserving today's behavior for deployments that haven't
+    // provisioned it yet. When set, every /admin/* request must also
+    // present the current 6-digit code via X-Admin-TOTP (adminAuth.js).
+    totpSecret: process.env.ADMIN_TOTP_SECRET || '',
   }),
 
   // Settlement webhooks (see webhooks.js for registration/validation and
@@ -422,6 +629,10 @@ export const config = Object.freeze({
     // Pair score at or above which both workers are also dropped from
     // routing eligibility (soft, fails open like every other routing gate).
     suspendScore: num(process.env.COLLUSION_SUSPEND_SCORE, 0.85),
+    // Dedicated HMAC key for worker IP hashing (#278). Deliberately not
+    // config.session.secret: key separation between session signing and
+    // IP pseudonymization.
+    ipHashSecret: COLLUSION_IP_HASH_SECRET,
   }),
 });
 

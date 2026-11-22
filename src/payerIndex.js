@@ -39,8 +39,8 @@ const MAX_TRACKED_CCPA_REQUESTS = 5_000;
 const CCPA_RESPONSE_WINDOW_DAYS = 45;
 const CCPA_RESPONSE_WINDOW_MS = CCPA_RESPONSE_WINDOW_DAYS * 24 * 60 * 60 * 1000;
 
-export async function getKnownPayerAddresses() {
-  return (await store.get(PAYER_INDEX_KEY)) || [];
+export async function getKnownPayerAddresses(readStore = store) {
+  return (await readStore.get(PAYER_INDEX_KEY)) || [];
 }
 
 export async function recordPayerQuestion(payerAddress, questionId) {
@@ -58,8 +58,8 @@ export async function recordPayerQuestion(payerAddress, questionId) {
   }
 }
 
-export async function getPayerQuestionIds(payerAddress) {
-  return (await store.get(PREFIX + payerAddress)) || [];
+export async function getPayerQuestionIds(payerAddress, readStore = store) {
+  return (await readStore.get(PREFIX + payerAddress)) || [];
 }
 
 /**
@@ -106,7 +106,19 @@ export async function erasePayerRecords(payerAddress) {
  * broken row.
  */
 export function summarizePayerQuestions(ids, jobs) {
-  const questions = ids.map((questionId, i) => ({ questionId, ...jobs[i] })).filter((q) => q.status);
+  const questions = ids
+    .map((questionId, i) => {
+      const job = jobs[i];
+      if (!job) return { questionId };
+      return {
+        questionId,
+        ...job,
+        ...(job.cancellableUntil
+          ? { cancelableUntil: job.cancellableUntil, cancelUrl: `/oracle/${questionId}/cancel` }
+          : {}),
+      };
+    })
+    .filter((q) => q.status);
 
   const totalSpendStroops = questions.reduce((sum, q) => sum + BigInt(q.amountStroops || 0), 0n);
   const resolved = questions.filter((q) => q.outcome === 'resolved').length;

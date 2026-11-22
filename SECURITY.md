@@ -41,6 +41,16 @@ keys and funds involved are testnet — please calibrate severity
 accordingly. We would still rather hear about an issue early than read it
 in a public issue.
 
+## Webhook secret storage
+
+Webhook signing secrets are sealed at rest with
+`WEBHOOK_SECRET_ENCRYPTION_KEY`. When that variable is **unset**, the
+service falls back to storing the secret in plaintext (a `raw:`-prefixed
+value) and emits a warning at startup and on each seal so operators are
+notified. This fallback is intended for local development only — set
+`WEBHOOK_SECRET_ENCRYPTION_KEY` in any shared or production-shaped
+deployment so webhook secrets are never persisted in cleartext.
+
 ## What to expect
 
 We aim to acknowledge a report within **3 business days** and to give an
