@@ -549,6 +549,13 @@ export const config = Object.freeze({
         .map((t) => t.trim())
         .filter(Boolean),
     ),
+    // #130: admin 2FA. A base32 TOTP secret (RFC 6238), shared across every
+    // admin token holder (same single-operator-set model as the bearer
+    // token above — see this block's own doc comment). Unset = 2FA is not
+    // required, preserving today's behavior for deployments that haven't
+    // provisioned it yet. When set, every /admin/* request must also
+    // present the current 6-digit code via X-Admin-TOTP (adminAuth.js).
+    totpSecret: process.env.ADMIN_TOTP_SECRET || '',
   }),
 
   // Settlement webhooks (see webhooks.js for registration/validation and
