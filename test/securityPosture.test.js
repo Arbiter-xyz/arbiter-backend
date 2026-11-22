@@ -11,8 +11,8 @@ const SECURE_PROD = {
   NODE_ENV: 'production',
   SESSION_SECRET: 'a'.repeat(64),
   ALLOWED_ORIGINS: 'https://app.example.com',
-  METRICS_TOKEN: 'm'.repeat(32),
   REDIS_URL: 'rediss://default:pw@redis.example.com:6380',
+  METRICS_TOKEN: 'm'.repeat(32),
 };
 
 function settingsOf(result) {
@@ -108,7 +108,7 @@ describe('evaluateSecurityPosture', () => {
   });
 
   test('a platform marker alone (no NODE_ENV) still catches a missing SESSION_SECRET', () => {
-    const result = evaluateSecurityPosture({ RENDER: 'true', ALLOWED_ORIGINS: 'https://app.example.com', METRICS_TOKEN: 'tok' });
+    const result = evaluateSecurityPosture({ RENDER: 'true', ALLOWED_ORIGINS: 'https://app.example.com', METRICS_TOKEN: 'm'.repeat(32) });
     assert.deepEqual(settingsOf(result), ['SESSION_SECRET']);
   });
 });
