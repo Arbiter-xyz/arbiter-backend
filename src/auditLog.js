@@ -32,3 +32,8 @@ export async function listAuditLog({ actor, limit = 200 } = {}) {
   const filtered = actor ? entries.filter((e) => e.actor === actor) : entries;
   return filtered.slice(0, limit);
 }
+
+export async function _resetAuditLogForTesting() {
+  await store.set(AUDIT_LOG_KEY, []);
+}
+

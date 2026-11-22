@@ -51,7 +51,7 @@ export async function askMetered(payerAddress, questionText, tierKey, category, 
 
   return {
     jobId,
-    ...(cancellableUntil ? { cancellableUntil, cancelUrl: `/oracle/${jobId}/cancel` } : {}),
+    ...(cancellableUntil ? { cancellableUntil, cancelableUntil: cancellableUntil, cancelUrl: `/oracle/${jobId}/cancel` } : {}),
     questionId,
     tier: priced.key,
     amount: stroopsToUsdc(priced.priceStroops),
