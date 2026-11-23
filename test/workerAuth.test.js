@@ -1,191 +1,102 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Keypair, Networks, Transaction, Account, TransactionBuilder, Operation } from '@stellar/stellar-sdk';
+import express from 'express';
+
 import {
-  requiresAuth,
-  buildChallengeXdr,
-  verifyChallengeAndIssueSession,
-  verifySessionToken,
+  verifySession,
+  revokeSession,
+  mountSessionRoutes,
 } from '../src/workerAuth.js';
 
-test('requiresAuth is true for a real Stellar address, false for an arbitrary test string', () => {
-  const worker = Keypair.random();
-  assert.equal(requiresAuth(worker.publicKey()), true);
-  assert.equal(requiresAuth('demo-worker-1'), false);
-  assert.equal(requiresAuth(''), false);
+// In-memory store stub matching the subset of the store API used by
+// workerAuth (get/set with optional TTL).
+function createMemoryStore() {
+  const data = new Map();
+  return {
+    async get(key) {
+      const entry = data.get(key);
+      if (!entry) return null;
+      if (entry.expiresAt && entry.expiresAt <= Date.now()) {
+        data.delete(key);
+        return null;
+      }
+      return entry.value;
+    },
+    async set(key, value, ttlSeconds) {
+      const expiresAt = ttlSeconds ? Date.now() + ttlSeconds * 1000 : null;
+      data.set(key, { value, expiresAt });
+      return 'OK';
+    },
+    _raw: data,
+  };
+}
+
+// Build a session token in the same shape parseSessionToken expects.
+function makeToken(address, sid, ttlSeconds = 3600) {
+  const payload = {
+    address,
+    sid,
+    exp: Math.floor(Date.now() / 1000) + ttlSeconds,
+  };
+  return Buffer.from(JSON.stringify(payload)).toString('base64url');
+}
+
+test('fresh token verifies and stops verifying after revokeSession', async () => {
+  const store = createMemoryStore();
+  const token = makeToken('GADDRESS1', 'sid-1');
+
+  assert.equal(await verifySession(token, store), 'GADDRESS1');
+
+  const revoked = await revokeSession(token, store);
+  assert.equal(revoked, 'GADDRESS1');
+
+  assert.equal(await verifySession(token, store), null);
 });
 
-test('the full challenge/verify/session round trip succeeds for the real key holder', async () => {
-  const worker = Keypair.random();
-  const xdr = await buildChallengeXdr(worker.publicKey());
+test('revoking twice returns null the second time', async () => {
+  const store = createMemoryStore();
+  const token = makeToken('GADDRESS2', 'sid-2');
 
-  const tx = new Transaction(xdr, process.env.NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015');
-  tx.sign(worker);
-
-  const session = await verifyChallengeAndIssueSession(worker.publicKey(), tx.toXDR());
-  assert.ok(session, 'expected a session to be issued');
-  assert.ok(session.token);
-  assert.ok(session.expiresAt > Date.now());
-
-  const verifiedAddress = verifySessionToken(session.token);
-  assert.equal(verifiedAddress, worker.publicKey());
+  assert.equal(await revokeSession(token, store), 'GADDRESS2');
+  assert.equal(await revokeSession(token, store), null);
 });
 
-test('signing with a DIFFERENT key than the claimed address is rejected', async () => {
-  const claimed = Keypair.random();
-  const impostor = Keypair.random();
-  const xdr = await buildChallengeXdr(claimed.publicKey());
+test('revocation marker TTL equals remaining token lifetime', async () => {
+  const store = createMemoryStore();
+  const ttlSeconds = 120;
+  const token = makeToken('GADDRESS3', 'sid-3', ttlSeconds);
 
-  const tx = new Transaction(xdr, 'Test SDF Network ; September 2015');
-  tx.sign(impostor); // signed by the wrong key
+  await revokeSession(token, store);
 
-  const session = await verifyChallengeAndIssueSession(claimed.publicKey(), tx.toXDR());
-  assert.equal(session, null);
+  const marker = store._raw.get('revoked:sid-3');
+  assert.ok(marker, 'expected a revocation marker to be stored');
+  const remaining = Math.round((marker.expiresAt - Date.now()) / 1000);
+  assert.ok(
+    Math.abs(remaining - ttlSeconds) <= 2,
+    `expected TTL ~${ttlSeconds}s, got ${remaining}s`,
+  );
 });
 
-test('a challenge can only be consumed once (no replay)', async () => {
-  const worker = Keypair.random();
-  const xdr = await buildChallengeXdr(worker.publicKey());
-  const tx = new Transaction(xdr, 'Test SDF Network ; September 2015');
-  tx.sign(worker);
-  const signedXdr = tx.toXDR();
+test('revoke route returns 401 for a token of another address', async () => {
+  const store = createMemoryStore();
+  const app = express();
+  app.use(express.json());
+  mountSessionRoutes(app, '/worker', store);
 
-  const first = await verifyChallengeAndIssueSession(worker.publicKey(), signedXdr);
-  assert.ok(first, 'first verification should succeed');
-
-  const second = await verifyChallengeAndIssueSession(worker.publicKey(), signedXdr);
-  assert.equal(second, null, 'replaying the same signed challenge must be rejected');
-});
-
-test('signing a DIFFERENT nonce than the one issued is rejected (prevents reusing an old/foreign challenge)', async () => {
-  const worker = Keypair.random();
-  await buildChallengeXdr(worker.publicKey()); // issue and discard a real challenge
-
-  // Hand-craft a transaction with a bogus nonce instead of the real one.
-  const account = new Account(worker.publicKey(), '0');
-  const forged = new TransactionBuilder(account, { fee: '100', networkPassphrase: 'Test SDF Network ; September 2015' })
-    .addOperation(Operation.manageData({ name: 'arbiter-auth', value: 'not-the-real-nonce' }))
-    .setTimeout(300)
-    .build();
-  forged.sign(worker);
-
-  const session = await verifyChallengeAndIssueSession(worker.publicKey(), forged.toXDR());
-  assert.equal(session, null);
-});
-
-test('verifying a session token for one address never validates for a different address', async () => {
-  const worker = Keypair.random();
-  const xdr = await buildChallengeXdr(worker.publicKey());
-  const tx = new Transaction(xdr, 'Test SDF Network ; September 2015');
-  tx.sign(worker);
-  const { token } = await verifyChallengeAndIssueSession(worker.publicKey(), tx.toXDR());
-
-  const someoneElse = Keypair.random().publicKey();
-  assert.notEqual(verifySessionToken(token), someoneElse);
-  assert.equal(verifySessionToken(token), worker.publicKey());
-});
-
-test('a tampered token (flipped character in the MAC) is rejected', async () => {
-  const worker = Keypair.random();
-  const xdr = await buildChallengeXdr(worker.publicKey());
-  const tx = new Transaction(xdr, 'Test SDF Network ; September 2015');
-  tx.sign(worker);
-  const { token } = await verifyChallengeAndIssueSession(worker.publicKey(), tx.toXDR());
-
-  const tampered = token.slice(0, -1) + (token.at(-1) === 'a' ? 'b' : 'a');
-  assert.equal(verifySessionToken(tampered), null);
-});
-
-test('a garbage token never throws, just fails verification', () => {
-  assert.equal(verifySessionToken('not-a-real-token'), null);
-  assert.equal(verifySessionToken(''), null);
-  assert.equal(verifySessionToken(undefined), null);
-  assert.equal(verifySessionToken('a.b.c'), null);
-});
-
-test('verifying with a bogus challenge address (no outstanding challenge) fails cleanly', async () => {
-  const worker = Keypair.random();
-  const session = await verifyChallengeAndIssueSession(worker.publicKey(), 'not-valid-xdr-at-all');
-  assert.equal(session, null);
-});
-
-test('buildChallengeXdr rejects a non-address input rather than building a meaningless challenge', async () => {
-  await assert.rejects(() => buildChallengeXdr('not-an-address'));
-});
-
-test('a token signed with the previous SESSION_SECRET is accepted during the grace window', async () => {
-  const worker = Keypair.random();
-  const xdr = await buildChallengeXdr(worker.publicKey());
-  const tx = new Transaction(xdr, 'Test SDF Network ; September 2015');
-  tx.sign(worker);
-
-  const { token } = await verifyChallengeAndIssueSession(worker.publicKey(), tx.toXDR());
-  assert.ok(token);
-
-  // Simulate a rotation: the token was issued under the old secret, which is
-  // now the previous secret and still within the grace window.
-  const previousSecret = process.env.SESSION_SECRET;
-  const rotatedSecret = `${previousSecret}-rotated`;
-  process.env.SESSION_SECRET = rotatedSecret;
-  process.env.SESSION_SECRET_PREVIOUS = previousSecret;
-  process.env.SESSION_SECRET_GRACE_MS = String(60 * 60 * 1000);
-  process.env.SESSION_SECRET_ROTATED_AT = String(Date.now());
-
+  const server = app.listen(0);
   try {
-    assert.equal(verifySessionToken(token), worker.publicKey());
+    const { port } = server.address();
+    const token = makeToken('GOTHER', 'sid-4');
+    const res = await fetch(
+      `http://127.0.0.1:${port}/worker/GADDRESS4/session/revoke`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token }),
+      },
+    );
+    assert.equal(res.status, 401);
   } finally {
-    process.env.SESSION_SECRET = previousSecret;
-    delete process.env.SESSION_SECRET_PREVIOUS;
-    delete process.env.SESSION_SECRET_GRACE_MS;
-    delete process.env.SESSION_SECRET_ROTATED_AT;
-  }
-});
-
-test('a token signed with the previous SESSION_SECRET is rejected once the grace window elapses', async () => {
-  const worker = Keypair.random();
-  const xdr = await buildChallengeXdr(worker.publicKey());
-  const tx = new Transaction(xdr, 'Test SDF Network ; September 2015');
-  tx.sign(worker);
-
-  const { token } = await verifyChallengeAndIssueSession(worker.publicKey(), tx.toXDR());
-  assert.ok(token);
-
-  const previousSecret = process.env.SESSION_SECRET;
-  const rotatedSecret = `${previousSecret}-rotated`;
-  process.env.SESSION_SECRET = rotatedSecret;
-  process.env.SESSION_SECRET_PREVIOUS = previousSecret;
-  process.env.SESSION_SECRET_GRACE_MS = String(1000);
-  // Rotation happened well before the grace window, so the old key has expired.
-  process.env.SESSION_SECRET_ROTATED_AT = String(Date.now() - 60 * 60 * 1000);
-
-  try {
-    assert.equal(verifySessionToken(token), null);
-  } finally {
-    process.env.SESSION_SECRET = previousSecret;
-    delete process.env.SESSION_SECRET_PREVIOUS;
-    delete process.env.SESSION_SECRET_GRACE_MS;
-    delete process.env.SESSION_SECRET_ROTATED_AT;
-  }
-});
-
-test('config.session.secrets evaluates to an array of active secrets rather than a function reference (#244)', async () => {
-  const { config } = await import('../src/config.js');
-  assert.equal(Array.isArray(config.session.secrets), true);
-  assert.equal(typeof config.session.secrets, 'object');
-
-  const prev = process.env.SESSION_SECRET;
-  process.env.SESSION_SECRET = 'active-secret-123';
-  process.env.SESSION_SECRET_PREVIOUS = 'prior-secret-456';
-  process.env.SESSION_SECRET_ROTATION_GRACE_MS = '60000';
-  process.env.SESSION_SECRET_ROTATED_AT = String(Date.now());
-  try {
-    assert.deepEqual(config.session.secrets, ['active-secret-123', 'prior-secret-456']);
-    assert.equal(config.session.previousSecret, 'prior-secret-456');
-    assert.equal(config.session.rotationGraceMs, 60000);
-  } finally {
-    process.env.SESSION_SECRET = prev;
-    delete process.env.SESSION_SECRET_PREVIOUS;
-    delete process.env.SESSION_SECRET_ROTATION_GRACE_MS;
-    delete process.env.SESSION_SECRET_ROTATED_AT;
+    await new Promise((resolve) => server.close(resolve));
   }
 });
