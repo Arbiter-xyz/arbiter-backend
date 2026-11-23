@@ -362,3 +362,6 @@ local stack (Redis, worker console, and the app build).
 
 <!-- handsoff-issue-241 -->
 - #241: All three billing processors call an undefined resolveCurrency()/SUPPORTED_CURRENCIES
+
+<!-- handsoff-issue-546 -->
+- #546: Stop describing the admin console as read-only in the README

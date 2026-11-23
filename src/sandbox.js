@@ -92,6 +92,13 @@ function sleep(ms) {
 
 export function issueSandboxChallenge(questionId, questionText, tierKey) {
   const tier = resolveTier(tierKey);
+  // In 'resolved' mode with an API key configured, the sandbox may call the
+  // real Claude API (budget-capped) to produce a genuine draft answer, so the
+  // note must not claim "no LLM calls made" unconditionally.
+  const mayUseLlm = Boolean(config.anthropicApiKey);
+  const llmNote = mayUseLlm
+    ? 'In resolved mode this sandbox may use a real Claude draft (budget-capped) when an API key is configured; otherwise it returns a canned response.'
+    : 'No LLM calls are made (no API key configured), so this returns a canned response.';
   return {
     sandbox: true,
     questionId,
@@ -101,7 +108,7 @@ export function issueSandboxChallenge(questionId, questionText, tierKey) {
     timeoutMs: tier.timeoutMs,
     amount: '0.00',
     amountStroops: '0',
-    note: 'Sandbox mode: no payment required, no real chain or LLM calls made. Every field ' +
+    note: `Sandbox mode: no payment required, no real chain calls made. ${llmNote} Every field ` +
       'below matches the shape of a real response so you can build against it directly.',
   };
 }
@@ -182,29 +189,26 @@ async function runSandboxFulfillment(questionId, questionText, mode) {
   await updateJob(questionId, { status: 'reconciling', totalAnswers: submissions.length });
   await sleep(350);
 
-  const result =
-    submissions.length === 0
-      ? { consensus: null, confidence: 0, matchingWorkerIds: [], method: 'no-answers' }
-      : (() => {
-          const vote = exactMatchVote(submissions);
-          return {
-            consensus: vote.consensus,
-            confidence: vote.confidence,
-            matchingWorkerIds: vote.matchingWorkerIds,
-            method: 'exact-match',
-          };
-        })();
+  if (submissions.length === 0) {
+    await updateJob(questionId, {
+      status: 'settled',
+      outcome: 'refunded',
+      reason: 'no answers submitted before timeout',
+      refundTx: fakeTxHash('refund'),
+    });
+    return;
+  }
 
+  const result = exactMatchVote(submissions);
   await updateJob(questionId, {
     status: 'settled',
-    outcome: result.consensus ? 'resolved' : 'refunded',
+    outcome: result.resolved ? 'resolved' : 'refunded',
     answer: result.consensus,
     confidence: result.confidence,
     reconciliationMethod: result.method,
     totalAnswers: submissions.length,
-    matchingWorkers: result.matchingWorkerIds,
-    payoutTx: result.consensus ? fakeTxHash('payout') : null,
-    refundTx: result.consensus ? null : fakeTxHash('refund'),
+    matchingWorkers: result.matchingWorkers,
+    payoutTx: fakeTxHash('payout'),
     payoutModel: 'sandbox — no real funds moved',
   });
 }
