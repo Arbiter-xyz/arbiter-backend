@@ -9,6 +9,8 @@ import {
   onlineWorkers,
   probeErrorsTotal,
   recordJobScan,
+  claudeBudgetSpentCents,
+  claudeBudgetRemainingCents,
 } from './metrics.js';
 
 /**
@@ -92,6 +94,25 @@ export async function probeJobs({ getKnownJobIds, getJob }, now = Date.now(), { 
   }
 }
 
+/** Fleet-wide Claude spend cap (rateLimit.js): how much of the rolling
+ * window's budget is spent and how much is left, so operators can alert
+ * before the cap trips and real-Claude paths start falling back. Both values
+ * are read from the shared store, so every instance reports the same
+ * fleet-wide numbers. On a store error the last good values are kept rather
+ * than zeroed, so a blip can't look like the budget just ran out. */
+export async function probeClaudeBudget({ getSpent, getRemaining }) {
+  try {
+    const [spent, remaining] = await Promise.all([getSpent(), getRemaining()]);
+    claudeBudgetSpentCents.set(spent);
+    claudeBudgetRemainingCents.set(remaining);
+    return { spent, remaining };
+  } catch (err) {
+    probeErrorsTotal.inc({ probe: 'claude_budget' });
+    logger.warn({ err }, 'Claude budget probe failed');
+    return { error: err.message };
+  }
+}
+
 function every(intervalMs, fn) {
   const run = () => fn().catch((err) => logger.error({ err }, 'health probe threw'));
   run();
@@ -135,6 +156,8 @@ export function startHealthProbes({
   getKnownJobIds,
   getJob,
   getOnlineWorkerCount,
+  getClaudeBudgetSpent,
+  getClaudeBudgetRemaining,
   intervalMs = 15_000,
   jobScanIntervalMs = 60_000,
 }) {
@@ -148,5 +171,12 @@ export function startHealthProbes({
     // flight, so slow scans can't pile up concurrently.
     everyNoOverlap(jobScanIntervalMs, () => probeJobs({ getKnownJobIds, getJob })),
   ];
+  // Optional so callers (and tests) that don't wire the budget readers keep
+  // working; server.js always passes both.
+  if (getClaudeBudgetSpent && getClaudeBudgetRemaining) {
+    timers.push(
+      every(intervalMs, () => probeClaudeBudget({ getSpent: getClaudeBudgetSpent, getRemaining: getClaudeBudgetRemaining })),
+    );
+  }
   return () => timers.forEach(clearInterval);
 }

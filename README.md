@@ -25,7 +25,10 @@ are no longer documented as live targets. Do not point an integration at
 them.
 
 To try the backend, run it yourself (see
-[`docs/local-full-stack.md`](docs/local-full-stack.md)):
+[`docs/local-full-stack.md`](docs/local-full-stack.md)). It needs
+**Node.js 22 or newer**, the version CI runs and the only one it tests. It
+is declared in `package.json`'s `engines` field (npm warns at install time on
+an older Node) and pinned in `.nvmrc`, so `nvm use` picks it up.
 
 ```sh
 npm install
@@ -185,7 +188,8 @@ receiver can safely treat a repeated delivery as the same event.
 
 ## Running it locally
 
-Install dependencies, copy `.env.example` to `.env`, and start the server:
+With Node.js 22+ (see `.nvmrc`), install dependencies, copy `.env.example`
+to `.env`, and start the server:
 
 ```sh
 npm install

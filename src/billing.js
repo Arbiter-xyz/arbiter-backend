@@ -5,7 +5,13 @@ import { config } from './config.js';
 import { hashApiKey } from './apiKeyAuth.js';
 import { logger } from './logger.js';
 import { recordPaymentReversal } from './paymentReversals.js';
-import { billingReservationCount, billingSettlementCount, fiatPoolBalanceStroops } from './metrics.js';
+import {
+  billingReservationCount,
+  billingSettlementCount,
+  billingReservationsReconciled,
+  fiatPoolBalanceStroops,
+} from './metrics.js';
+import { getJob } from './jobs.js';
 import { isLoopbackHost } from './securityPosture.js';
 
 /**
@@ -120,6 +126,30 @@ export async function getCreditBalanceStroops(accountId) {
 }
 
 /**
+ * Durable pending-reservation records (#63, #472). Each live reservation is
+ * one field in this hash, keyed `${accountId}:${questionId}`, written by
+ * reserveCredit() before askMetered() runs and removed by
+ * settleReservation(). A field that outlives its request means the process
+ * died in between, and reconcilePendingReservations() settles it.
+ *
+ * One hash rather than one key per reservation because the store has no key
+ * scan: hgetall() is how the sweep finds them, and hdel() is the atomic claim
+ * that lets settleReservation() and the sweep (on any instance) race for the
+ * same record with exactly one of them moving money. No TTL: a reservation
+ * is money owed back to a customer and must never silently expire.
+ */
+const PENDING_RESERVATIONS_KEY = 'pending-reservations';
+
+function pendingReservationField(accountId, questionId) {
+  return `${accountId}:${questionId}`;
+}
+
+/** Every reservation not yet settled, as stored. For tests and operators. */
+export async function getPendingReservations() {
+  return Object.values(await store.hgetall(PENDING_RESERVATIONS_KEY));
+}
+
+/**
  * Reserves up to `maxStroops` BEFORE the real, possibly-lower surge price
  * is known — askMetered() only reveals the actual price it charged in its
  * return value (amountStroops), by which point the on-chain charge has
@@ -129,25 +159,181 @@ export async function getCreditBalanceStroops(accountId) {
  * never go negative and a customer can never be charged more than their
  * balance covers, without needing to predict the exact price in advance.
  *
+ * With a `questionId` (the id askMetered() will open the question under),
+ * also writes the durable pending-reservation record, so a crash before
+ * settleReservation() runs is repaired by reconcilePendingReservations()
+ * instead of keeping the customer's whole reservation. The credit is taken
+ * first and the record written second: a crash between the two leaves an
+ * unrecorded reservation, as before, but the opposite order could leave a
+ * record for credit that was never taken, and the sweep would refund money
+ * the customer never paid. If the record can't be written, the credit is
+ * put back and the error rethrown, so no request goes ahead unrecorded.
+ *
  * Invoice-billed accounts deliberately bypass this path (see oracle.js):
  * going negative — accruing a balance owed — is the entire point for them.
  */
-export async function reserveCredit(accountId, maxStroops) {
+export async function reserveCredit(accountId, maxStroops, questionId = null) {
   const ok = await store.decrIfAtLeast(`credit:${accountId}`, maxStroops);
-  if (ok) billingReservationCount.inc({ outcome: 'reserved' });
-  else billingReservationCount.inc({ outcome: 'insufficient' });
-  return ok;
+  if (!ok) {
+    billingReservationCount.inc({ outcome: 'insufficient' });
+    return false;
+  }
+  if (questionId !== null && questionId !== undefined) {
+    const record = {
+      accountId,
+      questionId: String(questionId),
+      reservedStroops: Number(maxStroops),
+      createdAt: Date.now(),
+    };
+    let written = false;
+    try {
+      written = await store.hsetnx(PENDING_RESERVATIONS_KEY, pendingReservationField(accountId, questionId), record);
+    } catch (err) {
+      await store.incrBy(`credit:${accountId}`, maxStroops);
+      throw err;
+    }
+    if (!written) {
+      // Question ids are unique, so this is a caller bug. Reusing the
+      // existing record would let one settlement clear two reservations.
+      await store.incrBy(`credit:${accountId}`, maxStroops);
+      throw new Error(`a pending reservation already exists for question ${questionId}`);
+    }
+  }
+  billingReservationCount.inc({ outcome: 'reserved' });
+  return true;
 }
 
 /** Credits back the unused portion of a reservation. Pass actualStroops=0
  * to refund the reservation in full (the downstream charge failed
  * entirely — e.g. the pooled on-chain balance itself was insufficient).
- * Clears the durable pending-reservation record so reconciliation never
- * revisits a settled reservation. */
-export async function settleReservation(accountId, reservedStroops, actualStroops, questionId) {
+ *
+ * With the same `questionId` passed to reserveCredit(), first claims (removes)
+ * the durable pending-reservation record, so reconciliation never revisits a
+ * settled reservation. If the record is already gone, the sweep settled this
+ * reservation first, so this call moves no money and returns false; otherwise
+ * true. Without a `questionId` no record is involved: the legacy call shape,
+ * and how a follow-up settlement of a reservation's remainder works. */
+export async function settleReservation(accountId, reservedStroops, actualStroops, questionId = null) {
+  if (questionId !== null && questionId !== undefined) {
+    const claimed = await store.hdel(PENDING_RESERVATIONS_KEY, pendingReservationField(accountId, questionId));
+    if (!claimed) {
+      billingSettlementCount.inc({ outcome: 'already_reconciled' });
+      logger.warn({ accountId, questionId: String(questionId) }, 'reservation already settled by the pending-reservation sweep');
+      return false;
+    }
+  }
   const refund = reservedStroops - actualStroops;
   if (refund > 0) await store.incrBy(`credit:${accountId}`, refund);
   billingSettlementCount.inc({ outcome: actualStroops > 0 ? 'charged' : 'refunded' });
+  return true;
+}
+
+/**
+ * The reconciliation pass #63 asked for. Settles every pending reservation
+ * older than `minAgeMs`, which by then can only belong to a request whose
+ * process died before settleReservation() ran:
+ *
+ *   - a job exists for the question: askMetered() got as far as charging and
+ *     opening it, so settle against what the job records it charged
+ *     (amountStroops), exactly as the request itself would have;
+ *   - no job: either the charge never happened, or it happened but the
+ *     process died before the job was created. Either way the customer got
+ *     nothing, so refund the reservation in full. In the second case the
+ *     on-chain question is orphaned, and the disaster-recovery sweep
+ *     refunds it to the fiat pool (disasterRecovery.js), so the pool is made
+ *     whole too.
+ *
+ * Each record is claimed with an atomic hdel() before any credit moves, so a
+ * slow live request, or the same sweep on another instance, can never settle
+ * it a second time. A record that fails to process is left for the next run.
+ */
+export async function reconcilePendingReservations({
+  now = Date.now(),
+  minAgeMs = config.billing.reservationMinAgeMs,
+  lookupJob = getJob,
+} = {}) {
+  const summary = { scanned: 0, tooRecent: 0, charged: 0, refunded: 0, refundedStroops: 0, skipped: 0, errors: 0 };
+  const records = await store.hgetall(PENDING_RESERVATIONS_KEY);
+  for (const [field, record] of Object.entries(records)) {
+    summary.scanned += 1;
+    const createdAt = Number(record?.createdAt);
+    const reservedStroops = Number(record?.reservedStroops);
+    if (!record?.accountId || !record?.questionId || !Number.isFinite(createdAt) || !Number.isFinite(reservedStroops)) {
+      summary.skipped += 1;
+      logger.error({ field, record }, 'malformed pending-reservation record; left for an operator');
+      continue;
+    }
+    if (now - createdAt < minAgeMs) {
+      summary.tooRecent += 1;
+      continue;
+    }
+    try {
+      const job = await lookupJob(record.questionId);
+      let actualStroops = 0;
+      if (job) {
+        actualStroops = Number(job.amountStroops);
+        if (!Number.isFinite(actualStroops) || actualStroops < 0) {
+          summary.skipped += 1;
+          logger.error(
+            { accountId: record.accountId, questionId: record.questionId, amountStroops: job.amountStroops },
+            'job for a pending reservation has no usable amountStroops; left for an operator',
+          );
+          continue;
+        }
+      }
+      if (!(await store.hdel(PENDING_RESERVATIONS_KEY, field))) continue; // settled elsewhere meanwhile
+
+      const refund = reservedStroops - actualStroops;
+      if (refund > 0) await store.incrBy(`credit:${record.accountId}`, refund);
+      const outcome = job ? 'charged' : 'refunded';
+      billingReservationsReconciled.inc({ outcome });
+      summary[outcome] += 1;
+      summary.refundedStroops += Math.max(refund, 0);
+      logger.warn(
+        {
+          accountId: record.accountId,
+          questionId: record.questionId,
+          reservedStroops,
+          actualStroops,
+          refundStroops: Math.max(refund, 0),
+          outcome,
+        },
+        'reconciled a reservation that was never settled (process likely died mid-request)',
+      );
+    } catch (err) {
+      summary.errors += 1;
+      logger.error({ err, accountId: record.accountId, questionId: record.questionId }, 'pending-reservation reconciliation failed; will retry');
+    }
+  }
+  return summary;
+}
+
+/** Runs reconcilePendingReservations() once on boot (the startup pass), then
+ * every `intervalMs`, skipping a tick while the previous run is still going.
+ * Returns stop() for tests and shutdown. */
+export function startPendingReservationSweeper({
+  intervalMs = config.billing.reservationSweepIntervalMs,
+  minAgeMs = config.billing.reservationMinAgeMs,
+} = {}) {
+  let running = false;
+  const run = async () => {
+    if (running) return;
+    running = true;
+    try {
+      const summary = await reconcilePendingReservations({ minAgeMs });
+      if (summary.charged || summary.refunded || summary.errors || summary.skipped) {
+        logger.info({ summary }, 'pending-reservation sweep finished');
+      }
+    } catch (err) {
+      logger.error({ err }, 'pending-reservation sweep failed');
+    } finally {
+      running = false;
+    }
+  };
+  run();
+  const timer = setInterval(run, intervalMs);
+  timer.unref();
+  return () => clearInterval(timer);
 }
 
 /** Creates a fresh account (and its one API key) and a Stripe Checkout

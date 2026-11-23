@@ -154,3 +154,25 @@ groups:
         annotations:
           summary: "The recovery sweep on {{ $labels.instance }} cannot scan the chain; stranded payers would not be refunded"
           runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterrecoverysweepfailing"
+
+  - name: arbiter-claude-budget
+    rules:
+      - alert: ArbiterClaudeBudgetNearlyExhausted
+        # The fleet-wide rolling Claude spend cap (rateLimit.js,
+        # CLAUDE_FLEET_BUDGET_CENTS per CLAUDE_FLEET_WINDOW_MS) has less than
+        # 10% left. When it hits 0, the sandbox serves canned responses and
+        # the Instant tier fails closed to a refund until the window rolls
+        # over. Every instance reads the same shared counter, so this is
+        # aggregated across instances to page once, not once per replica.
+        expr: |
+          max without (instance) (
+              arbiter_claude_budget_remaining_cents
+            /
+              (arbiter_claude_budget_spent_cents + arbiter_claude_budget_remaining_cents)
+          ) < 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Less than 10% of the fleet-wide Claude budget is left in the current window; real-Claude paths will fall back when it runs out"
+          runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterclaudebudgetnearlyexhausted"

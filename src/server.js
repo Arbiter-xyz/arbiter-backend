@@ -33,7 +33,7 @@ import { getLeaderboard } from './leaderboard.js';
 import { getWorkerDashboard } from './workerAnalytics.js';
 import { getGamificationProfile, getXpLeaderboard, badgeCatalog } from './gamification.js';
 import { stroopsToUsdc, resolveTier, MAX_SURGE_MULTIPLIER } from './pricing.js';
-import { checkRateLimit } from './rateLimit.js';
+import { checkRateLimit, claudeBudgetSpent, claudeBudgetRemaining } from './rateLimit.js';
 import { issueSandboxChallenge, startSandboxFulfillment } from './sandbox.js';
 import { requireAdmin } from './adminAuth.js';
 import {
@@ -53,7 +53,16 @@ import { recordAnchorTransaction, recordAnchorKyc } from './anchorRecords.js';
 import { resolveApiKey, extractApiKey } from './apiKeyAuth.js';
 import { parseConsensusRule } from './consensus.js';
 import { getPrivatePool, addPoolWorkers, removePoolWorkers, PoolValidationError } from './privatePools.js';
-import { isBillingConfigured, createCheckoutSession, handleStripeWebhook, rotateApiKey, getCreditBalanceStroops, reserveCredit, settleReservation } from './billing.js';
+import {
+  isBillingConfigured,
+  createCheckoutSession,
+  handleStripeWebhook,
+  rotateApiKey,
+  getCreditBalanceStroops,
+  reserveCredit,
+  settleReservation,
+  startPendingReservationSweeper,
+} from './billing.js';
 import { registerWebhook, listWebhooks, deleteWebhook, WebhookError } from './webhooks.js';
 import { getDispatchPause, listUpcomingWindows, describePause, addWindow, removeWindow, listWindows, MaintenanceWindowError } from './maintenanceWindows.js';
 import { logger, httpLogger } from './logger.js';
@@ -417,9 +426,15 @@ app.post('/oracle', refuseWhileDraining, rateLimited('oracle', byIp), async (req
     // reserveCredit()'s doc comment in billing.js.
     const resolvedTier = resolveTier(tier);
     const maxStroops = Number(resolvedTier.priceStroops * BigInt(MAX_SURGE_MULTIPLIER));
+    // Allocated up front (rather than inside askMetered()) so the durable
+    // pending-reservation record names this question: if the process dies
+    // before settleReservation() below, the reservation sweep settles it
+    // against this question's job, or refunds it in full if none exists.
     let reserved;
+    let reservedQuestionId;
     try {
-      reserved = await reserveCredit(apiKeyAccountId, maxStroops);
+      reservedQuestionId = (await nextQuestionId()).toString();
+      reserved = await reserveCredit(apiKeyAccountId, maxStroops, reservedQuestionId);
     } catch (err) {
       // An Express 4 async handler doesn't catch a throw on its own — left
       // unguarded, this would be an unhandled rejection that crashes the
@@ -435,8 +450,9 @@ app.post('/oracle', refuseWhileDraining, rateLimited('oracle', byIp), async (req
       const result = await askMetered(config.billing.fiatPoolAddress, question, tier, category, {
         ownerAccountId: apiKeyAccountId, // routes this customer's settlement webhooks
         consensusRule: consensus.rule,
+        questionId: reservedQuestionId,
       });
-      await settleReservation(apiKeyAccountId, maxStroops, Number(result.amountStroops));
+      await settleReservation(apiKeyAccountId, maxStroops, Number(result.amountStroops), reservedQuestionId);
       return res.status(202).json({ ...result, statusUrl: `/oracle/${result.jobId}` });
     } catch (err) {
       // Refund the reservation in full — this failure is the platform's
@@ -444,7 +460,7 @@ app.post('/oracle', refuseWhileDraining, rateLimited('oracle', byIp), async (req
       // never cost them credit. Never surfaced to the customer as "the
       // platform is low on funds" — that's an operator concern (see the
       // Treasury admin view), not something to leak externally.
-      await settleReservation(apiKeyAccountId, maxStroops, 0);
+      await settleReservation(apiKeyAccountId, maxStroops, 0, reservedQuestionId);
       req.log.error({ err, apiKeyAccountId }, 'fiat-pool charge failed — platform pooled balance may be low');
       return res.status(503).json({ error: 'temporarily unable to process — try again shortly' });
     }
@@ -1609,6 +1625,8 @@ const server = app.listen(config.port, () => {
     getKnownJobIds,
     getJob,
     getOnlineWorkerCount: onlineWorkerCount,
+    getClaudeBudgetSpent: claudeBudgetSpent,
+    getClaudeBudgetRemaining: claudeBudgetRemaining,
     intervalMs: config.metrics.probeIntervalMs,
     jobScanIntervalMs: config.metrics.jobScanIntervalMs,
   });
@@ -1621,6 +1639,17 @@ const server = app.listen(config.port, () => {
     startRecoverySweeper({ store, intervalMs: config.recovery.intervalMs, options: config.recovery });
   } else {
     logger.warn('recovery sweep disabled (RECOVERY_SWEEP_ENABLED=false, or ORACLE_CONTRACT_ID/PLATFORM_SECRET unset)');
+  }
+
+  // Settles fiat-credit reservations a crash left unsettled (#472): once on
+  // boot, then periodically. Store-only (no chain, no keys), and each record
+  // is claimed atomically, but like every background writer it stays off
+  // canaries.
+  if (!isCanary) {
+    startPendingReservationSweeper({
+      intervalMs: config.billing.reservationSweepIntervalMs,
+      minAgeMs: config.billing.reservationMinAgeMs,
+    });
   }
 });
 

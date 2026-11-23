@@ -123,8 +123,35 @@ export const billingReservationCount = new client.Counter({
 
 export const billingSettlementCount = new client.Counter({
   name: 'arbiter_billing_settlement_total',
-  help: 'Fiat-credit reservations settled against an actual charge, by outcome (charged, refunded).',
+  help:
+    'Fiat-credit reservations settled against an actual charge, by outcome (charged, refunded, ' +
+    'already_reconciled = the pending-reservation sweep had already settled it).',
   labelNames: ['outcome'],
+  registers: [registry],
+});
+
+export const billingReservationsReconciled = new client.Counter({
+  name: 'arbiter_billing_reservations_reconciled_total',
+  help:
+    'Fiat-credit reservations left unsettled (e.g. by a crash) and settled by the pending-reservation sweep, by outcome ' +
+    "(charged = settled against the job's actual charge, refunded = no job was created, refunded in full).",
+  labelNames: ['outcome'],
+  registers: [registry],
+});
+
+// --- Claude fleet budget (rateLimit.js) ------------------------------------
+
+export const claudeBudgetSpentCents = new client.Gauge({
+  name: 'arbiter_claude_budget_spent_cents',
+  help: 'Real Claude API spend recorded against the fleet-wide rolling budget for the current window, in cents.',
+  registers: [registry],
+});
+
+export const claudeBudgetRemainingCents = new client.Gauge({
+  name: 'arbiter_claude_budget_remaining_cents',
+  help:
+    'Fleet-wide Claude budget left in the current rolling window, in cents. At 0, real-Claude paths fall back ' +
+    '(sandbox: canned response; Instant tier: refund).',
   registers: [registry],
 });
 

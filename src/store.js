@@ -121,6 +121,24 @@ class MemoryStore {
     return { ...entry.value };
   }
 
+  /** Removes one field from a hash and reports whether this call was the one
+   * that removed it — the claim primitive for billing.js's pending-
+   * reservation records: settleReservation() and the reconciliation sweep
+   * both try to remove the same field, and only the caller that gets `true`
+   * moves any money. No `await` between the check and the delete, same
+   * run-to-completion discipline as incr(). */
+  async hdel(key, field) {
+    const entry = this.map.get(key);
+    if (!entry) return false;
+    if (entry.expiresAt && entry.expiresAt < Date.now()) {
+      this.map.delete(key);
+      return false;
+    }
+    if (!Object.prototype.hasOwnProperty.call(entry.value, field)) return false;
+    delete entry.value[field];
+    return true;
+  }
+
   /** Durable accumulator — no TTL, matching every other money-like balance
    * in this codebase (Owed, reputation, payer records): a credit balance
    * must never silently expire. Same run-to-completion-safe check-then-
@@ -235,6 +253,12 @@ export class RedisStore {
       result[field] = JSON.parse(value);
     }
     return result;
+  }
+
+  // HDEL is atomic and returns how many fields it removed, so exactly one
+  // of several concurrent callers (across instances) sees `true`.
+  async hdel(key, field) {
+    return (await this.client.hdel(key, field)) === 1;
   }
 
   // Durable — no TTL, matching MemoryStore's incrBy (money-like balances
