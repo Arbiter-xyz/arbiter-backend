@@ -93,9 +93,21 @@ export const logger = pino({
  * logs one line per request with method/path/status/duration, and exposes
  * a per-request child logger at req.log for handlers to attach further
  * context to (job id, question id, worker id, etc.). */
+const VALID_REQUEST_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+
+export function resolveRequestId(req, res) {
+  const raw = req?.headers?.['x-request-id'];
+  const candidate = Array.isArray(raw) ? raw[0] : raw;
+  const id = typeof candidate === 'string' && VALID_REQUEST_ID_RE.test(candidate) ? candidate : randomUUID();
+  if (res && typeof res.setHeader === 'function') {
+    res.setHeader('X-Request-Id', id);
+  }
+  return id;
+}
+
 export const httpLogger = pinoHttp({
   logger,
-  genReqId: (req) => req.headers['x-request-id'] || randomUUID(),
+  genReqId: (req, res) => resolveRequestId(req, res),
   customLogLevel: (req, res, err) => {
     if (err || res.statusCode >= 500) return 'error';
     if (res.statusCode >= 400) return 'warn';
