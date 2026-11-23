@@ -326,6 +326,12 @@ export const config = Object.freeze({
     // 1 USD = 1 USDC face value, at USDC's 7-decimal stroop convention.
     usdToStroops: 10_000_000n,
     minTopupUsd: num(process.env.MIN_TOPUP_USD, 10),
+    // Pending-reservation sweep (billing.js, #472): credits back fiat
+    // reservations a crash left unsettled. A reservation is only touched once
+    // it is older than reservationMinAgeMs, far longer than a live
+    // askMetered() call takes, so the sweep never races a request in flight.
+    reservationSweepIntervalMs: num(process.env.BILLING_RESERVATION_SWEEP_INTERVAL_MS, 5 * 60 * 1000),
+    reservationMinAgeMs: num(process.env.BILLING_RESERVATION_MIN_AGE_MS, 15 * 60 * 1000),
   }),
 
   // Auto-withdraw (autoWithdraw.js): a worker opts in to having their full

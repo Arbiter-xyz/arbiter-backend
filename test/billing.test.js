@@ -13,7 +13,10 @@ import {
   createCheckoutSession,
   configuredProcessors,
   getProcessor,
+  reconcilePendingReservations,
+  getPendingReservations,
 } from '../src/billing.js';
+import { createJob } from '../src/jobs.js';
 import { config } from '../src/config.js';
 import { store } from '../src/store.js';
 
@@ -437,4 +440,140 @@ test('getProcessor selects the requested processor when more than one is configu
   assert.equal(getProcessor('paypal')?.name, 'paypal');
   assert.equal(getProcessor('coinbase')?.name, 'coinbase');
   assert.equal(getProcessor('does-not-exist'), null);
+});
+
+// --- Durable pending reservations and the crash-recovery sweep (#63, #472) ---
+
+const SWEEP_MIN_AGE_MS = 15 * 60 * 1000;
+const afterMinAge = () => Date.now() + SWEEP_MIN_AGE_MS + 1;
+
+async function fundedAccount(stroops) {
+  const accountId = uniqueId('acct');
+  await store.incrBy(`credit:${accountId}`, stroops);
+  return accountId;
+}
+
+async function pendingFor(accountId) {
+  return (await getPendingReservations()).filter((r) => r.accountId === accountId);
+}
+
+test('reserveCredit with a questionId writes a durable pending-reservation record; settleReservation clears it', async () => {
+  const accountId = await fundedAccount(100_000_000);
+  const questionId = uniqueId('q');
+
+  assert.equal(await reserveCredit(accountId, 50_000_000, questionId), true);
+  const [record] = await pendingFor(accountId);
+  assert.equal(record.questionId, questionId);
+  assert.equal(record.reservedStroops, 50_000_000);
+
+  assert.equal(await settleReservation(accountId, 50_000_000, 30_000_000, questionId), true);
+  assert.deepEqual(await pendingFor(accountId), []);
+  assert.equal(await getCreditBalanceStroops(accountId), 70_000_000);
+
+  // A settled reservation is never revisited by the sweep.
+  await reconcilePendingReservations({ now: afterMinAge(), minAgeMs: SWEEP_MIN_AGE_MS });
+  assert.equal(await getCreditBalanceStroops(accountId), 70_000_000);
+});
+
+test('an insufficient reservation writes no record', async () => {
+  const accountId = await fundedAccount(1_000);
+  assert.equal(await reserveCredit(accountId, 50_000_000, uniqueId('q')), false);
+  assert.deepEqual(await pendingFor(accountId), []);
+  assert.equal(await getCreditBalanceStroops(accountId), 1_000);
+});
+
+test('crash before any job was created: the sweep refunds the reservation in full', async () => {
+  const accountId = await fundedAccount(100_000_000);
+  const questionId = uniqueId('q');
+  await reserveCredit(accountId, 50_000_000, questionId);
+  // ...process dies here: askMetered() never opened the question and
+  // settleReservation() never ran.
+  assert.equal(await getCreditBalanceStroops(accountId), 50_000_000);
+
+  await reconcilePendingReservations({ now: afterMinAge(), minAgeMs: SWEEP_MIN_AGE_MS });
+  assert.equal(await getCreditBalanceStroops(accountId), 100_000_000, 'customer made whole');
+  assert.deepEqual(await pendingFor(accountId), []);
+});
+
+test('crash after the job was created: the sweep settles against the job\'s actual charge', async () => {
+  const accountId = await fundedAccount(100_000_000);
+  const questionId = uniqueId('q');
+  await reserveCredit(accountId, 50_000_000, questionId);
+  // askMetered() charged 30_000_000 and opened the job, then the process
+  // died before settleReservation() handed back the surge headroom.
+  await createJob(questionId, { amountStroops: '30000000', payer: 'GDPOOL' });
+
+  await reconcilePendingReservations({ now: afterMinAge(), minAgeMs: SWEEP_MIN_AGE_MS });
+  assert.equal(await getCreditBalanceStroops(accountId), 70_000_000, 'charged only what the job actually cost');
+  assert.deepEqual(await pendingFor(accountId), []);
+});
+
+test('the sweep leaves reservations younger than minAgeMs alone (a request may still be in flight)', async () => {
+  const accountId = await fundedAccount(100_000_000);
+  const questionId = uniqueId('q');
+  await reserveCredit(accountId, 50_000_000, questionId);
+
+  await reconcilePendingReservations({ now: Date.now(), minAgeMs: SWEEP_MIN_AGE_MS });
+  assert.equal(await getCreditBalanceStroops(accountId), 50_000_000);
+  assert.equal((await pendingFor(accountId)).length, 1);
+
+  await settleReservation(accountId, 50_000_000, 30_000_000, questionId);
+  assert.equal(await getCreditBalanceStroops(accountId), 70_000_000);
+});
+
+test('a late settleReservation after the sweep moves no money (no double refund)', async () => {
+  const accountId = await fundedAccount(100_000_000);
+  const questionId = uniqueId('q');
+  await reserveCredit(accountId, 50_000_000, questionId);
+
+  await reconcilePendingReservations({ now: afterMinAge(), minAgeMs: SWEEP_MIN_AGE_MS, lookupJob: async () => null });
+  assert.equal(await getCreditBalanceStroops(accountId), 100_000_000);
+
+  assert.equal(await settleReservation(accountId, 50_000_000, 0, questionId), false);
+  assert.equal(await getCreditBalanceStroops(accountId), 100_000_000);
+});
+
+test('concurrent sweeps settle a reservation exactly once', async () => {
+  const accountId = await fundedAccount(100_000_000);
+  await reserveCredit(accountId, 50_000_000, uniqueId('q'));
+
+  const opts = { now: afterMinAge(), minAgeMs: SWEEP_MIN_AGE_MS, lookupJob: async () => null };
+  await Promise.all([reconcilePendingReservations(opts), reconcilePendingReservations(opts)]);
+  assert.equal(await getCreditBalanceStroops(accountId), 100_000_000);
+});
+
+test('a failed job lookup leaves the reservation for the next sweep', async () => {
+  const accountId = await fundedAccount(100_000_000);
+  const questionId = uniqueId('q');
+  await reserveCredit(accountId, 50_000_000, questionId);
+
+  const failing = await reconcilePendingReservations({
+    now: afterMinAge(),
+    minAgeMs: SWEEP_MIN_AGE_MS,
+    lookupJob: async (id) => {
+      if (id === questionId) throw new Error('store timeout');
+      return null;
+    },
+  });
+  assert.ok(failing.errors >= 1);
+  assert.equal(await getCreditBalanceStroops(accountId), 50_000_000);
+  assert.equal((await pendingFor(accountId)).length, 1);
+
+  await reconcilePendingReservations({ now: afterMinAge(), minAgeMs: SWEEP_MIN_AGE_MS, lookupJob: async () => null });
+  assert.equal(await getCreditBalanceStroops(accountId), 100_000_000);
+});
+
+test('reserveCredit puts the credit back if the reservation record cannot be written', async () => {
+  const accountId = await fundedAccount(100_000_000);
+  const original = store.hsetnx;
+  store.hsetnx = async () => {
+    throw new Error('store write failed');
+  };
+  try {
+    await assert.rejects(() => reserveCredit(accountId, 50_000_000, uniqueId('q')), /store write failed/);
+  } finally {
+    store.hsetnx = original;
+  }
+  assert.equal(await getCreditBalanceStroops(accountId), 100_000_000);
+  assert.deepEqual(await pendingFor(accountId), []);
 });

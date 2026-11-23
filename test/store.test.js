@@ -55,6 +55,12 @@ class FakeRedisClient {
   async hgetall(key) {
     return this.hashes.get(key) || {};
   }
+  async hdel(key, field) {
+    const hash = this.hashes.get(key);
+    if (!hash || !Object.prototype.hasOwnProperty.call(hash, field)) return 0;
+    delete hash[field];
+    return 1;
+  }
   async eval(_script, _numKeys, key, amount) {
     const current = Number(this.data.get(key)) || 0;
     const amt = Number(amount);
@@ -106,6 +112,26 @@ test('hsetnx dedupes per field, independently per key', async () => {
   assert.equal(await store.hsetnx(key, 'workerA', 'no'), false); // dup field, refused
   assert.equal(await store.hsetnx(key, 'workerB', 'yes'), true); // different field, fine
   assert.deepEqual(await store.hgetall(key), { workerA: 'yes', workerB: 'yes' });
+});
+
+test('hdel reports true only to the caller that actually removed the field', async () => {
+  const key = uniqueKey('hash');
+  await store.hsetnx(key, 'a', 1);
+  await store.hsetnx(key, 'b', 2);
+  const results = await Promise.all([store.hdel(key, 'a'), store.hdel(key, 'a')]);
+  assert.deepEqual(results.sort(), [false, true]); // exactly one claim wins
+  assert.equal(await store.hdel(key, 'missing'), false);
+  assert.equal(await store.hdel(uniqueKey('never-written'), 'a'), false);
+  assert.deepEqual(await store.hgetall(key), { b: 2 });
+});
+
+test('RedisStore.hdel maps HDEL\'s removed-count to a boolean claim', async () => {
+  const redisStore = new RedisStore(new FakeRedisClient());
+  const key = uniqueKey('hash');
+  await redisStore.hsetnx(key, 'a', { x: 1 });
+  assert.equal(await redisStore.hdel(key, 'a'), true);
+  assert.equal(await redisStore.hdel(key, 'a'), false);
+  assert.deepEqual(await redisStore.hgetall(key), {});
 });
 
 test('hgetall on a never-written key returns an empty object, not null/undefined', async () => {

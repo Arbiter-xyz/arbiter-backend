@@ -25,8 +25,17 @@ import { config } from './config.js';
  * route wiring) — without that, anyone could charge against a balance they
  * don't own just by naming someone else's address.
  */
-export async function askMetered(payerAddress, questionText, tierKey, category, { ownerAccountId, consensusRule = null } = {}) {
-  const questionId = (await nextQuestionId()).toString();
+export async function askMetered(
+  payerAddress,
+  questionText,
+  tierKey,
+  category,
+  { ownerAccountId, consensusRule = null, questionId: allocatedQuestionId = null } = {},
+) {
+  // The API-key path allocates the id itself, before reserving credit, so the
+  // durable pending-reservation record can name the question it pays for
+  // (billing.js's reserveCredit()).
+  const questionId = allocatedQuestionId !== null ? String(allocatedQuestionId) : (await nextQuestionId()).toString();
   const priced = priceForTier(tierKey, getSmoothedOnlineWorkerCount());
 
   // Throws (InsufficientBalance, or any RPC/network failure) if the charge

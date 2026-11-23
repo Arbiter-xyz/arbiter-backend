@@ -293,3 +293,47 @@ tests:
             exp_annotations:
               summary: "The recovery sweep on api-1 cannot scan the chain; stranded payers would not be refunded"
               runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterrecoverysweepfailing"
+
+  - name: Claude budget nearly exhausted
+    interval: 1m
+    input_series:
+      # Budget 1000 cents. From minute 5 the fleet has spent 950 (5% left).
+      # Both instances read the same shared counter, so they report the same
+      # values and the alert fires once, not once per instance.
+      - series: 'arbiter_claude_budget_spent_cents{instance="api-1"}'
+        values: '200x4 950x15'
+      - series: 'arbiter_claude_budget_remaining_cents{instance="api-1"}'
+        values: '800x4 50x15'
+      - series: 'arbiter_claude_budget_spent_cents{instance="api-2"}'
+        values: '200x4 950x15'
+      - series: 'arbiter_claude_budget_remaining_cents{instance="api-2"}'
+        values: '800x4 50x15'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: ArbiterClaudeBudgetNearlyExhausted
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: ArbiterClaudeBudgetNearlyExhausted
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: "Less than 10% of the fleet-wide Claude budget is left in the current window; real-Claude paths will fall back when it runs out"
+              runbook_url: "https://github.com/Arbiter-xyz/arbiter-backend/blob/main/docs/runbooks/observability.md#arbiterclaudebudgetnearlyexhausted"
+
+  - name: Claude budget healthy
+    interval: 1m
+    input_series:
+      # Half the budget spent, and a fresh window with nothing spent yet:
+      # neither is close to the cap.
+      - series: 'arbiter_claude_budget_spent_cents{instance="api-1"}'
+        values: '500x20'
+      - series: 'arbiter_claude_budget_remaining_cents{instance="api-1"}'
+        values: '500x20'
+      - series: 'arbiter_claude_budget_spent_cents{instance="api-2"}'
+        values: '0x20'
+      - series: 'arbiter_claude_budget_remaining_cents{instance="api-2"}'
+        values: '1000x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ArbiterClaudeBudgetNearlyExhausted
+        exp_alerts: []

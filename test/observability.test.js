@@ -2,7 +2,7 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import express from 'express';
 import { registry, metricsMiddleware, metricsHandler, recordJobScan } from '../src/metrics.js';
-import { probeStore, probeChain, probeJobs } from '../src/healthProbes.js';
+import { probeStore, probeChain, probeJobs, probeClaudeBudget } from '../src/healthProbes.js';
 import { createFaultInjector, mountFaultRoutes, validateFault, isProtectedPath } from '../src/faultInjection.js';
 import { evaluateSecurityPosture } from '../src/securityPosture.js';
 
@@ -187,5 +187,24 @@ describe('health probes', () => {
 
     recordJobScan([], now);
     assert.equal(await value('arbiter_job_oldest_inflight_age_seconds'), 0);
+  });
+
+  test('Claude budget probe publishes fleet spend and remaining, keeping the last value on error', async () => {
+    await probeClaudeBudget({ getSpent: async () => 730, getRemaining: async () => 270 });
+    assert.equal(await value('arbiter_claude_budget_spent_cents'), 730);
+    assert.equal(await value('arbiter_claude_budget_remaining_cents'), 270);
+
+    const errorsBefore = (await value('arbiter_probe_errors_total', { probe: 'claude_budget' })) || 0;
+    const result = await probeClaudeBudget({
+      getSpent: async () => {
+        throw new Error('store unreachable');
+      },
+      getRemaining: async () => 0,
+    });
+    assert.equal(result.error, 'store unreachable');
+    assert.equal(await value('arbiter_probe_errors_total', { probe: 'claude_budget' }), errorsBefore + 1);
+    // A store blip must not read as "budget exhausted".
+    assert.equal(await value('arbiter_claude_budget_spent_cents'), 730);
+    assert.equal(await value('arbiter_claude_budget_remaining_cents'), 270);
   });
 });
