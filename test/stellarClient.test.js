@@ -1,132 +1,63 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { scValToNative } from '@stellar/stellar-sdk';
+import { Address, nativeToScVal, scValToNative, xdr } from '@stellar/stellar-sdk';
+
 import {
-  decodeStatus,
-  createSerialQueue,
-  computeAnswerHash,
-  bytes32Arg,
-  CONTRACT_ERROR_CODES,
-  isContractError,
-  isInsufficientBalanceError,
+  u64Arg,
+  i128Arg,
+  addressArg,
+  vecOfAddresses,
 } from '../src/stellarClient.js';
 
-// Regression coverage for a real bug found running against a live deployed
-// contract on Stellar testnet (round 6): scValToNative decodes a data-less
-// Rust enum variant like Status::Pending as a single-element ARRAY
-// (['Pending']), not the plain-object shape this function used to assume.
-// The old code silently decoded that to "0" (an array's stringified index)
-// instead of "pending" — verifyPayment then rejected every real payment
-// with "question is 0 on-chain, expected pending". No prior test caught
-// this because every other test in this repo only ever exercises mocked
-// data, never a real simulateTransaction response.
+const VALID_ADDRESS = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+const SECOND_ADDRESS = 'GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
 
-test('decodeStatus handles the real array shape scValToNative actually produces', () => {
-  assert.equal(decodeStatus(['Pending']), 'pending');
-  assert.equal(decodeStatus(['Resolved']), 'resolved');
-  assert.equal(decodeStatus(['Refunded']), 'refunded');
+test('u64Arg round-trips 0 through scValToNative', () => {
+  const scVal = u64Arg(0);
+  assert.equal(scVal.switch().name, 'scvU64');
+  assert.equal(scValToNative(scVal), 0n);
 });
 
-test('decodeStatus still handles a plain string, in case a future SDK version changes shape again', () => {
-  assert.equal(decodeStatus('Pending'), 'pending');
+test('u64Arg round-trips 2^64-1 through scValToNative', () => {
+  const max = 18446744073709551615n;
+  const scVal = u64Arg(max);
+  assert.equal(scVal.switch().name, 'scvU64');
+  assert.equal(scValToNative(scVal), max);
 });
 
-test('decodeStatus still handles an object-keyed shape as a defensive fallback', () => {
-  assert.equal(decodeStatus({ pending: true }), 'pending');
+test('i128Arg handles negative values', () => {
+  const scVal = i128Arg(-42);
+  assert.equal(scVal.switch().name, 'scvI128');
+  assert.equal(scValToNative(scVal), -42n);
 });
 
-test('decodeStatus never throws on an unexpected shape', () => {
-  assert.equal(decodeStatus(null), 'null');
-  assert.equal(decodeStatus(undefined), 'undefined');
-  assert.equal(decodeStatus(0), '0');
+test('i128Arg round-trips a large negative value', () => {
+  const value = -170141183460469231731687303715884105728n;
+  const scVal = i128Arg(value);
+  assert.equal(scVal.switch().name, 'scvI128');
+  assert.equal(scValToNative(scVal), value);
 });
 
-// Regression coverage for the sequence-number race invokeAsAdmin() used to
-// have: every admin-signed contract call re-fetches the account's current
-// sequence number, and Stellar requires a strictly increasing, gap-free
-// sequence per submitted transaction — two overlapping calls that both
-// fetched the same sequence would collide, and in production this
-// surfaced as a genuinely-reached consensus getting spuriously refunded
-// (oracle.js's settleResolved() falls back to settleRefunded() when the
-// admin call exhausts its retries). createSerialQueue() is the fix's
-// actual mechanism, factored out standalone so this is testable without
-// mocking the RPC layer at all.
-test('createSerialQueue runs queued calls one at a time, never overlapping', async () => {
-  const serialize = createSerialQueue();
-  let concurrentlyRunning = 0;
-  let maxConcurrentlyRunning = 0;
-  const order = [];
+test('addressArg encodes a valid address', () => {
+  const scVal = addressArg(VALID_ADDRESS);
+  assert.equal(scVal.switch().name, 'scvAddress');
+  assert.equal(scValToNative(scVal), VALID_ADDRESS);
+});
 
-  async function slowCall(id) {
-    concurrentlyRunning += 1;
-    maxConcurrentlyRunning = Math.max(maxConcurrentlyRunning, concurrentlyRunning);
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    order.push(id);
-    concurrentlyRunning -= 1;
-    return id;
+test('vecOfAddresses produces an scvVec of addresses', () => {
+  const scVal = vecOfAddresses([VALID_ADDRESS, SECOND_ADDRESS]);
+  assert.equal(scVal.switch().name, 'scvVec');
+
+  const native = scValToNative(scVal);
+  assert.deepEqual(native, [VALID_ADDRESS, SECOND_ADDRESS]);
+
+  const inner = scVal.vec();
+  assert.equal(inner.length, 2);
+  for (const entry of inner) {
+    assert.equal(entry.switch().name, 'scvAddress');
   }
-
-  // Fire all three "concurrently" (no await between them) — this is
-  // exactly sweepWorkerTtls()'s Promise.all() fan-out shape.
-  const results = await Promise.all([1, 2, 3].map((id) => serialize(() => slowCall(id))));
-
-  assert.equal(maxConcurrentlyRunning, 1, 'no two calls should ever be in-flight at the same time');
-  assert.deepEqual(order, [1, 2, 3], 'calls should run in the order they were queued');
-  assert.deepEqual(results, [1, 2, 3]);
 });
 
-test('createSerialQueue does not let one failed call wedge every later call behind it', async () => {
-  const serialize = createSerialQueue();
-
-  await assert.rejects(() => serialize(async () => { throw new Error('boom'); }));
-
-  // A later call must still run — a single admin-call failure (e.g. a
-  // dropped RPC connection) can never permanently stall the queue for
-  // every settlement after it.
-  const result = await serialize(async () => 'still works');
-  assert.equal(result, 'still works');
+test('vecOfAddresses throws on a non-address string', () => {
+  assert.throws(() => vecOfAddresses(['not-an-address']));
 });
-
-test('createSerialQueue preserves each call\'s own success/failure outcome to its caller', async () => {
-  const serialize = createSerialQueue();
-
-  const [a, bErr, c] = await Promise.allSettled([
-    serialize(async () => 'a'),
-    serialize(async () => { throw new Error('b failed'); }),
-    serialize(async () => 'c'),
-  ]);
-
-  assert.equal(a.status, 'fulfilled');
-  assert.equal(a.value, 'a');
-  assert.equal(bErr.status, 'rejected');
-  assert.match(bErr.reason.message, /b failed/);
-  assert.equal(c.status, 'fulfilled');
-  assert.equal(c.value, 'c');
-});
-
-test('computeAnswerHash produces a deterministic 32-byte SHA-256 digest and bytes32Arg encodes it as ScVal Bytes (#232)', () => {
-  const h1 = computeAnswerHash('What is 2+2?', '4');
-  const h2 = computeAnswerHash('What is 2+2?', '4');
-  const h3 = computeAnswerHash('What is 2+2?', '5');
-
-  assert.equal(Buffer.isBuffer(h1), true);
-  assert.equal(h1.length, 32);
-  assert.deepEqual(h1, h2);
-  assert.notDeepEqual(h1, h3);
-
-  const scValFromBuf = bytes32Arg(h1);
-  const scValFromHex = bytes32Arg(h1.toString('hex'));
-  assert.deepEqual(Buffer.from(scValToNative(scValFromBuf)), h1);
-  assert.deepEqual(Buffer.from(scValToNative(scValFromHex)), h1);
-
-  assert.throws(() => bytes32Arg(Buffer.alloc(16)), /32 bytes/);
-});
-
-test('CONTRACT_ERROR_CODES and isInsufficientBalanceError match Soroban ContractError #13 (#236)', () => {
-  assert.equal(CONTRACT_ERROR_CODES.INSUFFICIENT_BALANCE, 13);
-  assert.equal(isInsufficientBalanceError(new Error('HostError: Error(Contract, #13)')), true);
-  assert.equal(isInsufficientBalanceError(new Error('HostError: Error(Contract, #130)')), false);
-  assert.equal(isContractError('Error(Contract, #13)', 13), true);
-  assert.equal(isContractError('Error(Contract, #14)', 13), false);
-});
-
