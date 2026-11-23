@@ -10,7 +10,9 @@
     "test": "node --test --test-timeout=30000",
     "lint": "eslint src scripts",
     "verify-provenance": "node scripts/verify-provenance.js",
-    "boot-smoke-test": "node scripts/boot-smoke-test.js"
+    "boot-smoke-test": "node scripts/boot-smoke-test.js",
+    "canary:preflight": "node scripts/canary-preflight.js",
+    "check:env": "node scripts/check-env-example.js"
   },
   "keywords": [],
   "author": "",
