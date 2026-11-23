@@ -38,6 +38,13 @@ export const httpRequestDuration = new client.Histogram({
   registers: [registry],
 });
 
+export const rateLimitRejectionsTotal = new client.Counter({
+  name: 'arbiter_ratelimit_rejections_total',
+  help: 'Requests rejected with 429 by a rate limiter, by bucket.',
+  labelNames: ['bucket'],
+  registers: [registry],
+});
+
 export const storeUp = new client.Gauge({
   name: 'arbiter_store_up',
   help: '1 if the last store probe (Redis PING, or the in-memory store) succeeded, else 0.',
@@ -207,31 +214,13 @@ export function metricsMiddleware(req, res, next) {
 export function metricsHandler({ token = '' } = {}) {
   return async (req, res) => {
     if (token) {
-      const header = req.get('authorization') || '';
-      if (header !== `Bearer ${token}`) return res.status(401).json({ error: 'unauthorized' });
+      const auth = req.headers.authorization || '';
+      if (auth !== `Bearer ${token}`) {
+        res.status(401).json({ error: 'unauthorized' });
+        return;
+      }
     }
     res.set('Content-Type', registry.contentType);
-    res.send(await registry.metrics());
+    res.end(await registry.metrics());
   };
-}
-
-/** Records an admin-signed contract call's outcome. */
-export function recordAdminInvocation(method, ok) {
-  adminInvocationsTotal.inc({ method, result: ok ? 'ok' : 'error' });
-}
-
-/** Folds a job scan (see healthProbes.js) into the in-flight gauges. */
-export function recordJobScan(jobs, now = Date.now()) {
-  const byStatus = new Map();
-  let oldestCreatedAt = null;
-  for (const job of jobs) {
-    if (!job || job.status === 'settled') continue;
-    byStatus.set(job.status, (byStatus.get(job.status) || 0) + 1);
-    if (oldestCreatedAt === null || job.createdAt < oldestCreatedAt) oldestCreatedAt = job.createdAt;
-  }
-  // Reset every known status to 0 before rebuilding, so a status that drained
-  // since the last scan doesn't leave a stale non-zero series behind.
-  jobsInflight.reset();
-  for (const [status, count] of byStatus) jobsInflight.set({ status }, count);
-  oldestInflightJobAge.set(oldestCreatedAt === null ? 0 : ms(now - oldestCreatedAt));
 }
