@@ -8,6 +8,7 @@
     "dev": "node --watch src/server.js",
     "check": "find src scripts -name '*.js' -print0 | xargs -0 -n1 node --check",
     "test": "node --test --test-timeout=30000",
+    "test:redis": "node --test --test-timeout=30000 test/store.test.js test/replicaStore.test.js",
     "lint": "eslint src scripts",
     "verify-provenance": "node scripts/verify-provenance.js",
     "boot-smoke-test": "node scripts/boot-smoke-test.js"
