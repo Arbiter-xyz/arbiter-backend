@@ -238,7 +238,7 @@ async function runInvokeAsAdmin(method, scValArgs, admin) {
         const account = await srv.getAccount(admin.publicKey());
         const contract = new Contract(getContractId());
 
-        const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
+        const tx = new TransactionBuilder(account, { fee: config.adminTxFeeStroops, networkPassphrase: config.networkPassphrase })
           .addOperation(contract.call(method, ...scValArgs))
           .setTimeout(60)
           .build();
@@ -353,7 +353,7 @@ export async function simulateRead(method, scValArgs = []) {
         const admin = getAdminKeypair();
         const account = await srv.getAccount(admin.publicKey());
         const contract = new Contract(getContractId());
-        const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
+        const tx = new TransactionBuilder(account, { fee: config.adminTxFeeStroops, networkPassphrase: config.networkPassphrase })
           .addOperation(contract.call(method, ...scValArgs))
           .setTimeout(60)
           .build();

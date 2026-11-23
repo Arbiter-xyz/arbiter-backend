@@ -216,6 +216,9 @@ export const config = Object.freeze({
   // Full ordered list of configured RPC endpoints (primary first).
   sorobanRpcUrls: Object.freeze(sorobanRpcUrls),
   networkPassphrase: process.env.NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015',
+  // Fee (in stroops) for admin-signed contract calls and read simulations
+  // (#563). Default 1000000 = 0.1 XLM; raise it during network fee spikes.
+  adminTxFeeStroops: String(Math.max(100, Math.trunc(num(process.env.ADMIN_TX_FEE_STROOPS, 1_000_000)))),
 
   // Which deployment this process is (#150): 'demo' (disposable) or
   // 'sandbox' (long-lived developer sandbox). Surfaced so /health and the
