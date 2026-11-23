@@ -256,13 +256,23 @@ export function requireRole(...roles) {
 export function createInvoiceBilledAccount({ createAccount, store }) {
   return async function provisionInvoiceBilledAccount(req, res) {
     const { amount } = req.body || {};
-    const credit = Number(amount);
-    if (!Number.isFinite(credit) || credit <= 0) {
-      return res.status(400).json({ error: 'amount must be a positive number of credits' });
+    const credit = typeof amount === 'number' || (typeof amount === 'string' && amount.trim() !== '') ? Number(amount) : NaN;
+    if (!Number.isSafeInteger(credit) || credit <= 0) {
+      return res.status(400).json({ error: 'amount must be a positive integer number of credits' });
     }
 
     const account = await createAccount();
-    await store.incrBy(`credit:${account.accountId}`, credit);
+    try {
+      await store.incrBy(`credit:${account.accountId}`, credit);
+    } catch (err) {
+      if (store && typeof store.delete === 'function') {
+        const keyHash = typeof store.get === 'function' ? await store.get(`account-key:${account.accountId}`).catch(() => null) : null;
+        await store.delete(`account:${account.accountId}`).catch(() => {});
+        await store.delete(`account-key:${account.accountId}`).catch(() => {});
+        if (keyHash) await store.delete(`apikey:${keyHash}`).catch(() => {});
+      }
+      throw err;
+    }
 
     // One-time reveal: the raw key is returned here and nowhere else.
     return res.status(201).json({
