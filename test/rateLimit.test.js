@@ -54,4 +54,60 @@ test('settleClaudeBudget charges additional delta when actual cost exceeds reser
   assert.equal(await claudeBudgetSpent(), baseline);
 });
 
+test('reserveClaudeBudget within budget returns true and increases spend by the amount', async () => {
+  const baseline = await claudeBudgetSpent();
+  const allowed = await reserveClaudeBudget(7);
+  assert.equal(allowed, true);
+  assert.equal(await claudeBudgetSpent(), baseline + 7, 'store.incr must honour the amount argument');
 
+  await settleClaudeBudget(7, 0);
+  assert.equal(await claudeBudgetSpent(), baseline);
+});
+
+test('reserveClaudeBudget beyond budget returns false', async () => {
+  const baseline = await claudeBudgetSpent();
+  const remaining = await claudeBudgetRemaining();
+
+  // Reserve more than what is left in the window.
+  const allowed = await reserveClaudeBudget(remaining + 1);
+  assert.equal(allowed, false);
+
+  // The over-budget reservation is still recorded by the store; clean it up.
+  await settleClaudeBudget(remaining + 1, 0);
+  assert.equal(await claudeBudgetSpent(), baseline);
+});
+
+test('claudeBudgetRemaining never goes below 0', async () => {
+  const baseline = await claudeBudgetSpent();
+  const remaining = await claudeBudgetRemaining();
+
+  // Push spend past the configured budget.
+  await reserveClaudeBudget(remaining + 50);
+  assert.equal(await claudeBudgetRemaining(), 0);
+
+  await settleClaudeBudget(remaining + 50, 0);
+  assert.equal(await claudeBudgetSpent(), baseline);
+});
+
+test('env overrides CLAUDE_FLEET_BUDGET_CENTS and CLAUDE_FLEET_WINDOW_MS are honoured', async () => {
+  const prevBudget = process.env.CLAUDE_FLEET_BUDGET_CENTS;
+  const prevWindow = process.env.CLAUDE_FLEET_WINDOW_MS;
+  process.env.CLAUDE_FLEET_BUDGET_CENTS = '100';
+  process.env.CLAUDE_FLEET_WINDOW_MS = '60000';
+  try {
+    const baseline = await claudeBudgetSpent();
+    assert.equal(await claudeBudgetRemaining(), 100 - baseline);
+
+    assert.equal(await reserveClaudeBudget(100 - baseline), true);
+    assert.equal(await claudeBudgetRemaining(), 0);
+    assert.equal(await reserveClaudeBudget(1), false);
+
+    await settleClaudeBudget(100 - baseline, 0);
+    assert.equal(await claudeBudgetSpent(), baseline);
+  } finally {
+    if (prevBudget === undefined) delete process.env.CLAUDE_FLEET_BUDGET_CENTS;
+    else process.env.CLAUDE_FLEET_BUDGET_CENTS = prevBudget;
+    if (prevWindow === undefined) delete process.env.CLAUDE_FLEET_WINDOW_MS;
+    else process.env.CLAUDE_FLEET_WINDOW_MS = prevWindow;
+  }
+});
