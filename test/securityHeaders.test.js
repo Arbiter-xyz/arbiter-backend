@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildCsp, securityHeaders } from '../src/securityHeaders.js';
+import { buildCsp, securityHeaders, securityHeadersMiddleware } from '../src/securityHeaders.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -33,6 +33,44 @@ test('securityHeaders includes the four required headers, and HSTS can be disabl
   assert.equal(h['X-Frame-Options'], 'DENY');
   assert.match(h['Strict-Transport-Security'], /^max-age=\d+/);
   assert.equal(securityHeaders({ hsts: false })['Strict-Transport-Security'], undefined);
+});
+
+function fakeRes() {
+  const headers = {};
+  return {
+    headers,
+    setHeader(name, value) {
+      headers[name] = value;
+    },
+  };
+}
+
+test('securityHeadersMiddleware sets every header from securityHeaders() and calls next()', () => {
+  const expected = securityHeaders();
+  const res = fakeRes();
+  let nextCalls = 0;
+  securityHeadersMiddleware()({}, res, () => {
+    nextCalls += 1;
+  });
+  assert.deepEqual(res.headers, expected);
+  assert.equal(nextCalls, 1);
+});
+
+test('securityHeadersMiddleware with hsts:false omits Strict-Transport-Security', () => {
+  const res = fakeRes();
+  let nextCalls = 0;
+  securityHeadersMiddleware({ hsts: false })({}, res, () => {
+    nextCalls += 1;
+  });
+  assert.equal(res.headers['Strict-Transport-Security'], undefined);
+  assert.equal(res.headers['X-Content-Type-Options'], 'nosniff');
+  assert.equal(nextCalls, 1);
+});
+
+test('securityHeadersMiddleware includes extra connectSrc values in CSP', () => {
+  const res = fakeRes();
+  securityHeadersMiddleware({ connectSrc: ['https://ui.example.com'] })({}, res, () => {});
+  assert.match(res.headers['Content-Security-Policy'], /connect-src 'self' https:\/\/ui\.example\.com/);
 });
 
 describe('headers on live responses', () => {
