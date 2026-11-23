@@ -75,6 +75,22 @@ const job = await arbiter.waitForResult(jobId);
 
 `ask(question, options)` picks the API-key or metered path automatically based on what you pass it.
 
+#### Idempotency-Key on `POST /oracle`
+
+The 402 challenge step accepts an optional `Idempotency-Key` request header. Send it when you might retry the same challenge request (network blip, timeout, user double-click) so a retry returns the same challenge instead of minting a new `questionId` you'd then have to pay for twice.
+
+```sh
+curl -X POST http://localhost:4000/oracle \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 6f1c2b9e-3a4d-4e8f-9b2a-1c7d5e0f8a11' \
+  -d '{"question":"Is the venue wheelchair accessible?","tier":"priority"}'
+# → 402 with the challenge JSON (questionId, amountStroops, contractId, ...)
+```
+
+- **When to send it:** only on the challenge request that returns `402`. Use a fresh key per logical question (e.g. `crypto.randomUUID()`); reuse the same key for retries of that request. The SDK does this for you when you pass `idempotencyKey` to `requestChallenge`.
+- **How long keys are remembered:** for the pending-question TTL (`pendingQuestionTtlMs` on the server), the same window during which an unpaid challenge stays valid. After it expires, the key is forgotten and a request with it issues a fresh challenge.
+- **What a replay returns:** the cached `402` challenge body from the first request (same `questionId`, amount, and contract), so you can safely pay and call `submitPayment` with the original `questionId`. Requests without the header are never cached and always issue a new challenge.
+
 ### Undo window
 
 Paid non-instant questions are held for a few seconds (`status: 'holding'`, until `cancellableUntil`) before workers see them. During that window:
