@@ -42,10 +42,12 @@ const collectors = new Map(); // questionId -> { submissions: Map<workerId, answ
 // transport to a single subscribe/publish pair with no consumer-group
 // bookkeeping. The channel is keyed by questionId, so the owning instance
 // subscribes to exactly the questions it dispatched.
-const ANSWER_CHANNEL_PREFIX = 'quorum:answer:';
-
-function answerChannel(questionId) {
-  return ANSWER_CHANNEL_PREFIX + questionId;
+//
+// This is the single channel-name function for answer routing (issue #560):
+// every publisher and subscriber must build the name here, from
+// config.quorum.channelPrefix, so instances can never disagree on it.
+export function answerChannel(questionId) {
+  return config.quorum.channelPrefix + String(questionId);
 }
 
 // questionId -> unsubscribe handle for the pub/sub subscription owned by
