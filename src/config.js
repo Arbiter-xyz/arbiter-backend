@@ -548,6 +548,7 @@ export const config = Object.freeze({
   alerting: Object.freeze({
     webhookUrl: process.env.ALERT_WEBHOOK_URL || '',
     treasuryMinUsdc: num(process.env.ALERT_TREASURY_MIN_USDC, null),
+    treasuryMinXlm: num(process.env.ALERT_TREASURY_MIN_XLM, null),
     treasuryIntervalMs: num(process.env.ALERT_TREASURY_INTERVAL_MS, 5 * 60 * 1000),
   }),
 
