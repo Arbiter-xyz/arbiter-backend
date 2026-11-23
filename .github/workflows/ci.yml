@@ -49,13 +49,28 @@ jobs:
       # a missing/renamed export or other cross-module wiring break.
       - run: npm run boot-smoke-test
       - run: npm test
-      - name: MCP server tests
-        working-directory: mcp-server
-        run: |
-          npm ci
-          npm test
       - name: Dependency audit (fails only on high/critical)
         run: npm audit --omit=dev --audit-level=high
+
+  # MCP server tests run in their own job (#568) so a red root lint/test
+  # cannot skip them, and they surface as a distinct PR check.
+  mcp-server:
+    name: MCP server tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mcp-server/package-lock.json
+      - name: Install dependencies
+        working-directory: mcp-server
+        run: npm ci
+      - name: Run MCP server tests
+        working-directory: mcp-server
+        run: npm test
 
   # Proves the Redis-backed store path (not the in-memory fallback) is correct
   # under real multi-process concurrent load. A real Redis service container is
