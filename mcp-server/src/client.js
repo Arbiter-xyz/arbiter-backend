@@ -12,13 +12,23 @@ export class ArbiterError extends Error {
   }
 }
 
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+function resolveTimeoutMs(explicit) {
+  if (explicit !== undefined && explicit !== null) return explicit;
+  const fromEnv = Number(process.env.ARBITER_TIMEOUT_MS);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  return DEFAULT_TIMEOUT_MS;
+}
+
 export class ArbiterClient {
-  constructor({ baseUrl, apiKey, fetchImpl = globalThis.fetch, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
+  constructor({ baseUrl, apiKey, fetchImpl = globalThis.fetch, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), timeoutMs }) {
     if (!baseUrl) throw new Error('baseUrl is required');
     this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.apiKey = apiKey || '';
     this.fetch = fetchImpl;
     this.sleep = sleep;
+    this.timeoutMs = resolveTimeoutMs(timeoutMs);
   }
 
   async #request(method, path, { body, auth = false } = {}) {
@@ -28,8 +38,16 @@ export class ArbiterClient {
 
     let res;
     try {
-      res = await this.fetch(this.baseUrl + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+      res = await this.fetch(this.baseUrl + path, {
+        method,
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
     } catch (err) {
+      if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+        throw new ArbiterError(`request to Arbiter at ${this.baseUrl} timed out after ${this.timeoutMs}ms`);
+      }
       throw new ArbiterError(`could not reach Arbiter at ${this.baseUrl}: ${err.message}`);
     }
     const text = await res.text();

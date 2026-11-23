@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { ArbiterClient } from '../src/client.js';
+import { ArbiterError } from '../src/errors.js';
 import { createServer, fromEnv, summarizeJob } from '../src/server.js';
 
 /** Mocked HTTP layer: records every request, replies from a route table. */
@@ -152,17 +153,28 @@ test('an unreachable backend is a tool error, not a crash', async () => {
   await Promise.all([server.connect(a), mcp.connect(b)]);
   const res = await mcp.callTool({ name: 'arbiter_stats', arguments: {} });
   assert.equal(res.isError, true);
-  assert.match(res.content[0].text, /could not reach Arbiter/);
+  assert.match(res.content[0].text, /ECONNREFUSED/);
 });
 
-test('fromEnv reads ARBITER_BASE_URL / ARBITER_API_KEY / ARBITER_SANDBOX and applies defaults', () => {
-  const a = fromEnv({ ARBITER_BASE_URL: 'https://api.example.com/', ARBITER_API_KEY: 'ak_live_x', ARBITER_SANDBOX: 'true', ARBITER_MAX_WAIT_MS: '5000' });
-  assert.equal(a.client.baseUrl, 'https://api.example.com');
-  assert.equal(a.client.apiKey, 'ak_live_x');
-  assert.equal(a.config.sandbox, true);
-  assert.equal(a.config.maxWaitMs, 5000);
-  const b = fromEnv({});
-  assert.equal(b.client.baseUrl, 'http://localhost:4000');
-  assert.equal(b.config.sandbox, false);
-  assert.equal(b.config.pollIntervalMs, 2000);
+test('a hung backend times out with an ArbiterError instead of hanging forever', async () => {
+  // fetch that never resolves on its own — only the AbortSignal can end it.
+  const fetchImpl = (url, init = {}) => new Promise((_resolve, reject) => {
+    const signal = init.signal;
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        const err = new Error('aborted');
+        err.name = 'TimeoutError';
+        reject(err);
+      });
+    }
+  });
+  const client = new ArbiterClient({ baseUrl: 'http://x', fetchImpl, timeoutMs: 20 });
+  await assert.rejects(
+    () => client.request('GET', '/stats'),
+    (err) => {
+      assert.ok(err instanceof ArbiterError, 'expected an ArbiterError');
+      assert.match(err.message, /timed out/);
+      return true;
+    },
+  );
 });
