@@ -27,6 +27,7 @@ import {
   feeBumpWithdrawBalance,
 } from './sponsor.js';
 import { getStashedQuestion, nextQuestionId } from './pendingQuestions.js';
+import { validateQuestion } from './questionValidation.js';
 import { getOwedOnChain, getStakeOnChain, getLatestLedgerSequence, isInsufficientBalanceError } from './stellarClient.js';
 import { askMetered, getMeteredBalance, depositInstructions } from './metered.js';
 import { getLeaderboard } from './leaderboard.js';
@@ -343,12 +344,8 @@ app.get('/stats', async (req, res) => {
 // generous than the paid flow, but not unlimited) since it's free to call.
 app.post('/oracle/sandbox', refuseWhileDraining, rateLimited('sandbox', byIp), async (req, res) => {
   const { question, tier, simulate } = req.body || {};
-  if (!question || typeof question !== 'string') {
-    return res.status(400).json({ error: 'body.question (string) is required' });
-  }
-  if (question.length > config.maxQuestionLength) {
-    return res.status(400).json({ error: `body.question must be at most ${config.maxQuestionLength} characters` });
-  }
+  const questionError = validateQuestion(question);
+  if (questionError) return res.status(400).json({ error: questionError });
   try {
     const questionId = (await nextQuestionId()).toString();
     const challenge = issueSandboxChallenge(questionId, question, tier);
@@ -401,13 +398,15 @@ app.post('/oracle', refuseWhileDraining, rateLimited('oracle', byIp), async (req
   const createsQuestion = Boolean(apiKeyAccountId || payerAddress || !questionId || !paymentTx);
   if (createsQuestion && (await rejectIfDispatchPaused(res))) return;
 
+  // Every question-creating branch below (API key, metered, classic step 1)
+  // validates the question first; step 2 of the classic flow reuses the
+  // question already stashed at step 1, so it is exempt.
+  if (createsQuestion) {
+    const questionError = validateQuestion(question);
+    if (questionError) return res.status(400).json({ error: questionError });
+  }
+
   if (apiKeyAccountId) {
-    if (!question || typeof question !== 'string') {
-      return res.status(400).json({ error: 'body.question (string) is required' });
-    }
-    if (question.length > config.maxQuestionLength) {
-      return res.status(400).json({ error: `body.question must be at most ${config.maxQuestionLength} characters` });
-    }
     if (!consensus.ok) return res.status(400).json({ error: consensus.error });
 
     // Reserve the worst-case (surge-capped) price up front — askMetered()
@@ -451,12 +450,6 @@ app.post('/oracle', refuseWhileDraining, rateLimited('oracle', byIp), async (req
   }
 
   if (payerAddress) {
-    if (!question || typeof question !== 'string') {
-      return res.status(400).json({ error: 'body.question (string) is required' });
-    }
-    if (question.length > config.maxQuestionLength) {
-      return res.status(400).json({ error: `body.question must be at most ${config.maxQuestionLength} characters` });
-    }
     if ((await verifySession(token)) !== payerAddress) {
       return res.status(401).json({ error: 'a valid session token for this address is required — see POST /payers/:address/session' });
     }
@@ -479,12 +472,6 @@ app.post('/oracle', refuseWhileDraining, rateLimited('oracle', byIp), async (req
   }
 
   if (!questionId || !paymentTx) {
-    if (!question || typeof question !== 'string') {
-      return res.status(400).json({ error: 'body.question (string) is required' });
-    }
-    if (question.length > config.maxQuestionLength) {
-      return res.status(400).json({ error: `body.question must be at most ${config.maxQuestionLength} characters` });
-    }
     if (!consensus.ok) return res.status(400).json({ error: consensus.error });
     try {
       const challenge = await issueChallengeIdempotent(question, tier, category, req.header('Idempotency-Key'), consensus.rule, { referralCode });

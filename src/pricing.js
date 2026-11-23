@@ -145,14 +145,25 @@ export function priorityQueueJumpMultiplier(tierKey) {
  * when a category has too little time-to-quorum history to trust a tuned
  * value — see tunedTimeoutMs(). Kept here (not in dispatch.js) so the tuning
  * function stays a pure function of (tier, history) with no dispatch coupling.
+ *
+ * Derived from PRICING_TIERS[...].timeoutMs (issue #561) so there is a single
+ * source of truth: changing a tier's timeoutMs above changes its tuning
+ * fallback here too.
  */
+// The instant tier is never dispatched, so its PRICING_TIERS.timeoutMs is 0
+// ("no quorum deadline"). A 0 fallback would be a useless tuned timeout, so
+// tunedTimeoutMs() falls back to the default (standard) tier's timeout for
+// instant instead — the same 45s value this table has always used for it.
+const TIER_TIMEOUT_OVERRIDES_MS = Object.freeze({
+  instant: PRICING_TIERS[DEFAULT_TIER_KEY].timeoutMs,
+});
+
 export const TIER_TIMEOUT_MS = Object.freeze(
-  Object.assign(Object.create(null), {
-    instant: 45_000,
-    standard: 45_000,
-    express: 12_000,
-    priority: 30_000,
-  }),
+  Object.assign(
+    Object.create(null),
+    Object.fromEntries(Object.values(PRICING_TIERS).map((tier) => [tier.key, tier.timeoutMs])),
+    TIER_TIMEOUT_OVERRIDES_MS,
+  ),
 );
 
 // Minimum number of recorded time-to-quorum samples before a category's tuned

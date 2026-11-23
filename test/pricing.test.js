@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PRICING_TIERS, surgeMultiplier, priceForTier, resolveTier, DEFAULT_TIER_KEY } from '../src/pricing.js';
+import { PRICING_TIERS, surgeMultiplier, priceForTier, resolveTier, DEFAULT_TIER_KEY, TIER_TIMEOUT_MS, tunedTimeoutMs } from '../src/pricing.js';
 
 // Regression coverage: resolveTier used a plain bracket lookup, so a
 // caller-supplied tierKey of "__proto__" resolved Object.prototype itself
@@ -269,4 +269,27 @@ test('property: fund-accounting invariant holds for pathological escrow/worker c
     const { share, fee, dust } = splitEscrow(escrowed, workers, feeBps);
     assertFundAccountingInvariant(escrowed, workers, share, fee, dust);
   }
+});
+
+// Issue #561: TIER_TIMEOUT_MS is derived from PRICING_TIERS, not a second
+// hand-maintained table, so the two can never silently drift apart.
+test('TIER_TIMEOUT_MS mirrors every dispatched tier\'s PRICING_TIERS.timeoutMs', () => {
+  assert.deepEqual(Object.keys(TIER_TIMEOUT_MS).sort(), Object.keys(PRICING_TIERS).sort());
+  for (const tier of Object.values(PRICING_TIERS)) {
+    if (tier.instant) continue;
+    assert.equal(TIER_TIMEOUT_MS[tier.key], tier.timeoutMs, `${tier.key} timeout must come from PRICING_TIERS`);
+  }
+});
+
+test('the instant tier\'s tuning fallback is the explicit default-tier override, not its 0 dispatch timeout', () => {
+  assert.equal(PRICING_TIERS.instant.timeoutMs, 0);
+  assert.equal(TIER_TIMEOUT_MS.instant, PRICING_TIERS[DEFAULT_TIER_KEY].timeoutMs);
+});
+
+test('tunedTimeoutMs falls back to the unchanged static per-tier defaults with too little history', () => {
+  assert.equal(tunedTimeoutMs('instant', []), 45_000);
+  assert.equal(tunedTimeoutMs('standard', []), 45_000);
+  assert.equal(tunedTimeoutMs('express', [1, 2]), 12_000);
+  assert.equal(tunedTimeoutMs('priority', undefined), 30_000);
+  assert.equal(tunedTimeoutMs('not-a-real-tier', []), 45_000);
 });

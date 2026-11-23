@@ -27,30 +27,6 @@ export function isInsufficientBalanceError(err) {
 import { store } from './store.js';
 import { createSignerLock } from './canary.js';
 
-/** Chaos fault injection: env-gated, inert unless CHAOS_FAULT is set to a
- * recognized scenario. Follows config.js's "everything is an env var with a
- * safe default" convention — the default (unset) leaves every code path
- * byte-for-byte identical to before this existed. Never reachable in
- * production: config.chaosFault is only honored when config.chaosEnabled is
- * true, which itself requires an explicit env opt-in. */
-function chaosFault() {
-  if (!config.chaosEnabled) return null;
-  return config.chaosFault || null;
-}
-
-/** Wraps a Soroban RPC call so a chaos scenario can inject a transient
- * failure at exactly the seam retry.js already wraps. When no fault is
- * configured this is a pass-through with zero behavioral change. */
-async function withChaosFault(operation, fn) {
-  const fault = chaosFault();
-  if (fault === `rpc-timeout:${operation}` || fault === `rpc-timeout:${operation}:once`) {
-    const err = new Error(`chaos: injected RPC timeout during ${operation}`);
-    err.code = 'CHAOS_INJECTED_TIMEOUT';
-    throw err;
-  }
-  return fn();
-}
-
 let server = null;
 export function getServer() {
   if (!server) {
