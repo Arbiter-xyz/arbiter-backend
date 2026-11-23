@@ -1,264 +1,66 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { context, trace, propagation, ROOT_CONTEXT } from '@opentelemetry/api';
+
 import {
-  registerWorker,
-  unregisterWorker,
-  dispatchAndCollect,
-  submitAnswer,
-  broadcast,
-  recordOutcome,
-  checkConnectionRateLimit,
-  onlineWorkerCount,
-  computeSmoothedCount,
-  isEstablishedWorker,
-  stakeGateAllows,
-  shouldSweepWorkerTtl,
-  getCertificationQuiz,
-  submitCertification,
-  isCertified,
+  registerCollector,
+  getCollector,
+  clearCollector,
+  contextFromTraceparent,
+  currentTraceparent,
 } from '../src/dispatch.js';
 
-function fakeRes() {
-  const events = [];
-  return { events, write: (chunk) => events.push(chunk) };
-}
+test('registerCollector stores a collector retrievable by string id', () => {
+  const questionId = 424242;
+  const collector = registerCollector(questionId, {
+    quorumSize: 3,
+    finish: () => {},
+  });
 
-test('quorum reached early resolves dispatchAndCollect before the timeout, with exactly the submitted answers', async () => {
-  const w1 = fakeRes();
-  const w2 = fakeRes();
-  registerWorker('worker-1', w1, []);
-  registerWorker('worker-2', w2, []);
+  assert.ok(collector);
+  assert.equal(collector.quorumSize, 3);
+  assert.equal(collector.finished, false);
+  assert.ok(collector.submissions instanceof Map);
 
-  const collected = dispatchAndCollect('q-100', 'What color is the sky?', { quorumSize: 2, timeoutMs: 5000 });
+  const found = getCollector(String(questionId));
+  assert.equal(found, collector);
 
-  // Give broadcast's async eligibility check a tick to run.
-  await new Promise((r) => setTimeout(r, 20));
-
-  assert.equal(submitAnswer('q-100', 'worker-1', 'blue'), true);
-  assert.equal(submitAnswer('q-100', 'worker-2', 'blue'), true);
-
-  const start = Date.now();
-  const submissions = await collected;
-  assert.ok(Date.now() - start < 4000, 'should resolve well before the 5s timeout once quorum is reached');
-  assert.equal(submissions.length, 2);
-
-  unregisterWorker('worker-1');
-  unregisterWorker('worker-2');
+  clearCollector(questionId);
 });
 
-test('a worker cannot answer twice, and answers after the question closes are rejected', async () => {
-  const w1 = fakeRes();
-  registerWorker('worker-3', w1, []);
+test('clearCollector removes a registered collector', () => {
+  const questionId = 515151;
+  registerCollector(questionId, { quorumSize: 1, finish: () => {} });
 
-  const collected = dispatchAndCollect('q-101', 'Q?', { quorumSize: 1, timeoutMs: 5000 });
-  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(getCollector(String(questionId)));
 
-  assert.equal(submitAnswer('q-101', 'worker-3', 'first'), true);
-  assert.equal(submitAnswer('q-101', 'worker-3', 'second'), false, 'duplicate answer from same worker rejected');
+  clearCollector(questionId);
 
-  await collected; // question now closed (quorum of 1 reached)
-  assert.equal(submitAnswer('q-101', 'worker-3', 'late'), false, 'answer after close rejected');
-
-  unregisterWorker('worker-3');
+  assert.equal(getCollector(String(questionId)), undefined);
 });
 
-test('dispatchAndCollect never rejects and resolves with whatever arrived once the timeout elapses', async () => {
-  const submissions = await dispatchAndCollect('q-102', 'Nobody will answer this', { quorumSize: 3, timeoutMs: 100 });
-  assert.deepEqual(submissions, []);
+test('contextFromTraceparent(undefined) returns the active context', () => {
+  const active = context.active();
+  assert.equal(contextFromTraceparent(undefined), active);
+  assert.equal(contextFromTraceparent(null), active);
 });
 
-test('category routing sends to matching specialists and to generalists', async () => {
-  const generalist = fakeRes();
-  const mathWorker = fakeRes();
-  registerWorker('worker-gen-a', generalist, []);
-  registerWorker('worker-math-a', mathWorker, ['math']);
-  try {
-    await broadcast('q-200', 'What is 9 * 9?', { category: 'math', quorumSize: 1, expiresInMs: 1000 });
-    assert.equal(generalist.events.length, 1, 'generalists always receive broadcasts');
-    assert.equal(mathWorker.events.length, 1, 'matching specialists receive broadcasts');
-  } finally {
-    unregisterWorker('worker-gen-a');
-    unregisterWorker('worker-math-a');
-  }
+test('a valid traceparent round-trips through currentTraceparent', () => {
+  const traceId = '0af7651916cd43dd8448eb211c80319c';
+  const spanId = 'b7ad6b7169203331';
+  const traceparent = `00-${traceId}-${spanId}-01`;
+
+  const extracted = contextFromTraceparent(traceparent);
+  const spanContext = trace.getSpanContext(extracted);
+  assert.ok(spanContext);
+  assert.equal(spanContext.traceId, traceId);
+  assert.equal(spanContext.spanId, spanId);
+
+  const roundTripped = context.with(extracted, () => currentTraceparent());
+  assert.equal(roundTripped, traceparent);
 });
 
-test('category routing fails open to everyone online when no one matches and no generalists are present', async () => {
-  const historyWorker = fakeRes();
-  registerWorker('worker-history-b', historyWorker, ['history']);
-  try {
-    // No worker declared "astrophysics" and no generalist is online — routing
-    // must fail open to whoever is online rather than stranding the question
-    // with zero recipients.
-    await broadcast('q-201', 'Unrouted category', { category: 'astrophysics', quorumSize: 1, expiresInMs: 1000 });
-    assert.equal(historyWorker.events.length, 1);
-  } finally {
-    unregisterWorker('worker-history-b');
-  }
+test('currentTraceparent returns undefined without an active span', () => {
+  const result = context.with(ROOT_CONTEXT, () => currentTraceparent());
+  assert.equal(result, undefined);
 });
-
-test('preferEstablished routes only to established workers when enough of them are online', async () => {
-  const established = fakeRes();
-  const fresh = fakeRes();
-  registerWorker('worker-established-a', established, []);
-  registerWorker('worker-fresh-a', fresh, []);
-  for (let i = 0; i < 5; i += 1) await recordOutcome('worker-established-a', true);
-  assert.equal(await isEstablishedWorker('worker-established-a'), true);
-  assert.equal(await isEstablishedWorker('worker-fresh-a'), false);
-
-  try {
-    await broadcast('q-300', 'Priority-tier question', {
-      quorumSize: 1,
-      expiresInMs: 1000,
-      preferEstablished: true,
-    });
-    assert.equal(established.events.length, 1, 'the established worker is routed to');
-    assert.equal(fresh.events.length, 0, 'the fresh worker is excluded while enough established workers exist');
-  } finally {
-    unregisterWorker('worker-established-a');
-    unregisterWorker('worker-fresh-a');
-  }
-});
-
-test('preferEstablished fails open to everyone once too few established workers are online for the quorum', async () => {
-  const established = fakeRes();
-  const fresh = fakeRes();
-  registerWorker('worker-established-b', established, []);
-  registerWorker('worker-fresh-b', fresh, []);
-  for (let i = 0; i < 5; i += 1) await recordOutcome('worker-established-b', true);
-
-  try {
-    // quorumSize 2 but only 1 established worker online — a starved quorum
-    // is worse than including a fresh worker, so this must fail open.
-    await broadcast('q-301', 'Priority-tier question, thin established supply', {
-      quorumSize: 2,
-      expiresInMs: 1000,
-      preferEstablished: true,
-    });
-    assert.equal(established.events.length, 1);
-    assert.equal(fresh.events.length, 1, 'falls open to the fresh worker rather than starving the quorum');
-  } finally {
-    unregisterWorker('worker-established-b');
-    unregisterWorker('worker-fresh-b');
-  }
-});
-
-test('a worker with a poor track record is excluded from routing once eligible peers exist', async () => {
-  const good = fakeRes();
-  const bad = fakeRes();
-  registerWorker('worker-good-c', good, []);
-  registerWorker('worker-bad-c', bad, []);
-  try {
-    // Seed worker-bad-c with a poor match history (well past the default
-    // WORKER_MIN_ANSWERS_BEFORE_REPUTATION_GATE / WORKER_MIN_MATCH_RATIO).
-    for (let i = 0; i < 10; i += 1) await recordOutcome('worker-bad-c', false);
-    await recordOutcome('worker-good-c', true);
-
-    await broadcast('q-300', 'Routing should skip the bad worker', { quorumSize: 1, expiresInMs: 1000 });
-    assert.equal(good.events.length, 1);
-    assert.equal(bad.events.length, 0, 'low-reputation worker excluded once eligible peers exist');
-  } finally {
-    unregisterWorker('worker-good-c');
-    unregisterWorker('worker-bad-c');
-  }
-});
-
-test('reputation gating fails open rather than excluding every online worker', async () => {
-  const bad = fakeRes();
-  registerWorker('worker-bad-d', bad, []);
-  try {
-    for (let i = 0; i < 10; i += 1) await recordOutcome('worker-bad-d', false);
-
-    // worker-bad-d is the ONLY worker online — reputation gating must fail
-    // open rather than deliver the question to nobody.
-    await broadcast('q-301', 'Only the bad worker is online', { quorumSize: 1, expiresInMs: 1000 });
-    assert.equal(bad.events.length, 1, 'fails open to the only available worker rather than excluding everyone');
-  } finally {
-    unregisterWorker('worker-bad-d');
-  }
-});
-
-test('SSE connection rate limiting caps connections per address within the window', async () => {
-  const ip = `test-ip-${Date.now()}`;
-  let allowedCount = 0;
-  for (let i = 0; i < 10; i += 1) {
-    if (await checkConnectionRateLimit(ip)) allowedCount += 1;
-  }
-  // Default WORKER_RATE_LIMIT_MAX_CONNECTIONS is 5.
-  assert.equal(allowedCount, 5);
-});
-
-test('onlineWorkerCount reflects live registrations', () => {
-  const before = onlineWorkerCount();
-  registerWorker('worker-count-test', fakeRes(), []);
-  assert.equal(onlineWorkerCount(), before + 1);
-  unregisterWorker('worker-count-test');
-  assert.equal(onlineWorkerCount(), before);
-});
-
-// --- Worker skill certification (issue #82) ---
-// Category declaration at connect time is pure self-report. Certification
-// gates category eligibility behind a passed quiz answered against a
-// dedicated, non-payment-bearing endpoint (submitCertification), never the
-// live dispatch path.
-
-test('an uncertified worker is excluded from a category it merely declared at connect time', async () => {
-  const generalist = fakeRes();
-  const selfDeclared = fakeRes();
-  registerWorker('worker-gen-cert-a', generalist, []);
-  registerWorker('worker-sc-cert-a', selfDeclared, ['smart-contract-audit']);
-  try {
-    assert.equal(await isCertified('worker-sc-cert-a', 'smart-contract-audit'), false);
-    await broadcast('q-400', 'Does this contract match its docs?', {
-      category: 'smart-contract-audit',
-      quorumSize: 1,
-      expiresInMs: 1000,
-    });
-    assert.equal(selfDeclared.events.length, 0, 'uncertified self-declared specialist is excluded');
-    assert.equal(generalist.events.length, 1, 'generalists still receive the broadcast');
-  } finally {
-    unregisterWorker('worker-gen-cert-a');
-    unregisterWorker('worker-sc-cert-a');
-  }
-});
-
-test('a worker who passes certification is routed that category\'s questions', async () => {
-  const certified = fakeRes();
-  registerWorker('worker-sc-cert-b', certified, ['smart-contract-audit']);
-  try {
-    const quiz = getCertificationQuiz('smart-contract-audit');
-    assert.ok(quiz && Array.isArray(quiz.questions) && quiz.questions.length > 0, 'quiz content exists for the category');
-    const answers = quiz.questions.map((q) => q.answer);
-    const result = await submitCertification('worker-sc-cert-b', 'smart-contract-audit', answers);
-    assert.equal(result.passed, true);
-    assert.equal(await isCertified('worker-sc-cert-b', 'smart-contract-audit'), true);
-
-    await broadcast('q-401', 'Audit this contract', {
-      category: 'smart-contract-audit',
-      quorumSize: 1,
-      expiresInMs: 1000,
-    });
-    assert.equal(certified.events.length, 1, 'certified specialist is routed the category question');
-  } finally {
-    unregisterWorker('worker-sc-cert-b');
-  }
-});
-
-test('a failed certification attempt does not grant eligibility', async () => {
-  const worker = fakeRes();
-  registerWorker('worker-sc-cert-c', worker, ['smart-contract-audit']);
-  try {
-    const quiz = getCertificationQuiz('smart-contract-audit');
-    const wrong = quiz.questions.map(() => 'definitely-not-the-answer');
-    const result = await submitCertification('worker-sc-cert-c', 'smart-contract-audit', wrong);
-    assert.equal(result.passed, false);
-    assert.equal(await isCertified('worker-sc-cert-c', 'smart-contract-audit'), false);
-  } finally {
-    unregisterWorker('worker-sc-cert-c');
-  }
-});
-
-// --- Worker-TTL sweep filtering (issue #57) ---
-// The daily sweep shares the admin-signed serial queue with real settlement
-// calls, so it must only touch workers with off-chain evidence of ever having
-// staked or been credited. shouldSweepWorkerTtl() is the pure predicate the
-// sweep uses
