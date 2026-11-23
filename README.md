@@ -63,6 +63,84 @@ own integration against a locally run instance:
 This keeps your integration independent of Arbiter's platform key and of
 any single hot key's funding.
 
+## Maintenance windows and dispatch pauses
+
+During a scheduled maintenance window or holiday, the backend can pause
+dispatch. While a pause is in effect, `POST /oracle` rejects new questions
+with `503 Service Unavailable` and a `Retry-After` header, and clients can
+poll `GET /maintenance` to see the pause and any upcoming windows.
+
+### `GET /maintenance`
+
+Public, like `/health` — no auth required. Returns the dispatch pause in
+effect (if any) and every scheduled maintenance/holiday window still ahead,
+so clients and workers can plan around them. Implemented in
+`src/server.js`; window scheduling lives in `maintenanceWindows.js`.
+
+Response fields:
+
+- `dispatchPaused` — boolean; `true` while a dispatch pause is in effect.
+- `reason` — present only when `dispatchPaused` is `true`; a human-readable
+  description of the pause.
+- `resumesAt` — present only when `dispatchPaused` is `true`; ISO 8601
+  timestamp at which dispatch is expected to resume.
+- `windows` — array of upcoming scheduled windows (serialized via
+  `serializeWindow`), each describing a maintenance/holiday window still
+  ahead of the current time.
+
+Not paused:
+
+```json
+{
+  "dispatchPaused": false,
+  "windows": [
+    {
+      "id": "holiday-2025-12-25",
+      "reason": "Christmas holiday",
+      "startsAt": "2025-12-25T00:00:00.000Z",
+      "endsAt": "2025-12-26T00:00:00.000Z"
+    }
+  ]
+}
+```
+
+Paused:
+
+```json
+{
+  "dispatchPaused": true,
+  "reason": "Scheduled maintenance",
+  "resumesAt": "2025-06-01T12:00:00.000Z",
+  "windows": []
+}
+```
+
+### `POST /oracle` during a pause
+
+While a dispatch pause is in effect, `POST /oracle` rejects the request with
+`503 Service Unavailable` and a `Retry-After` header (seconds to wait before
+retrying). The rejection helper lives alongside the route in `src/server.js`.
+
+```http
+HTTP/1.1 503 Service Unavailable
+Retry-After: 3600
+Content-Type: application/json
+
+{
+  "error": "Dispatch is paused for scheduled maintenance",
+  "resumesAt": "2025-06-01T12:00:00.000Z"
+}
+```
+
+### How clients should back off
+
+- On `503` from `POST /oracle`, honour the `Retry-After` header: wait at
+  least that many seconds before retrying. Do not retry in a tight loop.
+- Optionally poll `GET /maintenance` to learn when dispatch resumes
+  (`resumesAt`) and to see upcoming windows, rather than retrying blindly.
+- Once `dispatchPaused` is `false` (or `resumesAt` has passed), resume
+  normal submission.
+
 ## Fiat anchor routes (`/anchor/config`, `/anchor/report`)
 
 Arbiter is a **client** of one configured SEP-24/SEP-12 anchor (see
@@ -162,35 +240,6 @@ backend is the only thing serving the app.
 - **Configurable consensus rules** (`consensus.js`) — `consensusMode:
   'numeric-tolerance'` with `tolerance: { percent }` or `{ absolute }` on
   `POST /oracle` makes numeric answers ("42", "$42.00", "about 42") within
-  tolerance count as agreeing, without a Claude call. The default `'exact'`
-  mode is unchanged. The rule used is shown on `GET /oracle/:jobId`.
-- Cryptographic worker session auth (`workerAuth.js`) — an address-format
-  `workerId` must prove control of that key before submitting an answer.
-- A read-only admin/ops console (`/admin/*`, bearer-token gated) —
-  transactions, workers, payers, live on-chain treasury balance, fee
-  revenue, and fraud/trust monitoring. Its list/summary reads can go to a
-  Redis read replica (`REDIS_REPLICA_URL`, `replicaStore.js`) so an operator
-  browsing the console never competes with settlement for the primary; a
-  failing replica falls back to the primary, and `GET /admin/read-replica`
-  reports which one is in use and the replica's lag.
-- **Payer referrals (`payerReferrals.js`)** — a payer who passes a worker's
-  referral code (`body.referralCode` on `POST /oracle`) on their first
-  verified payment is attributed to that worker, once and permanently, with
-  an informational credit (`PAYER_REFERRAL_REWARD_BPS` of that payment)
-  listed at `GET /admin/referral-earnings`. Bookkeeping only: nothing is
-  paid out.
-- **Canary deployments ([docs/runbooks/canary-deployment.md](docs/runbooks/canary-deployment.md))** —
-  `INSTANCE_ROLE=canary` serves read-only traffic and never signs as the
-  platform key; a fleet-wide signer lock stops two instances racing the
-  platform account's sequence number; SIGTERM drains in-flight questions
-  before exit; `npm run canary:preflight` checks a canary matches the primary.
-- Every environment variable the code reads is documented in
-  [`.env.example`](.env.example); `npm run check:env` (run in CI) fails on drift.
-- A SEP-24/SEP-12 fiat anchor client (`anchorClient.js`) — Arbiter never
-  holds PII or bank details itself, only resolves and caches the
-  configured anchor's public `stellar.toml` for the frontend. See
-  [Fiat anchor routes](#fiat-anchor-routes-anchorconfig-anchorreport) for
-  the `/anchor/config` and `/anchor/report` endpoints.
-- **Billing (`billing.js`)** — the non-crypto onramp: a customer pays via
-  Stripe Checkout and is issued an API key instead of ever touching a
-  Stellar wallet. Every fiat-paid quest
+  tolerance count as agreein
+
+/* … truncated 2191 chars — edit only what you need near the top … */

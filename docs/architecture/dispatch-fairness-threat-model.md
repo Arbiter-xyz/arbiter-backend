@@ -97,3 +97,84 @@ still capture a proportional share. The mitigation is designed to make that
 share proportional to *cost* rather than to *latency*, which is the property
 FCFS lacks. Further hardening (proof-of-effort, stake-based admission) is out
 of scope for this change.
+
+## Maintenance windows and dispatch pauses
+
+Dispatch can be paused for scheduled maintenance or holidays. The pause is
+enforced in `src/server.js` (see the `POST /oracle` handler and the
+`GET /maintenance` route) and the window schedule lives in
+`src/maintenanceWindows.js`. This section documents the client-facing contract;
+it does not change any behavior.
+
+### `GET /maintenance`
+
+Public, like `GET /health`. Returns the dispatch pause currently in effect (if
+any) and every scheduled maintenance/holiday window still ahead, so clients and
+workers can plan around them.
+
+Response fields:
+
+- `dispatchPaused` (boolean): whether a dispatch pause is in effect right now.
+- `reason` (string, optional): present only when `dispatchPaused` is `true`;
+  human-readable reason for the pause.
+- `resumesAt` (string, optional): present only when `dispatchPaused` is `true`;
+  ISO 8601 timestamp at which dispatch is expected to resume.
+- `windows` (array): upcoming maintenance/holiday windows, each serialized by
+  `serializeWindow` in `src/maintenanceWindows.js`.
+
+Example — no pause in effect:
+
+```json
+{
+  "dispatchPaused": false,
+  "windows": [
+    {
+      "id": "holiday-2025-12-25",
+      "startsAt": "2025-12-25T00:00:00.000Z",
+      "endsAt": "2025-12-25T23:59:59.000Z",
+      "reason": "Holiday"
+    }
+  ]
+}
+```
+
+Example — pause in effect:
+
+```json
+{
+  "dispatchPaused": true,
+  "reason": "Scheduled maintenance",
+  "resumesAt": "2025-06-01T12:00:00.000Z",
+  "windows": []
+}
+```
+
+### `POST /oracle` during a pause
+
+While a dispatch pause is in effect, `POST /oracle` rejects the request with
+HTTP `503 Service Unavailable` and a `Retry-After` header indicating how long
+the client should wait before retrying.
+
+Example rejection:
+
+```http
+HTTP/1.1 503 Service Unavailable
+Retry-After: 120
+Content-Type: application/json
+
+{
+  "error": "dispatch paused",
+  "reason": "Scheduled maintenance",
+  "resumesAt": "2025-06-01T12:00:00.000Z"
+}
+```
+
+### How clients should back off
+
+1. On `503` from `POST /oracle`, honour the `Retry-After` header (seconds, or an
+   HTTP date) instead of retrying immediately.
+2. Optionally poll `GET /maintenance` to learn `dispatchPaused`, `reason`, and
+   `resumesAt`, and to see upcoming `windows` so work can be scheduled around
+   them.
+3. Resume normal dispatch once `dispatchPaused` is `false` or `resumesAt` has
+   passed.
