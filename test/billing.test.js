@@ -438,3 +438,20 @@ test('getProcessor selects the requested processor when more than one is configu
   assert.equal(getProcessor('coinbase')?.name, 'coinbase');
   assert.equal(getProcessor('does-not-exist'), null);
 });
+
+test('recordUsage sets a 31-day TTL on per-day usage counter keys (#516)', async () => {
+  const { recordUsage, USAGE_COUNTER_TTL_MS } = await import('../src/billing.js');
+  const { store } = await import('../src/store.js');
+  const ts = Date.UTC(2026, 10, 23, 12, 0, 0);
+  const key = 'usage:acct_ttl_test:/oracle:standard:2026-11-23';
+  await store.delete(key);
+  const before = Date.now();
+  await recordUsage('acct_ttl_test', '/oracle', 'standard', ts);
+  const after = Date.now();
+  assert.equal(await store.get(key), 1);
+  assert.equal(USAGE_COUNTER_TTL_MS, 31 * 24 * 60 * 60 * 1000);
+  const entry = store.map?.get(key);
+  if (entry) {
+    assert.ok(entry.expiresAt >= before + USAGE_COUNTER_TTL_MS && entry.expiresAt <= after + USAGE_COUNTER_TTL_MS);
+  }
+});
