@@ -160,9 +160,9 @@ backend is the only thing serving the app.
   `scripts/verify-provenance.js` lets anyone re-derive the consensus and
   check it against the on-chain payout.
 - **Startup security-posture check (`securityPosture.js`)**: a deployment
-  that looks like production refuses to start without `SESSION_SECRET`,
-  and logs a loud error for wide-open `ALLOWED_ORIGINS` or a non-TLS
-  `REDIS_URL`. Local dev with every default left alone stays silent.
+  that looks like production logs a loud error for an unset
+  `SESSION_SECRET`, wide-open `ALLOWED_ORIGINS`, or a non-TLS `REDIS_URL`.
+  Local dev with every default left alone stays silent.
 
 ## Client SDKs
 

@@ -478,4 +478,9 @@ export async function refundQuestion(questionId) {
  * and would have failed with a Soroban host error at submission time the
  * first time anyone wired them up. Whoever implements arbiter-contract#20
  * should reintroduce a batch helper here matching the real on-chain
- * signature (per-question id/matching/losing triples, per-entry outcomes). */
+ * signature (per-question id/matching/losing triples, per-entry outcomes).
+ *
+ * ABI decision (#422, resolving #263 vs #266): the contract has no batch
+ * entry points, so single-item resolve/refund is the only settlement path.
+ * Do not restore `resolve_batch`/`refund_batch` callers before the contract
+ * ships them. */

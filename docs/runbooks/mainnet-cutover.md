@@ -28,6 +28,18 @@ criterion is met.
 | `SPONSOR_KEY_REF` | Reference to the fee-sponsorship key in the custody system (never the raw key) |
 | `BACKEND_CONFIG_REV` | Git rev of the backend config being deployed |
 
+### On-chain ABI: batch settlement (#263 vs #266)
+
+**Resolved: the contract has no batch entry points.** `arbiter-contract`'s `src/lib.rs` exposes
+only single-item `resolve` and `refund`; `resolve_batch`/`refund_batch` do not exist (the batch
+entry point is still an open request, `arbiter-contract#20`). The backend therefore settles one
+question per transaction via `resolveQuestion()`/`refundQuestion()` in `src/stellarClient.js`, and
+the batch helpers that used to call `resolve_batch`/`refund_batch` were removed rather than kept as
+dead code that would fail with a Soroban host error on first use. Any PR that adds or restores a
+batch helper against those method names is rejected until the contract ships the entry point; when
+it does, the helper must match the real signature (per-question id/matching/losing triples,
+per-entry outcomes) and this table plus the cutover steps must be re-checked.
+
 ## Step 0 — Freeze and snapshot (both environments)
 
 1. Announce a change freeze; no merges to `main` for the duration.
@@ -237,6 +249,10 @@ admin signing is ever required. Do **not** run two active admin signers.
 | Admin-signed calls (resolve/refund/charge/touch) | **No** | Share the admin sequence number; active-passive only. |
 
 > Review note (#320): this runbook does not reference `resolve_batch` or `refund_batch`; its settlement-related steps only mention the single-item resolve/refund calls above. If batch settlement methods are added to the contract later, re-check this table and the cutover steps.
+
+> ABI note (#422): the #263-vs-#266 question is resolved — no batch entry points exist on-chain
+> today (see "On-chain ABI: batch settlement" above). Single-item resolve/refund is the only
+> settlement path; batch helpers must not be reintroduced until `arbiter-contract#20` lands.
 
 ### Out of scope
 
