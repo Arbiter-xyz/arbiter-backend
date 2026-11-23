@@ -194,20 +194,28 @@ export async function getTreasury() {
   if (!config.platformAddress) return { configured: false };
 
   const platform = await loadUsdcBalances(config.platformAddress);
-  const fiatPool = config.billing.fiatPoolAddress
-    ? await loadUsdcBalances(config.billing.fiatPoolAddress).catch(() => null)
-    : null;
+  let fiatPool = null;
+  let fiatPoolError = null;
+  if (config.billing.fiatPoolAddress) {
+    try {
+      const poolBalances = await loadUsdcBalances(config.billing.fiatPoolAddress);
+      fiatPool = {
+        address: config.billing.fiatPoolAddress,
+        xlmBalance: poolBalances.xlmBalance,
+        usdcBalance: poolBalances.usdcBalance,
+      };
+    } catch (err) {
+      fiatPoolError = err?.message || String(err);
+    }
+  }
 
   return {
     configured: true,
     platformAddress: config.platformAddress,
     xlmBalance: platform.xlmBalance,
     usdcBalance: platform.usdcBalance,
-    fiatPool: fiatPool && {
-      address: config.billing.fiatPoolAddress,
-      xlmBalance: fiatPool.xlmBalance,
-      usdcBalance: fiatPool.usdcBalance,
-    },
+    fiatPool,
+    ...(fiatPoolError ? { fiatPoolError } : {}),
   };
 }
 
