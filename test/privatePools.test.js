@@ -56,6 +56,23 @@ test('removing the last worker deletes the pool, so the payer is back on the ope
   assert.deepEqual(await getPrivatePool(payer), []);
 });
 
+test('emptying a pool removes the payer from the owner index', async () => {
+  const payer = addr();
+  const w = addr();
+  await addPoolWorkers(payer, [w]);
+  assert.ok((await getKnownPoolOwners()).includes(payer));
+  await removePoolWorkers(payer, [w]);
+  assert.ok(!(await getKnownPoolOwners()).includes(payer));
+});
+
+test('a partial removal leaves the payer in the owner index', async () => {
+  const payer = addr();
+  const [w1, w2] = [addr(), addr()];
+  await addPoolWorkers(payer, [w1, w2]);
+  await removePoolWorkers(payer, [w1]);
+  assert.ok((await getKnownPoolOwners()).includes(payer));
+});
+
 test('pools of different payers are independent', async () => {
   const [payerA, payerB] = [addr(), addr()];
   const [wa, wb] = [addr(), addr()];
