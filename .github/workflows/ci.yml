@@ -17,7 +17,7 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
-      - run: node scripts/check-env-example.js
+      - run: npm run check:env
       - name: Parse every file under src/
         run: |
           status=0
