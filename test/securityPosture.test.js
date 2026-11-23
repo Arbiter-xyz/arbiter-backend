@@ -107,6 +107,21 @@ describe('evaluateSecurityPosture', () => {
     assert.match(plain[0].message, /redis:\/\/ \(no TLS\)/);
   });
 
+  test('short ADMIN_TOKEN or ADMIN_TOKENS in production produces a finding (fatal below 16 chars, error below 32 chars), while 32+ chars or unset passes', () => {
+    const fatalRes = evaluateSecurityPosture({ ...SECURE_PROD, ADMIN_TOKEN: 'admin' });
+    assert.equal(fatalRes.findings.length, 1);
+    assert.equal(fatalRes.findings[0].setting, 'ADMIN_TOKEN');
+    assert.equal(fatalRes.findings[0].severity, 'fatal');
+
+    const errRes = evaluateSecurityPosture({ ...SECURE_PROD, ADMIN_TOKEN: 'a'.repeat(20) });
+    assert.equal(errRes.findings.length, 1);
+    assert.equal(errRes.findings[0].setting, 'ADMIN_TOKEN');
+    assert.equal(errRes.findings[0].severity, 'error');
+
+    const strongRes = evaluateSecurityPosture({ ...SECURE_PROD, ADMIN_TOKEN: 'a'.repeat(32) });
+    assert.deepEqual(strongRes.findings, []);
+  });
+
   test('a platform marker alone (no NODE_ENV) still catches a missing SESSION_SECRET', () => {
     const result = evaluateSecurityPosture({ RENDER: 'true', ALLOWED_ORIGINS: 'https://app.example.com', METRICS_TOKEN: 'm'.repeat(32) });
     assert.deepEqual(settingsOf(result), ['SESSION_SECRET']);

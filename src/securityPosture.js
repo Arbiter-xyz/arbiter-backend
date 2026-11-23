@@ -153,6 +153,24 @@ export function evaluateSecurityPosture(env) {
     });
   }
 
+  const adminTokens = [...(env.ADMIN_TOKENS || '').split(','), env.ADMIN_TOKEN || '']
+    .map((t) => t.trim())
+    .filter(Boolean);
+  const shortestAdminToken = adminTokens.reduce(
+    (min, t) => (min === null || t.length < min.length ? t : min),
+    null,
+  );
+  if (shortestAdminToken !== null && shortestAdminToken.length < 32) {
+    findings.push({
+      setting: 'ADMIN_TOKEN',
+      severity: shortestAdminToken.length < 16 ? 'fatal' : 'error',
+      message:
+        `Configured ADMIN_TOKEN / ADMIN_TOKENS contains a value of length ${shortestAdminToken.length} (< 32 characters), ` +
+        'which is too weak to gate unthrottled /admin/* routes in production. ' +
+        'Use at least 32 random characters, e.g. `openssl rand -hex 32`.',
+    });
+  }
+
   return { production, signals, findings };
 }
 
