@@ -67,14 +67,34 @@ function evaluateBalance(label, address, usdcBalance, minUsdc) {
   lowBalanceState.set(label, low);
 }
 
-export async function checkTreasuryBalance() {
+export function resetTreasuryAlertState() {
+  lowBalanceState.clear();
+}
+
+export async function checkTreasuryBalance({ getTreasuryFn = getTreasury } = {}) {
   const minUsdc = config.alerting.treasuryMinUsdc;
   if (minUsdc == null || !isAlertingConfigured()) return;
-  const treasury = await getTreasury();
+  const treasury = await getTreasuryFn();
   if (!treasury.configured) return;
   evaluateBalance('platform', treasury.platformAddress, treasury.usdcBalance, minUsdc);
   if (treasury.fiatPool) {
+    if (lowBalanceState.get('fiat_pool:unreachable')) {
+      logger.info({ address: treasury.fiatPool.address }, 'fiat-pool balance lookup recovered');
+      lowBalanceState.set('fiat_pool:unreachable', false);
+    }
     evaluateBalance('fiat_pool', treasury.fiatPool.address, treasury.fiatPool.usdcBalance, minUsdc);
+  } else if (treasury.fiatPoolError || config.billing.fiatPoolAddress) {
+    const address = config.billing.fiatPoolAddress;
+    const error = treasury.fiatPoolError || 'fiat-pool account balance could not be loaded';
+    logger.error({ address, error }, 'failed to read fiat-pool balance from Horizon');
+    if (!lowBalanceState.get('fiat_pool:unreachable')) {
+      raiseAlert('treasury_fiat_pool_unreachable', `fiat_pool balance at ${address} could not be read: ${error}`, {
+        account: 'fiat_pool',
+        address,
+        error,
+      });
+      lowBalanceState.set('fiat_pool:unreachable', true);
+    }
   }
 }
 
