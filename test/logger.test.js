@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import pino from 'pino';
 import { REDACT_CONFIG } from '../src/logger.js';
+import { resolveLogFormat } from '../src/config.js';
 
 // Regression coverage: pino-http's default req serializer logs the full
 // request headers object, including Authorization — every admin bearer
@@ -37,4 +38,12 @@ test('other headers are logged normally — redaction is scoped, not blanket', (
   logger.info({ req: { headers: { authorization: 'Bearer secret', 'content-type': 'application/json' } } }, 'request');
 
   assert.ok(lines.join('').includes('application/json'));
+});
+
+test('resolveLogFormat defaults to json in production-like env and pretty in local dev, while explicit LOG_FORMAT wins', () => {
+  assert.equal(resolveLogFormat({}), 'pretty');
+  assert.equal(resolveLogFormat({ NODE_ENV: 'production' }), 'json');
+  assert.equal(resolveLogFormat({ RAILWAY_ENVIRONMENT: 'production' }), 'json');
+  assert.equal(resolveLogFormat({ NODE_ENV: 'production', LOG_FORMAT: 'pretty' }), 'pretty');
+  assert.equal(resolveLogFormat({ LOG_FORMAT: 'json' }), 'json');
 });
