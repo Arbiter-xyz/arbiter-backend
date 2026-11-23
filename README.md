@@ -362,3 +362,6 @@ local stack (Redis, worker console, and the app build).
 
 <!-- handsoff-issue-241 -->
 - #241: All three billing processors call an undefined resolveCurrency()/SUPPORTED_CURRENCIES
+
+<!-- handsoff-issue-541 -->
+- #541: Add tests for admin.getTreasury
