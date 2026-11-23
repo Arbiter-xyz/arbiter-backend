@@ -680,6 +680,7 @@ async function debitCreditFloored(accountId, stroops) {
  * how stats.js already excludes it from platform-wide numbers.
  */
 const USAGE_WINDOW_DAYS = 30;
+export const USAGE_COUNTER_TTL_MS = (USAGE_WINDOW_DAYS + 1) * 24 * 60 * 60 * 1000;
 
 function usageDay(ts = Date.now()) {
   return new Date(ts).toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
@@ -690,7 +691,7 @@ function usageDay(ts = Date.now()) {
  * incrementStat() calls. */
 export async function recordUsage(accountId, endpoint, tier, ts = Date.now()) {
   if (!accountId || !endpoint || !tier) return;
-  await store.incrBy(`usage:${accountId}:${endpoint}:${tier}:${usageDay(ts)}`, 1);
+  await store.incr(`usage:${accountId}:${endpoint}:${tier}:${usageDay(ts)}`, USAGE_COUNTER_TTL_MS, 1);
 }
 
 /**
