@@ -67,19 +67,47 @@ function evaluateBalance(label, address, usdcBalance, minUsdc) {
   lowBalanceState.set(label, low);
 }
 
-export async function checkTreasuryBalance() {
+function evaluateXlmBalance(label, address, xlmBalance, minXlm) {
+  const stateKey = `${label}:xlm`;
+  const balance = Number(xlmBalance);
+  const low = balance < minXlm;
+  if (low && !lowBalanceState.get(stateKey)) {
+    raiseAlert('treasury_low_xlm', `${label} XLM balance ${balance} is below ${minXlm}`, {
+      account: label,
+      address,
+      xlmBalance: balance,
+      thresholdXlm: minXlm,
+    });
+  }
+  if (!low && lowBalanceState.get(stateKey)) {
+    logger.info({ account: label, xlmBalance: balance }, 'treasury XLM balance recovered above threshold');
+  }
+  lowBalanceState.set(stateKey, low);
+}
+
+export function resetTreasuryAlertState() {
+  lowBalanceState.clear();
+}
+
+export async function checkTreasuryBalance({ getTreasuryFn = getTreasury } = {}) {
   const minUsdc = config.alerting.treasuryMinUsdc;
-  if (minUsdc == null || !isAlertingConfigured()) return;
-  const treasury = await getTreasury();
+  const minXlm = config.alerting.treasuryMinXlm;
+  if ((minUsdc == null && minXlm == null) || !isAlertingConfigured()) return;
+  const treasury = await getTreasuryFn();
   if (!treasury.configured) return;
-  evaluateBalance('platform', treasury.platformAddress, treasury.usdcBalance, minUsdc);
-  if (treasury.fiatPool) {
-    evaluateBalance('fiat_pool', treasury.fiatPool.address, treasury.fiatPool.usdcBalance, minUsdc);
+  if (minUsdc != null) {
+    evaluateBalance('platform', treasury.platformAddress, treasury.usdcBalance, minUsdc);
+    if (treasury.fiatPool) {
+      evaluateBalance('fiat_pool', treasury.fiatPool.address, treasury.fiatPool.usdcBalance, minUsdc);
+    }
+  }
+  if (minXlm != null) {
+    evaluateXlmBalance('platform', treasury.platformAddress, treasury.xlmBalance, minXlm);
   }
 }
 
 export function startTreasuryMonitor() {
-  if (config.alerting.treasuryMinUsdc == null || !isAlertingConfigured()) return null;
+  if ((config.alerting.treasuryMinUsdc == null && config.alerting.treasuryMinXlm == null) || !isAlertingConfigured()) return null;
   const run = () => checkTreasuryBalance().catch((err) => logger.warn({ err }, 'treasury balance check failed'));
   run();
   const timer = setInterval(run, config.alerting.treasuryIntervalMs);
