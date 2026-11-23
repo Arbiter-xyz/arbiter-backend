@@ -1,5 +1,11 @@
 import 'dotenv/config';
 import { randomBytes } from 'node:crypto';
+import { productionSignals } from './securityPosture.js';
+
+export function resolveLogFormat(env = process.env) {
+  if (env.LOG_FORMAT) return env.LOG_FORMAT;
+  return productionSignals(env).length > 0 ? 'json' : 'pretty';
+}
 
 /**
  * Central runtime configuration.
@@ -413,7 +419,7 @@ export const config = Object.freeze({
 
   // 'json' for real deployments (log aggregators parse JSON lines
   // directly); anything else pretty-prints for local dev readability.
-  logFormat: process.env.LOG_FORMAT || 'pretty',
+  logFormat: resolveLogFormat(process.env),
   logLevel: process.env.LOG_LEVEL || 'info',
 
   // Prometheus scrape endpoint (metrics.js) and the probes behind its gauges
