@@ -146,6 +146,26 @@ export function getClient() {
   return anthropicClient;
 }
 
+export function validateConsensusToolInput(input, llm = null) {
+  if (!input || typeof input !== 'object') {
+    throw new Error('Invalid report_consensus tool input: expected an object');
+  }
+  const { consensus, confidence, matching_worker_ids: matchingWorkerIds } = input;
+  if (typeof consensus !== 'string' || consensus.trim() === '') {
+    throw new Error('Invalid report_consensus tool input: consensus must be a non-empty string');
+  }
+  if (typeof confidence !== 'number' || !Number.isFinite(confidence)) {
+    throw new Error('Invalid report_consensus tool input: confidence must be a finite number');
+  }
+  const clampedConfidence = Math.min(1, Math.max(0, confidence));
+  return {
+    consensus,
+    confidence: clampedConfidence,
+    matchingWorkerIds,
+    ...(llm ? { llm } : {}),
+  };
+}
+
 const anthropicProvider = {
   name: 'anthropic',
 
@@ -163,8 +183,7 @@ const anthropicProvider = {
     const toolUse = message.content.find((b) => b.type === 'tool_use' && b.name === 'report_consensus');
     if (!toolUse) throw new Error('Claude did not return a report_consensus tool call');
 
-    const { consensus, confidence, matching_worker_ids: matchingWorkerIds } = toolUse.input;
-    return { consensus, confidence, matchingWorkerIds, llm: { request, response: captureResponse(message) } };
+    return validateConsensusToolInput(toolUse.input, { request, response: captureResponse(message) });
   },
 
   async reportDraft(question) {
