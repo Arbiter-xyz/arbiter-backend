@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { randomBytes } from 'node:crypto';
+import { productionSignals } from './securityPosture.js';
 
 /**
  * Central runtime configuration.
@@ -201,6 +202,19 @@ const deploymentProfile = process.env.DEPLOYMENT_PROFILE === 'sandbox' ? 'sandbo
 function trustProxy() {
   const n = Number(process.env.TRUST_PROXY);
   return Number.isInteger(n) && n > 0 ? n : false;
+}
+
+// True when this process looks like a real deployment: NODE_ENV=production
+// or any of securityPosture.js's production signals (e.g. a platform secret
+// or contract id being configured). Used to pick production-safe defaults
+// such as JSON logging.
+function isProductionLike() {
+  if (process.env.NODE_ENV === 'production') return true;
+  try {
+    return productionSignals(process.env).length > 0;
+  } catch {
+    return false;
+  }
 }
 
 export const config = Object.freeze({
@@ -413,7 +427,11 @@ export const config = Object.freeze({
 
   // 'json' for real deployments (log aggregators parse JSON lines
   // directly); anything else pretty-prints for local dev readability.
-  logFormat: process.env.LOG_FORMAT || 'pretty',
+  // Defaults to 'json' in production-like environments (NODE_ENV=production
+  // or any productionSignals()) so a deployment that forgets LOG_FORMAT
+  // still emits parseable logs; 'pretty' everywhere else. An explicit
+  // LOG_FORMAT always wins.
+  logFormat: process.env.LOG_FORMAT || (isProductionLike() ? 'json' : 'pretty'),
   logLevel: process.env.LOG_LEVEL || 'info',
 
   // Prometheus scrape endpoint (metrics.js) and the probes behind its gauges
