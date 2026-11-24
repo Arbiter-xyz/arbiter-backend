@@ -54,4 +54,45 @@ test('settleClaudeBudget charges additional delta when actual cost exceeds reser
   assert.equal(await claudeBudgetSpent(), baseline);
 });
 
+test('refused reserveClaudeBudget leaves the counter unchanged (#513)', async () => {
+  const baseline = await claudeBudgetSpent();
+  const remaining = await claudeBudgetRemaining();
+
+  // Reserve everything that is left so the next reservation must be refused.
+  const allowed = await reserveClaudeBudget(remaining);
+  assert.equal(allowed, true);
+  assert.equal(await claudeBudgetSpent(), baseline + remaining);
+
+  // A refused reservation must not push the counter past the cap.
+  assert.equal(await reserveClaudeBudget(1), false);
+  assert.equal(await claudeBudgetSpent(), baseline + remaining);
+
+  // Repeated refusals keep the counter unchanged.
+  assert.equal(await reserveClaudeBudget(1), false);
+  assert.equal(await reserveClaudeBudget(5), false);
+  assert.equal(await claudeBudgetSpent(), baseline + remaining);
+
+  // A large reservation that does not fit must not block smaller ones that would.
+  assert.equal(await reserveClaudeBudget(remaining + 1000), false);
+  assert.equal(await claudeBudgetSpent(), baseline + remaining);
+
+  // Clean up so subsequent tests see the original baseline.
+  await settleClaudeBudget(remaining, 0);
+  assert.equal(await claudeBudgetSpent(), baseline);
+});
+
+test('reserveClaudeBudget does not silently allow invalid estimates (#513)', async () => {
+  const baseline = await claudeBudgetSpent();
+
+  for (const bad of [NaN, Infinity, -Infinity, 0, -1, -25]) {
+    await assert.rejects(
+      async () => reserveClaudeBudget(bad),
+      `estimate ${bad} must not be silently allowed`,
+    );
+  }
+
+  // Invalid estimates must not have touched the counter.
+  assert.equal(await claudeBudgetSpent(), baseline);
+});
+
 

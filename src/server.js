@@ -27,6 +27,7 @@ import {
   feeBumpWithdrawBalance,
 } from './sponsor.js';
 import { getStashedQuestion, nextQuestionId } from './pendingQuestions.js';
+import { StrKey } from '@stellar/stellar-sdk';
 import { getOwedOnChain, getStakeOnChain, getLatestLedgerSequence, isInsufficientBalanceError } from './stellarClient.js';
 import { askMetered, getMeteredBalance, depositInstructions } from './metered.js';
 import { getLeaderboard } from './leaderboard.js';
@@ -921,6 +922,13 @@ app.delete('/webhooks/:id', rateLimited('webhooks', byIp), async (req, res) => {
 app.post('/sponsor/onboard/build', rateLimited('sponsor', byIp), async (req, res) => {
   const { address } = req.body || {};
   if (!address) return res.status(400).json({ error: 'address is required' });
+  // Reject a malformed address here, before buildSponsoredOnboardTx() does
+  // any rate-limit bookkeeping or network work — otherwise it fails deep in
+  // the SDK, is logged as a server error, and counts against the per-address
+  // onboarding limit. Not logged at error level: this is caller input.
+  if (typeof address !== 'string' || !StrKey.isValidEd25519PublicKey(address)) {
+    return res.status(400).json({ error: 'address must be a valid Stellar public key' });
+  }
   try {
     const xdr = await buildSponsoredOnboardTx(address);
     res.json({ xdr });

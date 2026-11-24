@@ -73,14 +73,23 @@ function budgetKey(now = Date.now()) {
  * The reservation is recorded atomically via store.incrBy, so concurrent
  * requests across instances can never collectively overshoot the cap by more
  * than a single in-flight reservation.
+ *
+ * A non-finite or non-positive estimate is a programming error: silently
+ * allowing it would let a bad cost estimate bypass the cap entirely, so we
+ * throw rather than fail open.
  */
 export async function reserveClaudeBudget(cents) {
   const amount = Number(cents);
-  if (!Number.isFinite(amount) || amount <= 0) return true;
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new TypeError(
+      `reserveClaudeBudget: invalid cost estimate ${String(cents)} (expected a finite, positive number of cents)`,
+    );
+  }
 
   const key = budgetKey();
+  const cap = budgetCents();
   const spent = await store.incrBy(key, amount);
-  if (spent <= budgetCents()) return true;
+  if (spent <= cap) return true;
 
   // A rejected reservation must not stay on the counter, or a burst of
   // over-cap attempts would keep inflating spend that was never incurred.

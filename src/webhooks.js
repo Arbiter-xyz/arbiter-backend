@@ -147,9 +147,24 @@ export function validateWebhookUrl(raw, { allowInsecure = config.webhooks.allowI
 
 // ── Secret storage ───────────────────────────────────────────────────────
 
-function encryptionKey() {
-  const k = config.webhooks.secretEncryptionKey;
+function deriveKey(k) {
   return k ? createHash('sha256').update(k).digest() : null;
+}
+
+function encryptionKey() {
+  return deriveKey(config.webhooks.secretEncryptionKey);
+}
+
+/** Keys to try when decrypting, current first. The previous key lets
+ * WEBHOOK_SECRET_ENCRYPTION_KEY be rotated without losing existing secrets;
+ * records are re-sealed with the current key on their next write. */
+function decryptionKeys() {
+  const keys = [];
+  const current = encryptionKey();
+  if (current) keys.push(current);
+  const previous = deriveKey(config.webhooks.secretEncryptionKeyPrevious);
+  if (previous) keys.push(previous);
+  return keys;
 }
 
 /** Encrypts a signing secret for storage when WEBHOOK_SECRET_ENCRYPTION_KEY
@@ -165,12 +180,22 @@ export function sealSecret(secret) {
 
 export function openSecret(sealed) {
   if (sealed.startsWith('raw:')) return sealed.slice(4);
-  const key = encryptionKey();
-  if (!key) throw new Error('webhook secret is encrypted but WEBHOOK_SECRET_ENCRYPTION_KEY is not set');
+  const keys = decryptionKeys();
+  if (keys.length === 0) {
+    throw new Error('webhook secret is encrypted but WEBHOOK_SECRET_ENCRYPTION_KEY is not set');
+  }
   const [iv, tag, ct] = sealed.slice(4).split('.').map((p) => Buffer.from(p, 'base64url'));
-  const decipher = createDecipheriv('aes-256-gcm', key, iv);
-  decipher.setAuthTag(tag);
-  return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8');
+  let lastError;
+  for (const key of keys) {
+    try {
+      const decipher = createDecipheriv('aes-256-gcm', key, iv);
+      decipher.setAuthTag(tag);
+      return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8');
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError;
 }
 
 // ── Registrations ────────────────────────────────────────────────────────
@@ -308,9 +333,24 @@ export async function getDeliveryTargets(owner) {
   if (!owner) return [];
   const ids = await ownerIds(owner);
   const records = await Promise.all(ids.map((id) => store.get(REG_PREFIX + id)));
-  return records
-    .filter((r) => r && r.active && r.owner === owner)
-    .map((r) => ({ id: r.id, url: r.url, secret: openSecret(r.secret) }));
+  const targets = [];
+  for (const r of records) {
+    if (!r || !r.active || r.owner !== owner) continue;
+    let secret;
+    try {
+      secret = openSecret(r.secret);
+    } catch (err) {
+      // One undecryptable record (key rotated without a previous key, or
+      // the encryption key unset) must not block the owner's other
+      // webhooks. Deactivate it with a clear reason so the owner sees why
+      // in listWebhooks() and can re-register.
+      console.error(`webhook ${r.id}: cannot decrypt signing secret, deactivating: ${err.message}`);
+      await deactivateWebhook(r.id, 'signing secret could not be decrypted; re-register this webhook').catch(() => {});
+      continue;
+    }
+    targets.push({ id: r.id, url: r.url, secret });
+  }
+  return targets;
 }
 
 // ── Job ownership ────────────────────────────────────────────────────────

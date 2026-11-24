@@ -1,7 +1,8 @@
-import { Horizon, TransactionBuilder, Operation, Asset, BASE_FEE, Address, xdr, nativeToScVal } from '@stellar/stellar-sdk';
+import { Horizon, TransactionBuilder, Operation, Asset, BASE_FEE, Address, StrKey, xdr, nativeToScVal } from '@stellar/stellar-sdk';
 import { config } from './config.js';
 import { getAdminKeypair, u64Arg, addressArg, getContractId } from './stellarClient.js';
 import { withRetry } from './retry.js';
+import { checkRateLimit } from './rateLimit.js';
 
 // Horizon submission is safe to retry as a whole: a resubmission of the
 // same already-signed transaction either succeeds once or comes back with
@@ -30,23 +31,27 @@ function usdcAsset() {
 // byIp) wrapper is not sufficient on its own: a single IP can rotate
 // through many distinct worker addresses, and each distinct address
 // bypasses any per-address accounting while still draining the platform's
-// reserve. This in-process guard caps how often a given worker address can
-// request a sponsored-onboard build, independent of the IP-based limiter.
-// It is intentionally best-effort (single-process, in-memory) — the goal
-// is to blunt address-rotation abuse, not to be a distributed limiter.
+// reserve. This guard caps how often a given worker address can request a
+// sponsored-onboard build, independent of the IP-based limiter. It uses the
+// shared store-backed checkRateLimit() (TTL-evicted, shared across
+// instances) so no unbounded in-process map accumulates.
 // ---------------------------------------------------------------------
 const ONBOARD_WINDOW_MS = 60_000;
 const ONBOARD_MAX_PER_WINDOW = 3;
-const onboardAttempts = new Map();
+
+/** Thrown for caller-supplied input that is invalid (maps to HTTP 400). */
+export class SponsorValidationError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'SponsorValidationError';
+    this.status = 400;
+  }
+}
 
 function assertOnboardRateLimit(workerAddress) {
-  const now = Date.now();
-  const recent = (onboardAttempts.get(workerAddress) || []).filter((t) => now - t < ONBOARD_WINDOW_MS);
-  if (recent.length >= ONBOARD_MAX_PER_WINDOW) {
+  if (!checkRateLimit(`sponsor-onboard:${workerAddress}`, ONBOARD_MAX_PER_WINDOW, ONBOARD_WINDOW_MS)) {
     throw new Error('sponsor/onboard: too many sponsored-onboard requests for this address, try again later');
   }
-  recent.push(now);
-  onboardAttempts.set(workerAddress, recent);
 }
 
 /**
@@ -57,6 +62,9 @@ function assertOnboardRateLimit(workerAddress) {
  * added in finalizeSponsoredOnboardTx.
  */
 export async function buildSponsoredOnboardTx(workerAddress) {
+  if (typeof workerAddress !== 'string' || !StrKey.isValidEd25519PublicKey(workerAddress)) {
+    throw new SponsorValidationError('invalid Stellar address');
+  }
   assertOnboardRateLimit(workerAddress);
 
   const admin = getAdminKeypair();
