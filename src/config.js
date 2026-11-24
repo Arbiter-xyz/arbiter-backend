@@ -240,6 +240,11 @@ export const config = Object.freeze({
 
   contractId: process.env.ORACLE_CONTRACT_ID || '',
   platformSecret: process.env.PLATFORM_SECRET || '',
+  // Public address of the platform account. Deliberately independent of
+  // platformSecret: read-only/canary deployments (no PLATFORM_SECRET) still
+  // need a valid G-address to build simulation transactions for
+  // simulateRead() (#509). Empty means "unset" — callers fall back to a
+  // constant dummy account.
   platformAddress: process.env.PLATFORM_ADDRESS || '',
   // Multi-signer settlement pool (#466/#161/#164): a comma-separated list of
   // additional admin-authorized secret keys. When set, admin-signed calls
