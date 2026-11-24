@@ -33,6 +33,11 @@ const HOSTING_PLATFORM_MARKERS = [
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]', '0.0.0.0']);
 
+// Admin bearer tokens are the only gate on every /admin/* route, and those
+// routes have no rate limit, so a short/guessable token is a real risk.
+const ADMIN_TOKEN_MIN_LENGTH = 32;
+const ADMIN_TOKEN_FATAL_LENGTH = 16;
+
 export function isLoopbackHost(hostname) {
   return LOOPBACK_HOSTS.has(hostname) || hostname.startsWith('127.') || hostname.endsWith('.localhost');
 }
@@ -86,6 +91,10 @@ export function productionSignals(env) {
  *   a private network (e.g. Railway's internal redis://), where TLS is
  *   optional, so refusing to start would break a legitimate setup. The
  *   warning still makes that trade-off a deliberate choice.
+ * - ADMIN_TOKEN / ADMIN_TOKENS shorter than 32 chars → error, or fatal
+ *   below 16. The admin bearer token is the only gate on every /admin/*
+ *   route (which has no rate limit), so a short or guessable value is a
+ *   real risk; a very short one is effectively no gate at all.
  */
 export function evaluateSecurityPosture(env) {
   const signals = productionSignals(env);
@@ -117,6 +126,26 @@ export function evaluateSecurityPosture(env) {
     });
   }
 
+  const adminTokenSources = [
+    ['ADMIN_TOKENS', (env.ADMIN_TOKENS || '').split(',')],
+    ['ADMIN_TOKEN', [env.ADMIN_TOKEN || '']],
+  ];
+  for (const [setting, rawTokens] of adminTokenSources) {
+    const tokens = rawTokens.map((t) => t.trim()).filter(Boolean);
+    for (const token of tokens) {
+      if (token.length >= ADMIN_TOKEN_MIN_LENGTH) continue;
+      const fatal = token.length < ADMIN_TOKEN_FATAL_LENGTH;
+      findings.push({
+        setting,
+        severity: fatal ? 'fatal' : 'error',
+        message:
+          `${setting} contains an admin bearer token that is only ${token.length} characters long. ` +
+          'The admin bearer token is the only gate on every /admin/* route, and those routes have no rate limit, ' +
+          'so a short or guessable value lets anyone who finds it take admin actions. ' +
+          `Use a long random value (at least ${ADMIN_TOKEN_MIN_LENGTH} characters), e.g. \`openssl rand -hex 32\`.`,
+      });
+    }
+  }
 
   if (env.ARBITER_FAULT_INJECTION === 'true') {
     findings.push({

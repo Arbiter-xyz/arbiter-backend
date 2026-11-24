@@ -111,6 +111,38 @@ describe('evaluateSecurityPosture', () => {
     const result = evaluateSecurityPosture({ RENDER: 'true', ALLOWED_ORIGINS: 'https://app.example.com', METRICS_TOKEN: 'm'.repeat(32) });
     assert.deepEqual(settingsOf(result), ['SESSION_SECRET']);
   });
+
+  test('a short ADMIN_TOKEN in production is an error naming the admin bearer token (#523)', () => {
+    const findings = evaluateSecurityPosture({ ...SECURE_PROD, ADMIN_TOKEN: 'admin' }).findings;
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0].setting, 'ADMIN_TOKEN');
+    assert.equal(findings[0].severity, 'error');
+    assert.match(findings[0].message, /ADMIN_TOKEN/);
+  });
+
+  test('an ADMIN_TOKEN shorter than 16 characters in production is fatal (#523)', () => {
+    const findings = evaluateSecurityPosture({ ...SECURE_PROD, ADMIN_TOKEN: 'admin' }).findings;
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0].setting, 'ADMIN_TOKEN');
+    assert.equal(findings[0].severity, 'fatal');
+  });
+
+  test('a short token in ADMIN_TOKENS is flagged too (#523)', () => {
+    const findings = evaluateSecurityPosture({ ...SECURE_PROD, ADMIN_TOKENS: `${'a'.repeat(40)},short` }).findings;
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0].setting, 'ADMIN_TOKEN');
+    assert.equal(findings[0].severity, 'error');
+  });
+
+  test('a long ADMIN_TOKEN (>=32 chars) in production produces no admin-token finding (#523)', () => {
+    const result = evaluateSecurityPosture({ ...SECURE_PROD, ADMIN_TOKEN: 'a'.repeat(32) });
+    assert.deepEqual(result.findings, []);
+  });
+
+  test('unset ADMIN_TOKEN/ADMIN_TOKENS in production produces no admin-token finding (#523)', () => {
+    const result = evaluateSecurityPosture(SECURE_PROD);
+    assert.deepEqual(result.findings, []);
+  });
 });
 
 describe('enforceSecurityPosture', () => {

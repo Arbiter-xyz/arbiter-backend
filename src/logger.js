@@ -89,13 +89,34 @@ export const logger = pino({
       : { target: 'pino-pretty', options: { colorize: true, translateTime: 'HH:MM:ss', ignore: 'pid,hostname' } },
 });
 
+// #522: a client-supplied X-Request-Id is only trusted when it's a short,
+// log-safe token. Anything else (multi-kilobyte values, control characters,
+// newlines that could forge log lines) is replaced by a generated UUID so
+// every log line for the request stays bounded and correlatable.
+export const REQUEST_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+
+/**
+ * Returns the incoming X-Request-Id when it's a valid, log-safe token,
+ * otherwise a freshly generated UUID. Exported so the validation can be
+ * unit-tested directly.
+ */
+export function sanitizeRequestId(incoming) {
+  if (typeof incoming === 'string' && REQUEST_ID_PATTERN.test(incoming)) return incoming;
+  return randomUUID();
+}
+
 /** Express middleware: assigns (or reuses, from X-Request-Id) a request id,
  * logs one line per request with method/path/status/duration, and exposes
  * a per-request child logger at req.log for handlers to attach further
- * context to (job id, question id, worker id, etc.). */
+ * context to (job id, question id, worker id, etc.). The chosen id is
+ * echoed back on the response as X-Request-Id so clients can correlate. */
 export const httpLogger = pinoHttp({
   logger,
-  genReqId: (req) => req.headers['x-request-id'] || randomUUID(),
+  genReqId: (req, res) => {
+    const id = sanitizeRequestId(req.headers['x-request-id']);
+    if (res && typeof res.setHeader === 'function') res.setHeader('X-Request-Id', id);
+    return id;
+  },
   customLogLevel: (req, res, err) => {
     if (err || res.statusCode >= 500) return 'error';
     if (res.statusCode >= 400) return 'warn';
