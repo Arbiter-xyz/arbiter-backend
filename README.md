@@ -176,6 +176,15 @@ README, tests, and changelog:
 Both can be tried against `POST /oracle/sandbox` with no wallet at all,
 and against the developer sandbox for a real round trip.
 
+## API documentation
+
+Detailed reference pages for the routes summarised in this README:
+
+- [docs/api/sessions.md](docs/api/sessions.md) — the session challenge/response flow (`/session/challenge`, `/session`, `/session/revoke`) for payer and worker tokens.
+- [docs/api/teams.md](docs/api/teams.md) — every `/teams` route: auth, roles, request/response examples and error codes.
+- [docs/api/referrals.md](docs/api/referrals.md) — referral codes and one-call worker onboarding, including `REFERRAL_REQUIRED_FOR_SPONSORED_ONBOARDING`.
+- [docs/api/push.md](docs/api/push.md) — Web Push endpoints, the `PushSubscription` shape, the `categories` filter and the `VAPID_*` settings.
+
 ## Webhooks
 
 Instead of polling `GET /oracle/:jobId`, a payer can register a webhook
@@ -265,6 +274,9 @@ Self-referral is rejected, and each code has a use cap
 (`REFERRAL_MAX_USES_PER_CODE`). Set `REFERRAL_REQUIRED_FOR_SPONSORED_ONBOARDING=true`
 to require a referral code for sponsored onboarding.
 
+Full request/response examples for each route and the complete onboarding
+sequence are in [docs/api/referrals.md](docs/api/referrals.md).
+
 ## Collusion detection
 
 `collusion.js` scores pairs of workers across the quorums they share. It
@@ -310,6 +322,9 @@ admins. Setting another member's role to `owner` transfers ownership, and
 the previous owner becomes an admin. The owner can't leave or be removed
 until ownership is transferred. People who aren't members get a `404` for a
 team. Limits: 100 members per team, 20 teams per address.
+
+Every route, with auth details, role requirements, example bodies and error
+codes, is documented in [docs/api/teams.md](docs/api/teams.md).
 
 ## Maintenance windows
 
