@@ -1,10 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mock } from 'node:test';
 import { requireAdmin } from '../src/adminAuth.js';
 import { listTransactions, listWorkers, listPayers, getFeeRevenue } from '../src/admin.js';
 import { createJob } from '../src/jobs.js';
 import { recordOutcome } from '../src/dispatch.js';
 import { recordPayerQuestion } from '../src/payerIndex.js';
+import { config } from '../src/config.js';
+import * as admin from '../src/admin.js';
+import * as alerting from '../src/alerting.js';
 
 function uniqueId(prefix) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -122,4 +126,50 @@ test('getFeeRevenue sums the platform\'s 20% cut only over settled+resolved jobs
   const { resolvedCount, totalFeeRevenue } = await getFeeRevenue();
   assert.ok(resolvedCount >= 1);
   assert.ok(Number(totalFeeRevenue) >= 0.2 - 1e-6, `expected at least ~0.2 USDC of fee revenue, got ${totalFeeRevenue}`);
+});
+
+test('checkTreasuryBalance warns and raises one treasury_unreadable alert when the fiat pool cannot be read', async (t) => {
+  const originalMinUsdc = config.alerting.treasuryMinUsdc;
+  const originalFiatPoolAddress = config.billing.fiatPoolAddress;
+  const originalPlatformAddress = config.platformAddress;
+
+  config.alerting.treasuryMinUsdc = 10;
+  config.billing.fiatPoolAddress = 'GFIATPOOL';
+  config.platformAddress = 'GPLATFORM';
+
+  const fiatPoolAddress = config.billing.fiatPoolAddress;
+  const getTreasuryStub = mock.method(admin, 'getTreasury', async () => ({
+    configured: true,
+    platformAddress: config.platformAddress,
+    usdcBalance: 100,
+    fiatPool: { address: fiatPoolAddress, error: 'Horizon 503' },
+  }));
+  const alertStub = mock.method(alerting, 'sendAlert', async () => {});
+  const warnStub = mock.method(console, 'warn', () => {});
+
+  t.after(() => {
+    getTreasuryStub.mock.restore();
+    alertStub.mock.restore();
+    warnStub.mock.restore();
+    config.alerting.treasuryMinUsdc = originalMinUsdc;
+    config.billing.fiatPoolAddress = originalFiatPoolAddress;
+    config.platformAddress = originalPlatformAddress;
+  });
+
+  // First call: state change -> one warning + one alert.
+  await alerting.checkTreasuryBalance();
+
+  const unreadableAlerts = () =>
+    alertStub.mock.calls.filter((call) => call.arguments[0]?.type === 'treasury_unreadable');
+  const unreadableWarnings = () =>
+    warnStub.mock.calls.filter((call) => String(call.arguments[0]).includes('fiat'));
+
+  assert.equal(unreadableAlerts().length, 1, 'expected exactly one treasury_unreadable alert');
+  assert.equal(unreadableWarnings().length, 1, 'expected exactly one warning about the fiat pool');
+  assert.equal(unreadableAlerts()[0].arguments[0].address, fiatPoolAddress);
+
+  // Second call while the state persists: no re-raise, no extra warning.
+  await alerting.checkTreasuryBalance();
+  assert.equal(unreadableAlerts().length, 1, 'alert should not be re-raised while unreadable');
+  assert.equal(unreadableWarnings().length, 1, 'warning should not be repeated while unreadable');
 });

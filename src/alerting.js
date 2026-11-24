@@ -67,13 +67,39 @@ function evaluateBalance(label, address, usdcBalance, minUsdc) {
   lowBalanceState.set(label, low);
 }
 
+// Edge-triggered like the low-balance alert: one alert when the fiat-pool
+// account becomes unreadable, and a recovery log when it's readable again.
+const unreadableState = new Map();
+
+function evaluateUnreadable(label, address, error) {
+  if (!unreadableState.get(label)) {
+    logger.warn({ account: label, address, err: error }, 'treasury account balance could not be read');
+    raiseAlert('treasury_unreadable', `${label} USDC balance could not be read`, {
+      account: label,
+      address,
+      error: error?.message ?? String(error),
+    });
+  }
+  unreadableState.set(label, true);
+}
+
+function clearUnreadable(label) {
+  if (unreadableState.get(label)) {
+    logger.info({ account: label }, 'treasury account balance readable again');
+  }
+  unreadableState.set(label, false);
+}
+
 export async function checkTreasuryBalance() {
   const minUsdc = config.alerting.treasuryMinUsdc;
   if (minUsdc == null || !isAlertingConfigured()) return;
   const treasury = await getTreasury();
   if (!treasury.configured) return;
   evaluateBalance('platform', treasury.platformAddress, treasury.usdcBalance, minUsdc);
-  if (treasury.fiatPool) {
+  if (treasury.fiatPool?.error) {
+    evaluateUnreadable('fiat_pool', treasury.fiatPool.address, treasury.fiatPool.error);
+  } else if (treasury.fiatPool) {
+    clearUnreadable('fiat_pool');
     evaluateBalance('fiat_pool', treasury.fiatPool.address, treasury.fiatPool.usdcBalance, minUsdc);
   }
 }

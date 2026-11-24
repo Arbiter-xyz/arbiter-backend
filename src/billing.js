@@ -687,10 +687,14 @@ function usageDay(ts = Date.now()) {
 
 /** Records one API call for an account. Called from the resolveApiKey()-
  * gated request flow in server.js's POST /oracle, alongside the existing
- * incrementStat() calls. */
+ * incrementStat() calls. Each per-day counter is given a TTL of
+ * USAGE_WINDOW_DAYS + 1 days so old days expire instead of accumulating
+ * forever (incrBy alone never sets a TTL). */
 export async function recordUsage(accountId, endpoint, tier, ts = Date.now()) {
   if (!accountId || !endpoint || !tier) return;
-  await store.incrBy(`usage:${accountId}:${endpoint}:${tier}:${usageDay(ts)}`, 1);
+  const key = `usage:${accountId}:${endpoint}:${tier}:${usageDay(ts)}`;
+  await store.incrBy(key, 1);
+  await store.expire(key, (USAGE_WINDOW_DAYS + 1) * 24 * 60 * 60 * 1000);
 }
 
 /**

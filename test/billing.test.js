@@ -13,6 +13,7 @@ import {
   createCheckoutSession,
   configuredProcessors,
   getProcessor,
+  recordUsage,
 } from '../src/billing.js';
 import { config } from '../src/config.js';
 import { store } from '../src/store.js';
@@ -241,6 +242,33 @@ test('createCheckoutSession rejects a disallowed cancelUrl too, not just success
       /allowed origin/,
     );
   }));
+
+// --- Usage counters ------------------------------------------------------
+
+test('recordUsage writes a per-day usage key that expires after the usage window', async () => {
+  const accountId = uniqueId('acct');
+  const endpoint = 'oracle';
+  const tier = 'free';
+  const ts = Date.now();
+  const day = new Date(ts).toISOString().slice(0, 10);
+  const key = `usage:${accountId}:${endpoint}:${tier}:${day}`;
+
+  await recordUsage(accountId, endpoint, tier, ts);
+
+  const value = await store.get(key);
+  assert.equal(Number(value), 1);
+
+  const ttl = await store.ttl(key);
+  assert.ok(ttl > 0, `expected usage key ${key} to carry a TTL, got ${ttl}`);
+
+  // TTL should be ~USAGE_WINDOW_DAYS + 1 = 31 days, allowing a generous
+  // slack for the time elapsed between the write and this assertion.
+  const expectedSeconds = 31 * 24 * 60 * 60;
+  assert.ok(
+    ttl <= expectedSeconds && ttl > expectedSeconds - 60,
+    `expected TTL near ${expectedSeconds}s, got ${ttl}s`,
+  );
+});
 
 // --- PayPal processor coverage -------------------------------------------
 // Mirrors the Stripe coverage above: checkout-session creation against a
