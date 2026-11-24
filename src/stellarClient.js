@@ -345,13 +345,21 @@ function invokeAsAdmin(method, scValArgs) {
     );
 }
 
-/** Reads a contract method via simulation (no submission, no signing). */
+/** Reads a contract method via simulation (no submission, no signing).
+ *
+ * Simulation never checks the source account's sequence number, so there is
+ * no need to load the admin keypair or fetch a real account from RPC: a
+ * dummy Account built from a fixed G-address (or config.platformAddress when
+ * configured) is enough. This keeps read endpoints working on deployments
+ * without PLATFORM_SECRET and removes a getAccount round trip per read. */
 export async function simulateRead(method, scValArgs = []) {
   return withServerFailover((srv) =>
     withRetry(
       async () => {
-        const admin = getAdminKeypair();
-        const account = await srv.getAccount(admin.publicKey());
+        const account = new Account(
+          config.platformAddress || 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+          '0',
+        );
         const contract = new Contract(getContractId());
         const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: config.networkPassphrase })
           .addOperation(contract.call(method, ...scValArgs))

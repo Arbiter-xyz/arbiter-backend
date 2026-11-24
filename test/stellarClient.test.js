@@ -9,6 +9,7 @@ import {
   CONTRACT_ERROR_CODES,
   isContractError,
   isInsufficientBalanceError,
+  simulateRead,
 } from '../src/stellarClient.js';
 
 // Regression coverage for a real bug found running against a live deployed
@@ -128,5 +129,41 @@ test('CONTRACT_ERROR_CODES and isInsufficientBalanceError match Soroban Contract
   assert.equal(isInsufficientBalanceError(new Error('HostError: Error(Contract, #130)')), false);
   assert.equal(isContractError('Error(Contract, #13)', 13), true);
   assert.equal(isContractError('Error(Contract, #14)', 13), false);
+});
+
+// Regression coverage for #509: simulateRead() used to load the admin
+// keypair and fetch the admin account from RPC just to build a simulation
+// transaction, so any read-only deployment without PLATFORM_SECRET could
+// not serve on-chain reads at all, and every read cost an extra
+// getAccount round trip. simulateRead() must build its transaction from a
+// dummy Account instead — no secret, no getAccount.
+test('simulateRead works without PLATFORM_SECRET and never calls getAccount (#509)', async () => {
+  const savedSecret = process.env.PLATFORM_SECRET;
+  delete process.env.PLATFORM_SECRET;
+
+  let getAccountCalls = 0;
+  let simulateCalls = 0;
+  const cannedResult = { result: { retval: 'canned-retval' } };
+
+  const stubServer = {
+    async getAccount() {
+      getAccountCalls += 1;
+      throw new Error('getAccount must not be called by simulateRead');
+    },
+    async simulateTransaction() {
+      simulateCalls += 1;
+      return cannedResult;
+    },
+  };
+
+  try {
+    const result = await simulateRead('owed', [], { server: stubServer });
+    assert.equal(result, cannedResult);
+    assert.equal(simulateCalls, 1);
+    assert.equal(getAccountCalls, 0, 'simulateRead must not fetch an account from RPC');
+  } finally {
+    if (savedSecret === undefined) delete process.env.PLATFORM_SECRET;
+    else process.env.PLATFORM_SECRET = savedSecret;
+  }
 });
 
