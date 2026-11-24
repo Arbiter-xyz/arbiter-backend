@@ -53,11 +53,31 @@ const DEFAULT_RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504
 /** Best-effort classification: network-level failures (no response at all)
  * and 429/5xx are worth retrying; 4xx client/auth/validation errors are
  * not — retrying an invalid request just wastes the retry budget on an
- * outcome that can never change. */
+ * outcome that can never change.
+ *
+ * Deterministic failures are never retried (#508): an error that opts out
+ * with `retryable === false` (e.g. a `ContractError` from a failed
+ * simulation) and programming errors (`TypeError`/`RangeError`) fail the
+ * same way every time, so retrying them only adds latency and log noise. */
 function defaultIsRetryable(err) {
+  if (err?.retryable === false) return false;
+  if (err instanceof TypeError || err instanceof RangeError) return false;
   const status = err?.status ?? err?.statusCode ?? err?.response?.status;
   if (status === undefined) return true; // no HTTP status at all -> network/timeout-shaped failure
   return DEFAULT_RETRYABLE_STATUS.has(status);
+}
+
+/** A deterministic contract/simulation failure: the same call will fail
+ * identically every time, so it is marked non-retryable. `code` carries the
+ * contract error number when one can be extracted. */
+export class ContractError extends Error {
+  constructor(message, { code, cause } = {}) {
+    super(message);
+    this.name = 'ContractError';
+    this.retryable = false;
+    if (code !== undefined) this.code = code;
+    if (cause !== undefined) this.cause = cause;
+  }
 }
 
 /** A malformed/truncated response is a transient remote fault, not a

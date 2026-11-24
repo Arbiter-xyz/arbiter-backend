@@ -128,6 +128,58 @@ test('withRetry respects a custom isRetryable predicate', async () => {
   assert.equal(calls, 1);
 });
 
+test('withRetry does NOT retry a ContractError marked retryable=false — fails after one attempt', async () => {
+  let calls = 0;
+  const err = Object.assign(new Error('simulate send failed: Error(Contract, #13)'), {
+    name: 'ContractError',
+    retryable: false,
+  });
+  await assert.rejects(
+    () =>
+      withRetry(
+        async () => {
+          calls += 1;
+          throw err;
+        },
+        { attempts: 5, baseDelayMs: 1 },
+      ),
+    /Error\(Contract, #13\)/,
+  );
+  assert.equal(calls, 1, 'deterministic contract errors should not be retried');
+});
+
+test('withRetry does NOT retry a TypeError — fails after one attempt', async () => {
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      withRetry(
+        async () => {
+          calls += 1;
+          throw new TypeError('cannot read properties of undefined');
+        },
+        { attempts: 5, baseDelayMs: 1 },
+      ),
+    /cannot read properties of undefined/,
+  );
+  assert.equal(calls, 1, 'programming errors should not be retried');
+});
+
+test('withRetry still retries a network-shaped error (no status) up to `attempts`', async () => {
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      withRetry(
+        async () => {
+          calls += 1;
+          throw new Error('socket hang up');
+        },
+        { attempts: 4, baseDelayMs: 1 },
+      ),
+    /socket hang up/,
+  );
+  assert.equal(calls, 4, 'network-shaped errors should be retried up to attempts');
+});
+
 test('withRetry combined with a per-attempt timeout retries a hanging call', async () => {
   let calls = 0;
   const result = await withRetry(

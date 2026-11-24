@@ -15,6 +15,21 @@ function num(value, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+/**
+ * Parse an env var as a BigInt, accepting only non-negative integers
+ * (`/^\d+$/`). Unset/empty falls back; anything else throws an Error naming
+ * the variable, so a malformed value fails at startup with a clear message
+ * instead of a bare `SyntaxError` from `BigInt()`.
+ */
+export function bigIntEnv(name, fallback = 0n) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`${name} must be a non-negative integer, got ${JSON.stringify(raw)}`);
+  }
+  return BigInt(raw);
+}
+
 function parseAdminCredentials(raw) {
   // ADMIN_CREDENTIALS is a comma-separated list of `role:hash` pairs, where
   // `hash` is apiKeyAuth.js's hashApiKey() output for the operator's secret.
@@ -487,7 +502,7 @@ export const config = Object.freeze({
     // zero, then misbehave for free" gap found pressure-testing the netting
     // engine. Past Owed earnings are never touched by this; it only gates
     // future dispatch eligibility. 0 (default) preserves today's behavior.
-    minStakeStroops: BigInt(process.env.WORKER_MIN_STAKE_STROOPS || '0'),
+    minStakeStroops: bigIntEnv('WORKER_MIN_STAKE_STROOPS', 0n),
   }),
 
   // Every one of these endpoints either costs the platform a real network

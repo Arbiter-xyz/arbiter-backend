@@ -9,6 +9,8 @@ import {
   CONTRACT_ERROR_CODES,
   isContractError,
   isInsufficientBalanceError,
+  withServerFailover,
+  runInvokeAsAdmin,
 } from '../src/stellarClient.js';
 
 // Regression coverage for a real bug found running against a live deployed
@@ -128,5 +130,92 @@ test('CONTRACT_ERROR_CODES and isInsufficientBalanceError match Soroban Contract
   assert.equal(isInsufficientBalanceError(new Error('HostError: Error(Contract, #130)')), false);
   assert.equal(isContractError('Error(Contract, #13)', 13), true);
   assert.equal(isContractError('Error(Contract, #14)', 13), false);
+});
+
+// Regression coverage for #506: withServerFailover() used to derive its URL
+// list by re-splitting config.sorobanRpcUrl, which is already only
+// sorobanRpcUrls[0] — so the list always had exactly one entry and the
+// backup endpoints were never tried. It must now read config.sorobanRpcUrls.
+test('withServerFailover retries on the next configured RPC URL when the first fails (#506)', async () => {
+  const calls = [];
+  const stubServers = {
+    'https://rpc-a.example': {
+      getAccount: async () => { calls.push('a'); throw new Error('rpc a is down'); },
+    },
+    'https://rpc-b.example': {
+      getAccount: async () => { calls.push('b'); return { id: 'ok-from-b' }; },
+    },
+  };
+
+  const result = await withServerFailover(
+    (srv) => srv.getAccount('GABC'),
+    {
+      urls: ['https://rpc-a.example', 'https://rpc-b.example'],
+      getServerForUrl: (url) => stubServers[url],
+    },
+  );
+
+  assert.deepEqual(calls, ['a', 'b'], 'the failing primary must be followed by the backup');
+  assert.deepEqual(result, { id: 'ok-from-b' });
+});
+
+test('withServerFailover throws the last error when every configured RPC URL fails (#506)', async () => {
+  const stubServers = {
+    'https://rpc-a.example': { getAccount: async () => { throw new Error('a down'); } },
+    'https://rpc-b.example': { getAccount: async () => { throw new Error('b down'); } },
+  };
+
+  await assert.rejects(
+    () => withServerFailover(
+      (srv) => srv.getAccount('GABC'),
+      {
+        urls: ['https://rpc-a.example', 'https://rpc-b.example'],
+        getServerForUrl: (url) => stubServers[url],
+      },
+    ),
+    /b down/,
+  );
+});
+
+// Regression coverage for #507: runInvokeAsAdmin() used to wrap prepare,
+// send AND poll in one retried, time-limited closure. A slow-to-confirm tx
+// could time out after sendTransaction had already been accepted, and the
+// retry would rebuild and resubmit a second resolve()/refund() — which the
+// contract rejects, turning a successful settlement into a reported failure.
+// Once a hash exists the tx must never be resubmitted; a poll timeout must
+// surface as an "unknown" status for the caller to reconcile on-chain.
+test('runInvokeAsAdmin never resubmits once a hash exists; a slow poll reports unknown (#507)', async () => {
+  let sendCalls = 0;
+  let pollCalls = 0;
+
+  const stubServer = {
+    getAccount: async () => ({
+      accountId: () => 'GADMIN',
+      sequenceNumber: () => '1',
+      incrementSequenceNumber: () => {},
+    }),
+    prepareTransaction: async (tx) => tx,
+    sendTransaction: async () => {
+      sendCalls += 1;
+      return { status: 'PENDING', hash: 'deadbeef' };
+    },
+    pollTransaction: async () => {
+      pollCalls += 1;
+      // Simulate a confirmation that takes far longer than the poll timeout.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      return { status: 'SUCCESS', hash: 'deadbeef' };
+    },
+  };
+
+  const result = await runInvokeAsAdmin('resolve', [], {
+    getServer: () => stubServer,
+    pollTimeoutMs: 20,
+    retryOptions: { retries: 3, baseDelayMs: 1, timeoutMs: 5000 },
+  });
+
+  assert.equal(sendCalls, 1, 'sendTransaction must be called exactly once — never resubmitted');
+  assert.equal(pollCalls, 1, 'pollTransaction should be attempted once for the known hash');
+  assert.equal(result.status, 'unknown');
+  assert.equal(result.hash, 'deadbeef');
 });
 
