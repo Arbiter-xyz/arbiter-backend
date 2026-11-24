@@ -640,6 +640,11 @@ export const config = Object.freeze({
     // hashed like API keys. Without a key they're stored as-is, which is the
     // same trust level as the store itself.
     secretEncryptionKey: process.env.WEBHOOK_SECRET_ENCRYPTION_KEY || '',
+    // Immediately-prior encryption key, used only for decryption during a
+    // key rotation: secrets sealed with it still open, and are re-sealed
+    // with secretEncryptionKey on their next write. Empty = no rotation in
+    // progress.
+    previousSecretEncryptionKey: process.env.WEBHOOK_SECRET_ENCRYPTION_KEY_PREVIOUS || '',
   }),
 
   // Referral-based worker onboarding (see referrals.js). A worker mints one

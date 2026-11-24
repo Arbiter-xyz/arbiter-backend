@@ -99,6 +99,63 @@ test('sealed secrets detect tampering', () => {
   assert.throws(() => openSecret(`gcm:${iv}.${tag}.${flipped.toString('base64url')}`));
 });
 
+test('one undecryptable record is skipped; the owner\'s other webhooks still deliver', async () => {
+  const o = owner('H');
+  const good = await registerWebhook(o, 'https://hooks.example.com/h-good');
+  const bad = await registerWebhook(o, 'https://hooks.example.com/h-bad');
+  const alsoGood = await registerWebhook(o, 'https://hooks.example.com/h-also');
+
+  // Corrupt the stored ciphertext so openSecret throws for this record only.
+  const raw = await store.get(`webhook:${bad.id}`);
+  const [iv, tag, ct] = raw.secret.slice(4).split('.');
+  const flipped = Buffer.from(ct, 'base64url');
+  flipped[0] ^= 1;
+  await store.set(`webhook:${bad.id}`, {
+    ...raw,
+    secret: `gcm:${iv}.${tag}.${flipped.toString('base64url')}`,
+  });
+
+  const targets = await getDeliveryTargets(o);
+  const ids = targets.map((t) => t.id).sort();
+  assert.deepEqual(ids, [good.id, alsoGood.id].sort());
+  assert.equal(targets.some((t) => t.id === bad.id), false);
+  for (const t of targets) assert.match(t.secret, /^whsec_[0-9a-f]{64}$/);
+});
+
+test('secrets sealed with the previous key still decrypt and are re-sealed with the current key', async () => {
+  const o = owner('I');
+  const hook = await registerWebhook(o, 'https://hooks.example.com/i');
+
+  // Re-seal the stored secret using the previous key, as if it had been
+  // written before a key rotation.
+  const current = process.env.WEBHOOK_SECRET_ENCRYPTION_KEY;
+  const previous = process.env.WEBHOOK_SECRET_ENCRYPTION_KEY_PREVIOUS;
+  assert.ok(previous, 'previous key must be configured for this test');
+  process.env.WEBHOOK_SECRET_ENCRYPTION_KEY = previous;
+  let sealedWithPrevious;
+  try {
+    sealedWithPrevious = sealSecret(hook.secret);
+  } finally {
+    process.env.WEBHOOK_SECRET_ENCRYPTION_KEY = current;
+  }
+  assert.match(sealedWithPrevious, /^gcm:/);
+
+  const raw = await store.get(`webhook:${hook.id}`);
+  await store.set(`webhook:${hook.id}`, { ...raw, secret: sealedWithPrevious });
+
+  // Decrypts via openSecret and getDeliveryTargets.
+  assert.equal(openSecret(sealedWithPrevious), hook.secret);
+  const [target] = await getDeliveryTargets(o);
+  assert.deepEqual(target, { id: hook.id, url: 'https://hooks.example.com/i', secret: hook.secret });
+
+  // A subsequent write re-seals with the current key.
+  await deactivateWebhook(hook.id, 'rotation test');
+  const after = await store.get(`webhook:${hook.id}`);
+  assert.match(after.secret, /^gcm:/);
+  assert.equal(openSecret(after.secret), hook.secret);
+  assert.notEqual(after.secret, sealedWithPrevious);
+});
+
 test('owners only ever see and delete their own registrations', async () => {
   const alice = owner('C');
   const mallory = owner('D');
