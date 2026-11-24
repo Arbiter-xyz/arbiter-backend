@@ -14,6 +14,15 @@ test('resolveApiKey resolves a valid key to its accountId', async () => {
   assert.equal(await resolveApiKey(mockReq(`Bearer ${rawKey}`)), 'acct_test1');
 });
 
+test('resolveApiKey accepts a case-insensitive scheme and extra spaces after it', async () => {
+  const rawKey = 'ak_live_' + 'd'.repeat(64);
+  await store.set(`apikey:${hashApiKey(rawKey)}`, { accountId: 'acct_test3' });
+
+  assert.equal(await resolveApiKey(mockReq(`bearer ${rawKey}`)), 'acct_test3');
+  assert.equal(await resolveApiKey(mockReq(`BEARER ${rawKey}`)), 'acct_test3');
+  assert.equal(await resolveApiKey(mockReq(`Bearer   ${rawKey}`)), 'acct_test3');
+});
+
 test('resolveApiKey returns null for a well-formed but unknown key', async () => {
   assert.equal(await resolveApiKey(mockReq(`Bearer ak_live_${'b'.repeat(64)}`)), null);
 });

@@ -25,12 +25,22 @@ export function hashApiKey(rawKey) {
   return createHash('sha256').update(rawKey).digest('hex');
 }
 
+/** Returns the token from a `Bearer <token>` Authorization header, or null
+ * if missing/malformed. The scheme is matched case-insensitively (RFC 7235)
+ * and extra whitespace around the token is tolerated. */
+export function parseBearer(req) {
+  const header = (typeof req?.get === 'function' ? req.get('authorization') : req?.headers?.authorization) || '';
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+  if (!match) return null;
+  const token = match[1].trim();
+  return token || null;
+}
+
 /** Returns the raw `ak_live_...` key from the Authorization header, or
  * null if missing/malformed. Does not check the key exists. */
 export function extractApiKey(req) {
-  const header = req.get('authorization') || '';
-  const [scheme, rawKey] = header.split(' ');
-  if (scheme !== 'Bearer' || !rawKey || !rawKey.startsWith(KEY_PREFIX)) return null;
+  const rawKey = parseBearer(req);
+  if (!rawKey || !rawKey.startsWith(KEY_PREFIX)) return null;
   return rawKey;
 }
 

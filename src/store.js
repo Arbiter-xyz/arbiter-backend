@@ -132,6 +132,20 @@ class MemoryStore {
     return next;
   }
 
+  /** Sets or replaces the TTL on an existing key. Used by billing.js's
+   * recordUsage() to expire per-day usage counters (#516) without changing
+   * incrBy()'s durable-by-default semantics for money-like balances. */
+  async expire(key, ttlMs) {
+    const entry = this.map.get(key);
+    if (!entry) return false;
+    if (entry.expiresAt && entry.expiresAt < Date.now()) {
+      this.map.delete(key);
+      return false;
+    }
+    entry.expiresAt = Date.now() + ttlMs;
+    return true;
+  }
+
   /** Atomic conditional decrement — the credit-reservation primitive: only
    * succeeds if the balance can afford `amount`, so two concurrent
    * reservations against the same account can never both succeed against
@@ -241,6 +255,12 @@ export class RedisStore {
   // must never expire).
   async incrBy(key, delta) {
     return this.client.incrby(key, delta);
+  }
+
+  // Sets/replaces the TTL on an existing key — see MemoryStore.expire().
+  async expire(key, ttlMs) {
+    const result = await this.client.pexpire(key, ttlMs);
+    return result === 1;
   }
 
   // Atomic conditional decrement via a Lua script so the read-compare-write

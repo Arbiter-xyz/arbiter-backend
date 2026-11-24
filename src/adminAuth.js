@@ -1,6 +1,6 @@
 import { timingSafeEqual, createHash } from 'node:crypto';
 import { config } from './config.js';
-import { hashApiKey } from './apiKeyAuth.js';
+import { hashApiKey, parseBearer } from './apiKeyAuth.js';
 import { store } from './store.js';
 import { logger, recordRequestContext } from './logger.js';
 import { verifyTotp } from './totp.js';
@@ -94,8 +94,7 @@ function resolveAdminCredential(token) {
  * object, so the REST middleware and GraphQL resolver guard read it the
  * same way. */
 function bearerToken(req) {
-  const header = (typeof req?.get === 'function' ? req.get('authorization') : req?.headers?.authorization) || '';
-  return header.startsWith('Bearer ') ? header.slice(7) : null;
+  return parseBearer(req);
 }
 
 /** Resolve the role granted by a presented token, or null if it matches no
@@ -257,12 +256,28 @@ export function createInvoiceBilledAccount({ createAccount, store }) {
   return async function provisionInvoiceBilledAccount(req, res) {
     const { amount } = req.body || {};
     const credit = Number(amount);
-    if (!Number.isFinite(credit) || credit <= 0) {
-      return res.status(400).json({ error: 'amount must be a positive number of credits' });
+    // Credits are stroops: Redis INCRBY rejects non-integers, so a
+    // fractional or out-of-range amount must be refused *before* any
+    // account is created (otherwise we'd leave an uncredited orphan).
+    if (!Number.isSafeInteger(credit) || credit <= 0) {
+      return res.status(400).json({ error: 'amount must be a positive integer number of credits' });
     }
 
     const account = await createAccount();
-    await store.incrBy(`credit:${account.accountId}`, credit);
+    try {
+      await store.incrBy(`credit:${account.accountId}`, credit);
+    } catch (err) {
+      logger.error({ err, accountId: account.accountId }, 'invoice-billed credit failed; rolling back account');
+      // Roll back the just-created account so a failed credit never leaves
+      // an uncredited orphan behind. Best-effort: the original error wins.
+      try {
+        await store.delete(`credit:${account.accountId}`);
+        await store.delete(`apikey:${hashApiKey(account.apiKey)}`);
+      } catch (cleanupErr) {
+        logger.error({ err: cleanupErr, accountId: account.accountId }, 'invoice-billed rollback failed');
+      }
+      return res.status(500).json({ error: 'failed to credit account' });
+    }
 
     // One-time reveal: the raw key is returned here and nowhere else.
     return res.status(201).json({
