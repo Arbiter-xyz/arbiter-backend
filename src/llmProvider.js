@@ -164,7 +164,27 @@ const anthropicProvider = {
     if (!toolUse) throw new Error('Claude did not return a report_consensus tool call');
 
     const { consensus, confidence, matching_worker_ids: matchingWorkerIds } = toolUse.input;
-    return { consensus, confidence, matchingWorkerIds, llm: { request, response: captureResponse(message) } };
+
+    // The tool schema is only a hint to the model, not a guarantee. Validate
+    // the fields that gate settlement (consensus text and confidence) so a
+    // malformed tool call throws here and the caller falls back to the
+    // deterministic vote / refund path instead of propagating bad values.
+    if (typeof consensus !== 'string' || consensus.trim() === '') {
+      throw new Error('Claude returned an invalid report_consensus tool call: consensus must be a non-empty string');
+    }
+    if (typeof confidence !== 'number' || !Number.isFinite(confidence)) {
+      throw new Error(
+        `Claude returned an invalid report_consensus tool call: confidence must be a finite number (got ${JSON.stringify(confidence)})`,
+      );
+    }
+    const clampedConfidence = Math.min(1, Math.max(0, confidence));
+
+    return {
+      consensus,
+      confidence: clampedConfidence,
+      matchingWorkerIds,
+      llm: { request, response: captureResponse(message) },
+    };
   },
 
   async reportDraft(question) {

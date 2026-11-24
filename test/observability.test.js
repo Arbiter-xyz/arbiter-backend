@@ -5,6 +5,8 @@ import { registry, metricsMiddleware, metricsHandler, recordJobScan } from '../s
 import { probeStore, probeChain, probeJobs } from '../src/healthProbes.js';
 import { createFaultInjector, mountFaultRoutes, validateFault, isProtectedPath } from '../src/faultInjection.js';
 import { evaluateSecurityPosture } from '../src/securityPosture.js';
+import { checkTreasuryBalance, raiseAlert } from '../src/alerting.js';
+import config from '../src/config.js';
 
 async function value(name, labels = {}) {
   const metric = (await registry.getMetricsAsJSON()).find((m) => m.name === name);
@@ -140,6 +142,113 @@ describe('fault injection is refused in production', () => {
 
   test('and silent in local dev', () => {
     assert.deepEqual(evaluateSecurityPosture({ ARBITER_FAULT_INJECTION: 'true' }).findings, []);
+  });
+});
+
+describe('treasury XLM monitoring (#518)', () => {
+  const originalAlerting = { ...config.alerting };
+  const originalFetch = globalThis.fetch;
+  let posted;
+
+  before(() => {
+    config.alerting.webhookUrl = 'https://hooks.example.com/arbiter';
+    config.alerting.treasuryMinUsdc = 10;
+    config.alerting.treasuryMinXlm = 5;
+    posted = [];
+    globalThis.fetch = async (url, opts) => {
+      posted.push(JSON.parse(opts.body));
+      return { ok: true, status: 200 };
+    };
+  });
+
+  after(() => {
+    Object.assign(config.alerting, originalAlerting);
+    globalThis.fetch = originalFetch;
+  });
+
+  function treasuryWith(xlmBalance) {
+    return {
+      configured: true,
+      platformAddress: 'GPLATFORM',
+      xlmBalance,
+      usdcBalance: 1000,
+      fiatPool: null,
+    };
+  }
+
+  test('low XLM raises exactly one alert per state change and recovers', async () => {
+    posted = [];
+    const healthy = treasuryWith(100);
+    const low = treasuryWith(1);
+
+    await checkTreasuryBalance({ getTreasury: async () => healthy });
+    assert.equal(posted.length, 0);
+
+    await checkTreasuryBalance({ getTreasury: async () => low });
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].key, 'treasury_low_xlm');
+
+    // Still low: no repeat alert.
+    await checkTreasuryBalance({ getTreasury: async () => low });
+    assert.equal(posted.length, 1);
+
+    // Recovered: no alert, but the state resets.
+    await checkTreasuryBalance({ getTreasury: async () => healthy });
+    assert.equal(posted.length, 1);
+
+    // Low again: a new state change, so a new alert.
+    await checkTreasuryBalance({ getTreasury: async () => low });
+    assert.equal(posted.length, 2);
+    assert.equal(posted[1].key, 'treasury_low_xlm');
+  });
+});
+
+describe('raiseAlert per-key cooldown (#519)', () => {
+  const originalAlerting = { ...config.alerting };
+  const originalFetch = globalThis.fetch;
+  let posted;
+  let now;
+
+  before(() => {
+    config.alerting.webhookUrl = 'https://hooks.example.com/arbiter';
+    config.alerting.cooldownMs = 5 * 60_000;
+    posted = [];
+    now = 1_800_000_000_000;
+    globalThis.fetch = async (url, opts) => {
+      posted.push(JSON.parse(opts.body));
+      return { ok: true, status: 200 };
+    };
+  });
+
+  after(() => {
+    Object.assign(config.alerting, originalAlerting);
+    globalThis.fetch = originalFetch;
+  });
+
+  test('suppresses repeats within the cooldown and reports the suppressed count', async () => {
+    posted = [];
+    const clock = () => now;
+
+    raiseAlert('refund_pending_timeout', 'first', { questionId: 'a' }, { now: clock });
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].details.suppressed, undefined);
+
+    for (let i = 0; i < 3; i += 1) {
+      now += 1_000;
+      raiseAlert('refund_pending_timeout', 'again', { questionId: 'b' }, { now: clock });
+    }
+    assert.equal(posted.length, 1);
+
+    // A different key is not throttled by another key's cooldown.
+    raiseAlert('other_key', 'unrelated', {}, { now: clock });
+    assert.equal(posted.length, 2);
+
+    // After the cooldown expires the alert is emitted again, carrying the suppressed count.
+    now += 5 * 60_000;
+    raiseAlert('refund_pending_timeout', 'after cooldown', { questionId: 'c' }, { now: clock });
+    assert.equal(posted.length, 3);
+    assert.equal(posted[2].key, 'refund_pending_timeout');
+    assert.equal(posted[2].details.suppressed, 3);
   });
 });
 
