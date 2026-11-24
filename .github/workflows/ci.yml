@@ -2,7 +2,14 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+# One run per PR commit: a new push to the same ref cancels the superseded
+# run instead of letting both finish (#569).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # .env.example must document every process.env.X the code reads, and
