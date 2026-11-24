@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Keypair, TransactionBuilder, Contract, Account, Address, nativeToScVal, scValToNative, rpc } from '@stellar/stellar-sdk';
 import { config } from './config.js';
-import { withRetry } from './retry.js';
+import { withRetry, withTimeout } from './retry.js';
 import { recordAdminInvocation } from './metrics.js';
 import { canonicalJson } from './provenanceVerify.js';
 
@@ -19,6 +19,25 @@ export const CONTRACT_ERROR_CODES = Object.freeze({
 export function isContractError(err, code) {
   const msg = typeof err === 'string' ? err : err?.message || '';
   return new RegExp(`Error\\(Contract,\\s*#${Number(code)}\\)`).test(msg);
+}
+
+/** Deterministic contract failure (e.g. `Error(Contract, #13)`). Marked
+ * non-retryable so withRetry() fails fast instead of re-running a call that
+ * will fail identically every time (#508). */
+export class ContractError extends Error {
+  constructor(message, { code = null, cause } = {}) {
+    super(message, cause ? { cause } : undefined);
+    this.name = 'ContractError';
+    this.retryable = false;
+    this.contractCode = code;
+  }
+}
+
+/** True when a simulation error payload/message denotes a deterministic
+ * contract error (contains `Error(Contract,`). */
+function isContractSimulationError(err) {
+  const msg = typeof err === 'string' ? err : err?.message || '';
+  return /Error\(Contract,/.test(msg);
 }
 
 export function isInsufficientBalanceError(err) {
@@ -79,16 +98,18 @@ export async function getTransactionEnvelope(hash) {
   return typeof tx.envelopeXdr === 'string' ? tx.envelopeXdr : tx.envelopeXdr.toXDR('base64');
 }
 
-/** Comma-separated list of configured RPC URLs, mirroring
- * config.allowedOrigins' comma-split parsing convention. The first entry is
- * the primary; the rest are ordered failover candidates. A single-URL
- * configuration yields a one-element list, so no failover path is ever
- * exercised. */
+/** Ordered list of configured RPC URLs (primary first, then failover
+ * candidates). Reads config.sorobanRpcUrls directly — the env var is already
+ * split into a list in config.js — instead of re-splitting the single
+ * primary URL (config.sorobanRpcUrl === sorobanRpcUrls[0]), which would
+ * always yield a one-element list and never exercise failover (#506). Falls
+ * back to [config.sorobanRpcUrl] when the array is absent/empty. */
 function getRpcUrls() {
-  return String(config.sorobanRpcUrl || '')
-    .split(',')
-    .map((u) => u.trim())
-    .filter(Boolean);
+  const urls = Array.isArray(config.sorobanRpcUrls) ? config.sorobanRpcUrls : [];
+  const cleaned = urls.map((u) => String(u).trim()).filter(Boolean);
+  if (cleaned.length > 0) return cleaned;
+  const primary = String(config.sorobanRpcUrl || '').trim();
+  return primary ? [primary] : [];
 }
 
 const failoverServers = new Map();
@@ -232,7 +253,10 @@ export function bytes32Arg(hashInput) {
  * getAccount() read against the server that will actually submit it.
  */
 async function runInvokeAsAdmin(method, scValArgs, admin) {
-  return withServerFailover((srv) =>
+  // Phase 1: build/prepare/sign/send. Retried (and failed over) only while no
+  // transaction hash exists — once sendTransaction returns a hash the tx may
+  // already have landed, so it must never be rebuilt/resubmitted (#507).
+  const sent = await withServerFailover((srv) =>
     withRetry(
       async () => {
         const account = await srv.getAccount(admin.publicKey());
@@ -250,16 +274,27 @@ async function runInvokeAsAdmin(method, scValArgs, admin) {
         if (sendResult.status === 'ERROR') {
           throw new Error(`submit failed for ${method}: ${JSON.stringify(sendResult.errorResult ?? sendResult)}`);
         }
-
-        const finalResult = await srv.pollTransaction(sendResult.hash);
-        if (finalResult.status !== 'SUCCESS') {
-          throw new Error(`${method} transaction ${sendResult.hash} did not succeed: ${finalResult.status}`);
-        }
-        return { hash: sendResult.hash, result: finalResult };
+        return { hash: sendResult.hash, srv };
       },
       { attempts: 2, timeoutMs: 10_000, baseDelayMs: 300, label: `invokeAsAdmin(${method})` },
     ),
   );
+
+  // Phase 2: poll the already-submitted hash to completion. Polling often
+  // takes longer than the send timeout, so it gets its own longer budget and
+  // is never retried by resubmitting. On timeout we return the hash with an
+  // 'unknown' status and let the caller check the question's on-chain state.
+  const { hash, srv } = sent;
+  let finalResult;
+  try {
+    finalResult = await withTimeout(() => srv.pollTransaction(hash), 30_000, `pollTransaction(${method})`);
+  } catch (err) {
+    return { hash, status: 'unknown', error: err };
+  }
+  if (finalResult.status !== 'SUCCESS') {
+    throw new Error(`${method} transaction ${hash} did not succeed: ${finalResult.status}`);
+  }
+  return { hash, status: 'SUCCESS', result: finalResult };
 }
 
 /** Each Stellar account requires a strictly increasing, gap-free sequence
@@ -359,7 +394,12 @@ export async function simulateRead(method, scValArgs = []) {
           .build();
         const sim = await srv.simulateTransaction(tx);
         if (sim.error) {
-          throw new Error(`simulate ${method} failed: ${JSON.stringify(sim.error)}`);
+          const message = `simulate ${method} failed: ${JSON.stringify(sim.error)}`;
+          if (isContractSimulationError(message)) {
+            const match = /Error\(Contract,\s*#(\d+)\)/.exec(message);
+            throw new ContractError(message, { code: match ? Number(match[1]) : null });
+          }
+          throw new Error(message);
         }
         return sim.result ? scValToNative(sim.result.retval) : null;
       },
