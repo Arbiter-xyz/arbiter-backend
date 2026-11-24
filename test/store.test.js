@@ -55,6 +55,36 @@ class FakeRedisClient {
   async hgetall(key) {
     return this.hashes.get(key) || {};
   }
+  async lpush(key, ...values) {
+    const list = this.data.get(key) || [];
+    // LPUSH pushes each value to the head, left to right.
+    for (const value of values) list.unshift(value);
+    this.data.set(key, list);
+    return list.length;
+  }
+  async ltrim(key, start, stop) {
+    const list = this.data.get(key) || [];
+    const len = list.length;
+    let from = Number(start);
+    let to = Number(stop);
+    if (from < 0) from = Math.max(len + from, 0);
+    if (to < 0) to = len + to;
+    if (to >= len) to = len - 1;
+    const trimmed = from > to ? [] : list.slice(from, to + 1);
+    this.data.set(key, trimmed);
+    return 'OK';
+  }
+  async lrange(key, start, stop) {
+    const list = this.data.get(key) || [];
+    const len = list.length;
+    let from = Number(start);
+    let to = Number(stop);
+    if (from < 0) from = Math.max(len + from, 0);
+    if (to < 0) to = len + to;
+    if (to >= len) to = len - 1;
+    if (from > to) return [];
+    return list.slice(from, to + 1);
+  }
   async eval(_script, _numKeys, key, amount) {
     const current = Number(this.data.get(key)) || 0;
     const amt = Number(amount);
@@ -136,6 +166,56 @@ test('decrIfAtLeast succeeds atomically when the balance covers the amount', asy
 
 test('decrIfAtLeast treats a never-written key as a zero balance', async () => {
   assert.equal(await store.decrIfAtLeast(uniqueKey('credit'), 1), false);
+});
+
+test('lpush/lrange/ltrim keep newest-first order and cap the list', async () => {
+  const key = uniqueKey('list');
+  assert.equal(await store.lpush(key, 'a'), 1);
+  assert.equal(await store.lpush(key, 'b'), 2);
+  assert.equal(await store.lpush(key, 'c'), 3);
+  assert.deepEqual(await store.lrange(key, 0, -1), ['c', 'b', 'a']);
+  await store.ltrim(key, 0, 1);
+  assert.deepEqual(await store.lrange(key, 0, -1), ['c', 'b']);
+});
+
+test('lrange on a never-written key returns an empty array', async () => {
+  assert.deepEqual(await store.lrange(uniqueKey('list'), 0, -1), []);
+});
+
+test('RedisStore.lpush/lrange/ltrim keep newest-first order and cap the list', async () => {
+  const redisStore = new RedisStore(new FakeRedisClient());
+  const key = uniqueKey('list');
+  assert.equal(await redisStore.lpush(key, 'a'), 1);
+  assert.equal(await redisStore.lpush(key, 'b'), 2);
+  assert.equal(await redisStore.lpush(key, 'c'), 3);
+  assert.deepEqual(await redisStore.lrange(key, 0, -1), ['c', 'b', 'a']);
+  await redisStore.ltrim(key, 0, 1);
+  assert.deepEqual(await redisStore.lrange(key, 0, -1), ['c', 'b']);
+});
+
+test('RedisStore.lrange on a never-written key returns an empty array', async () => {
+  const redisStore = new RedisStore(new FakeRedisClient());
+  assert.deepEqual(await redisStore.lrange(uniqueKey('list'), 0, -1), []);
+});
+
+test('appendAuditLog: 50 concurrent appends produce 50 entries, newest first', async () => {
+  const { appendAuditLog, listAuditLog } = await import('../src/auditLog.js');
+  const actor = uniqueKey('actor');
+  const entries = await Promise.all(
+    Array.from({ length: 50 }, (_, i) =>
+      appendAuditLog({ action: 'test.action', actor, metadata: { i } })
+    )
+  );
+  assert.equal(entries.length, 50);
+  assert.equal(new Set(entries.map((e) => e.id)).size, 50, 'every append gets a unique id');
+
+  const listed = await listAuditLog();
+  const mine = listed.filter((e) => e.actor === actor);
+  assert.equal(mine.length, 50, 'no concurrent append may be lost');
+  // Newest first: the last append must appear before the first append.
+  const firstIdx = listed.findIndex((e) => e.id === entries[0].id);
+  const lastIdx = listed.findIndex((e) => e.id === entries[49].id);
+  assert.ok(lastIdx < firstIdx, 'listAuditLog must return newest entries first');
 });
 
 // ---------------------------------------------------------------------------

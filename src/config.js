@@ -544,11 +544,18 @@ export const config = Object.freeze({
   // alert, same fail-closed-if-unconfigured pattern as vapid above. Payloads
   // carry a Slack-compatible `text` field, so a Slack incoming webhook or any
   // generic JSON receiver works unchanged. The treasury monitor only runs
-  // when ALERT_TREASURY_MIN_USDC is also set.
+  // when ALERT_TREASURY_MIN_USDC and/or ALERT_TREASURY_MIN_XLM is set: USDC
+  // covers settlement payouts, XLM covers the fixed fee every admin call and
+  // sponsored fee-bump pays, so both can independently halt settlement.
+  // alertCooldownMs throttles repeated alerts sharing one key (e.g. a burst
+  // of failed refund() calls during an RPC outage) to one per key per window,
+  // with the suppressed count folded into the next alert.
   alerting: Object.freeze({
     webhookUrl: process.env.ALERT_WEBHOOK_URL || '',
     treasuryMinUsdc: num(process.env.ALERT_TREASURY_MIN_USDC, null),
+    treasuryMinXlm: num(process.env.ALERT_TREASURY_MIN_XLM, null),
     treasuryIntervalMs: num(process.env.ALERT_TREASURY_INTERVAL_MS, 5 * 60 * 1000),
+    alertCooldownMs: num(process.env.ALERT_COOLDOWN_MS, 5 * 60 * 1000),
   }),
 
   push: Object.freeze({

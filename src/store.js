@@ -173,6 +173,34 @@ class MemoryStore {
     }
     return result;
   }
+
+  /** Atomic list prepend + truncate — the audit-log append primitive (#520).
+   * Same run-to-completion-safe discipline as incr(): no `await` between the
+   * read and the write, so concurrent appends can't lose an entry the way a
+   * get()-then-set() read-modify-write of one big array could. `maxLen`
+   * bounds the list, dropping the oldest entries past the cap. */
+  async listPush(key, value, maxLen) {
+    const entry = this.map.get(key);
+    const now = Date.now();
+    const alive = Boolean(entry && (!entry.expiresAt || entry.expiresAt >= now));
+    const list = alive ? entry.value : [];
+    list.unshift(value);
+    if (maxLen && list.length > maxLen) list.length = maxLen;
+    this.map.set(key, { value: list, expiresAt: alive ? entry.expiresAt : null });
+    return list.length;
+  }
+
+  /** Inclusive index range, matching Redis LRANGE semantics (negative
+   * indices count from the end). */
+  async listRange(key, start = 0, end = -1) {
+    const entry = this.map.get(key);
+    if (!entry) return [];
+    if (entry.expiresAt && entry.expiresAt < Date.now()) {
+      this.map.delete(key);
+      return [];
+    }
+    return entry.value.slice(start, end === -1 ? undefined : end + 1);
+  }
 }
 
 // Exported (unlike MemoryStore) so its methods are directly unit-testable
@@ -270,6 +298,29 @@ export class RedisStore {
       result[field] = JSON.parse(value).count;
     }
     return result;
+  }
+
+  // Atomic list prepend + truncate via a Lua script so the LPUSH and LTRIM
+  // can't interleave with a concurrent append (#520) — a plain LPUSH
+  // followed by a separate LTRIM round-trip would still be safe for
+  // correctness of entries, but the script keeps the cap enforced atomically
+  // with the push.
+  async listPush(key, value, maxLen) {
+    const raw = JSON.stringify(value);
+    if (!maxLen) {
+      return this.client.lpush(key, raw);
+    }
+    const script = `
+      redis.call('LPUSH', KEYS[1], ARGV[1])
+      redis.call('LTRIM', KEYS[1], 0, tonumber(ARGV[2]) - 1)
+      return redis.call('LLEN', KEYS[1])
+    `;
+    return this.client.eval(script, 1, key, raw, maxLen);
+  }
+
+  async listRange(key, start = 0, end = -1) {
+    const raw = await this.client.lrange(key, start, end);
+    return raw.map((value) => JSON.parse(value));
   }
 }
 

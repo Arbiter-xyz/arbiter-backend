@@ -12,6 +12,7 @@ import { reconcile, groupByNormalizedAnswer } from '../src/reconcile.js';
 import { startFulfillment, getJobStatus, issueChallenge, consensusRuleFromPending } from '../src/oracle.js';
 import { getStashedQuestion, nextQuestionId } from '../src/pendingQuestions.js';
 import { registerWorker, unregisterWorker, submitAnswer } from '../src/dispatch.js';
+import { reportConsensus } from '../src/llmProvider.js';
 
 const established = (workerId, answer) => ({ workerId, answer, established: true });
 const fresh = (workerId, answer) => ({ workerId, answer, established: false });
@@ -229,6 +230,101 @@ test('reconcile: mixed numeric and non-numeric submissions', async () => {
 test('reconcile: no submissions is still the no-answers path in numeric mode', async () => {
   const result = await reconcile('Q?', [], 'q', numericRule({ absolute: 1 }));
   assert.equal(result.method, 'no-answers');
+});
+
+// --- reportConsensus: validating the LLM tool output ---
+
+// Temporarily install a fake Anthropic client so reportConsensus() uses a mocked
+// messages.create() response instead of the real API.
+async function withMockedClaude(toolInput, fn) {
+  const prevKey = process.env.ANTHROPIC_API_KEY;
+  process.env.ANTHROPIC_API_KEY = 'test-key';
+  const { getClient } = await import('../src/llmProvider.js');
+  const client = getClient();
+  assert.ok(client, 'expected a client to be configured with ANTHROPIC_API_KEY set');
+  const originalCreate = client.messages.create;
+  client.messages.create = async () => ({
+    content: [{ type: 'tool_use', name: 'report_consensus', input: toolInput }],
+  });
+  try {
+    return await fn();
+  } finally {
+    client.messages.create = originalCreate;
+    if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevKey;
+  }
+}
+
+const sampleSubmissions = [established('w1', 'Paris'), established('w2', 'Paris')];
+
+test('reportConsensus accepts a well-formed tool call', async () => {
+  const result = await withMockedClaude(
+    { consensus: 'Paris', confidence: 0.9, matching_worker_ids: ['w1', 'w2'] },
+    () => reportConsensus('Capital of France?', sampleSubmissions),
+  );
+  assert.equal(result.consensus, 'Paris');
+  assert.equal(result.confidence, 0.9);
+  assert.deepEqual(result.matchingWorkerIds, ['w1', 'w2']);
+});
+
+test('reportConsensus rejects a string confidence', async () => {
+  await assert.rejects(
+    withMockedClaude(
+      { consensus: 'Paris', confidence: '0.9', matching_worker_ids: ['w1', 'w2'] },
+      () => reportConsensus('Capital of France?', sampleSubmissions),
+    ),
+    /confidence/i,
+  );
+});
+
+test('reportConsensus clamps a confidence above 1 down to 1', async () => {
+  const result = await withMockedClaude(
+    { consensus: 'Paris', confidence: 1.5, matching_worker_ids: ['w1', 'w2'] },
+    () => reportConsensus('Capital of France?', sampleSubmissions),
+  );
+  assert.equal(result.confidence, 1);
+});
+
+test('reportConsensus clamps a negative confidence up to 0', async () => {
+  const result = await withMockedClaude(
+    { consensus: 'Paris', confidence: -0.2, matching_worker_ids: ['w1', 'w2'] },
+    () => reportConsensus('Capital of France?', sampleSubmissions),
+  );
+  assert.equal(result.confidence, 0);
+});
+
+test('reportConsensus rejects a non-finite confidence', async () => {
+  await assert.rejects(
+    withMockedClaude(
+      { consensus: 'Paris', confidence: Number.NaN, matching_worker_ids: ['w1', 'w2'] },
+      () => reportConsensus('Capital of France?', sampleSubmissions),
+    ),
+    /confidence/i,
+  );
+});
+
+test('reportConsensus rejects a missing or empty consensus', async () => {
+  for (const input of [
+    { confidence: 0.9, matching_worker_ids: ['w1', 'w2'] },
+    { consensus: '', confidence: 0.9, matching_worker_ids: ['w1', 'w2'] },
+    { consensus: '   ', confidence: 0.9, matching_worker_ids: ['w1', 'w2'] },
+    { consensus: 42, confidence: 0.9, matching_worker_ids: ['w1', 'w2'] },
+  ]) {
+    await assert.rejects(
+      withMockedClaude(input, () => reportConsensus('Capital of France?', sampleSubmissions)),
+      /consensus/i,
+      JSON.stringify(input),
+    );
+  }
+});
+
+test('reconcile falls back to the exact-match vote when the LLM output is invalid', async () => {
+  const result = await withMockedClaude(
+    { consensus: 'Paris', confidence: '0.9', matching_worker_ids: ['w1', 'w2'] },
+    () => reconcile('Capital of France?', sampleSubmissions, 'q'),
+  );
+  assert.notEqual(result.method, 'claude');
+  assert.deepEqual(result.matchingWorkerIds.sort(), ['w1', 'w2']);
 });
 
 // --- plumbing: stash -> pending -> reconcile -> job record ---
